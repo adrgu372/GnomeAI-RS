@@ -1,0 +1,1248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gnome AI</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#1a1a2e;--bg2:#16213e;--bg3:#0f3460;
+  --sidebar:#0f0f1a;--chat:#1a1a2e;
+  --user:#0f3460;--gnome:#16213e;
+  --text:#e0e0e0;--text2:#a0a0b8;
+  --accent:#53a8b6;--accent2:#79c7c5;
+  --border:#2a2a4a;--danger:#e74c3c;
+  --success:#2ecc71;
+  --radius:12px;
+  --mono:'Cascadia Code','Fira Code','JetBrains Mono',monospace;
+}
+html,body{height:100%;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+  background:var(--bg);color:var(--text);overflow:hidden}
+
+.app{display:flex;height:100vh}
+.sidebar{width:280px;min-width:280px;background:var(--sidebar);
+  border-right:1px solid var(--border);display:flex;flex-direction:column;
+  transition:margin-left .25s ease}
+.sidebar.collapsed{margin-left:-280px}
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+
+.btn{border:none;border-radius:8px;cursor:pointer;font-size:13px;
+  padding:8px 14px;transition:all .15s;font-family:inherit}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent2)}
+.btn-icon{background:transparent;color:var(--text2);padding:8px;font-size:16px}
+.btn-icon:hover{background:var(--border);color:var(--text)}
+.btn-danger{background:var(--danger);color:#fff}
+.btn-danger:hover{opacity:.85}
+.btn-sm{padding:5px 10px;font-size:12px}
+
+.sb-head{padding:16px;border-bottom:1px solid var(--border);display:flex;
+  align-items:center;gap:10px}
+.sb-head h2{font-size:18px;font-weight:700;color:var(--accent2);flex:1}
+.new-chat-btn{margin:12px 16px 8px}
+.chat-list{flex:1;overflow-y:auto;padding:4px 8px}
+.chat-item{display:flex;align-items:center;padding:10px 12px;margin:2px 0;
+  border-radius:8px;cursor:pointer;transition:background .15s;gap:8px}
+.chat-item:hover{background:var(--border)}
+.chat-item.active{background:var(--bg3)}
+.chat-item .title{flex:1;font-size:13.5px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.chat-item .del{opacity:0;transition:opacity .15s;background:none;border:none;
+  color:var(--danger);cursor:pointer;font-size:14px;padding:2px 6px;border-radius:4px}
+.chat-item:hover .del{opacity:1}
+.chat-item .del:hover{background:rgba(231,76,60,.15)}
+.settings{border-top:1px solid var(--border);padding:14px 16px}
+.settings label{font-size:12px;color:var(--text2);display:block;margin-bottom:4px}
+.settings input[type=password],.settings input[type=text],.settings textarea{
+  width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border);
+  background:var(--bg);color:var(--text);font-size:13px;margin-bottom:6px}
+.settings textarea{resize:vertical;min-height:72px;font-family:var(--mono)}
+.settings input::placeholder{color:#555}
+.settings .btn{width:100%}
+.settings .status{font-size:11px;margin-top:4px}
+.status-ok{color:var(--accent2)}
+.status-err{color:var(--danger)}
+.status-note{color:var(--text2)}
+.check-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text2);margin:4px 0 8px}
+.check-row input{margin:0}
+.settings .btn-row{display:flex;gap:8px;margin-top:6px}
+.settings .btn-row .btn{flex:1}
+.settings .hint{font-size:11px;color:var(--text2);line-height:1.4;margin:4px 0 8px}
+.wa-qr-box{display:none;margin-top:10px;padding:12px;border:1px solid var(--border);
+  border-radius:10px;background:var(--bg2);text-align:center}
+.wa-qr-box img{width:100%;max-width:220px;background:#fff;padding:10px;border-radius:10px}
+
+.chat-head{padding:12px 20px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:12px;min-height:56px}
+.chat-head .toggle{font-size:20px;background:none;border:none;color:var(--text2);
+  cursor:pointer;padding:4px 8px;border-radius:6px}
+.chat-head .toggle:hover{background:var(--border)}
+.chat-head .title{font-size:16px;font-weight:600;flex:1}
+.chat-head .model-sel{padding:6px 10px;border-radius:6px;border:1px solid var(--border);
+  background:var(--bg2);color:var(--text);font-size:13px;cursor:pointer}
+
+.messages{flex:1;overflow-y:auto;padding:20px 0}
+.msg-row{display:flex;padding:12px 20px;gap:14px;animation:fadeIn .2s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.msg-row.user{background:var(--chat)}
+.msg-row.gnome{background:var(--gnome)}
+.avatar{width:34px;height:34px;border-radius:50%;display:flex;align-items:center;
+  justify-content:center;font-size:16px;font-weight:700;flex-shrink:0;margin-top:2px}
+.msg-row.user .avatar{background:var(--accent);color:#fff}
+.msg-row.gnome .avatar{background:var(--accent2);color:#111}
+.msg-body{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px}
+.msg-actions{display:flex;justify-content:flex-end;gap:8px}
+.action-btn{background:transparent;color:var(--text2);border:1px solid var(--border);
+  border-radius:999px;padding:4px 10px;font-size:11.5px;cursor:pointer;transition:all .15s}
+.action-btn:hover{border-color:var(--accent);color:var(--accent)}
+.bubble{flex:1;min-width:0;line-height:1.65;font-size:14.5px;overflow-wrap:break-word;
+  user-select:text;-webkit-user-select:text}
+.bubble p{margin:.5em 0}
+.bubble h1,.bubble h2,.bubble h3{margin:.8em 0 .4em;color:var(--accent2)}
+.bubble h1{font-size:1.4em}.bubble h2{font-size:1.2em}.bubble h3{font-size:1.05em}
+.bubble ul,.bubble ol{margin:.5em 0;padding-left:1.8em}
+.bubble li{margin:.2em 0}
+.bubble blockquote{border-left:3px solid var(--accent);padding:6px 14px;
+  margin:.6em 0;color:var(--text2);background:rgba(83,168,182,.06);border-radius:0 6px 6px 0}
+.bubble strong{color:var(--accent2)}
+.bubble em{color:var(--text2)}
+.bubble hr{border:none;border-top:1px solid var(--border);margin:1em 0}
+.bubble a{color:var(--accent);text-decoration:none}
+.bubble a:hover{text-decoration:underline}
+.bubble table{border-collapse:collapse;margin:.6em 0;width:auto;max-width:100%}
+.bubble th,.bubble td{border:1px solid var(--border);padding:6px 12px;text-align:left}
+.bubble th{background:var(--bg3);font-weight:600}
+.bubble pre{background:#0d1117;border-radius:8px;margin:.8em 0;overflow-x:auto;
+  position:relative;border:1px solid var(--border)}
+.bubble pre code{display:block;padding:14px 16px;font-family:var(--mono);
+  font-size:13px;line-height:1.5;color:#c9d1d9}
+.bubble code:not(pre code){background:var(--bg3);padding:2px 6px;border-radius:4px;
+  font-family:var(--mono);font-size:.9em;color:var(--accent2)}
+.bubble pre .copy-btn{position:absolute;top:6px;right:6px;
+  background:var(--border);color:var(--text2);border:none;border-radius:4px;
+  padding:3px 8px;font-size:11px;cursor:pointer;opacity:0;transition:opacity .15s}
+.bubble pre:hover .copy-btn{opacity:1}
+.bubble pre .copy-btn:hover{background:var(--accent);color:#fff}
+.bubble .lang-tag{position:absolute;top:6px;left:10px;font-size:10px;
+  color:var(--text2);text-transform:uppercase;letter-spacing:.5px}
+
+.thinking{display:flex;align-items:center;gap:8px;color:var(--text2);
+  font-style:italic;padding:4px 0}
+.thinking .dots span{display:inline-block;width:6px;height:6px;
+  background:var(--accent);border-radius:50%;margin:0 2px;
+  animation:bounce .6s infinite alternate}
+.thinking .dots span:nth-child(2){animation-delay:.15s}
+.thinking .dots span:nth-child(3){animation-delay:.3s}
+@keyframes bounce{to{transform:translateY(-5px);opacity:.4}}
+
+/* ── Download link ── */
+.download-link{display:inline-flex;align-items:center;gap:10px;
+  margin-top:14px;padding:12px 18px;background:var(--bg3);
+  border:1px solid var(--success);border-radius:10px;
+  color:var(--success);text-decoration:none;font-size:14px;
+  font-weight:600;transition:all .2s;animation:fadeIn .3s ease}
+.download-link:hover{background:var(--success);color:#fff;
+  transform:translateY(-1px);box-shadow:0 4px 12px rgba(46,204,113,.3)}
+.download-link .dl-icon{font-size:18px}
+
+.preview-area{padding:0 20px;min-height:0;display:none;overflow-x:auto}
+.preview-area.has-files{display:flex;gap:10px;padding:10px 20px;
+  border-top:1px solid var(--border)}
+.file-chip{display:inline-flex;align-items:center;gap:8px;
+  background:var(--bg2);border:1px solid var(--border);border-radius:10px;
+  padding:6px 10px;flex-shrink:0;position:relative;max-width:260px}
+.file-chip img{width:44px;height:44px;border-radius:6px;object-fit:cover;
+  border:1px solid var(--border)}
+.file-chip .file-icon{width:44px;height:44px;border-radius:6px;
+  background:var(--bg3);display:flex;align-items:center;justify-content:center;
+  font-size:22px;flex-shrink:0}
+.file-chip .file-info{display:flex;flex-direction:column;min-width:0}
+.file-chip .file-name{font-size:12.5px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;max-width:150px}
+.file-chip .file-type{font-size:10.5px;color:var(--text2)}
+.file-chip .remove-btn{position:absolute;top:-6px;right:-6px;
+  width:20px;height:20px;border-radius:50%;background:var(--danger);
+  color:#fff;border:none;cursor:pointer;font-size:12px;line-height:20px;
+  text-align:center;display:flex;align-items:center;justify-content:center}
+
+.input-bar{padding:12px 20px 16px;display:flex;gap:10px;align-items:flex-end;
+  background:var(--chat)}
+.input-tools{display:flex;gap:8px;align-self:flex-end}
+.input-bar textarea{flex:1;resize:none;border:1px solid var(--border);
+  border-radius:var(--radius);padding:12px 16px;font-size:14.5px;
+  background:var(--bg2);color:var(--text);font-family:inherit;
+  min-height:48px;max-height:160px;line-height:1.5;outline:none;
+  transition:border-color .15s}
+.input-bar textarea:focus{border-color:var(--accent)}
+.input-bar textarea::placeholder{color:#555}
+.send-btn{padding:12px 20px;font-size:15px;align-self:flex-end}
+.upload-btn{padding:12px 14px;font-size:15px;align-self:flex-end;
+  background:transparent;color:var(--text2);border:1px solid var(--border);
+  border-radius:var(--radius);cursor:pointer;transition:all .15s}
+.upload-btn:hover{border-color:var(--accent);color:var(--accent)}
+.selection-copy-btn{position:fixed;z-index:1000;display:none;
+  background:var(--accent);color:#fff;border:none;border-radius:999px;
+  padding:7px 12px;font-size:12px;font-weight:600;cursor:pointer;
+  box-shadow:0 8px 20px rgba(0,0,0,.35)}
+.selection-copy-btn:hover{background:var(--accent2);color:#111}
+.question-modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+  background:rgba(5,8,20,.72);backdrop-filter:blur(4px);z-index:1500;padding:20px}
+.question-modal.open{display:flex}
+.question-card{width:min(720px,100%);max-height:min(86vh,900px);overflow:auto;
+  background:linear-gradient(180deg,var(--bg2),var(--sidebar));border:1px solid var(--border);
+  border-radius:18px;box-shadow:0 24px 60px rgba(0,0,0,.45);padding:20px 20px 16px}
+.question-card h3{font-size:18px;color:var(--accent2);margin-bottom:6px}
+.question-card .sub{font-size:12.5px;color:var(--text2);margin-bottom:14px}
+.question-block{border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:14px;background:rgba(255,255,255,.02)}
+.question-chip{display:inline-flex;align-items:center;padding:4px 9px;border-radius:999px;
+  background:var(--bg3);color:var(--accent2);font-size:11px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;margin-bottom:8px}
+.question-text{font-size:14.5px;line-height:1.5;margin-bottom:10px}
+.question-options{display:flex;flex-direction:column;gap:10px}
+.question-option{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--border);
+  border-radius:12px;background:rgba(255,255,255,.015)}
+.question-option input{margin-top:3px}
+.question-option .opt-main{flex:1}
+.question-option .opt-label{font-size:13.5px;font-weight:600}
+.question-option .opt-desc{font-size:12px;color:var(--text2);margin-top:2px;line-height:1.45}
+.question-other,.question-notes{width:100%;padding:9px 10px;border-radius:10px;border:1px solid var(--border);
+  background:var(--bg);color:var(--text);font-size:13px;margin-top:10px}
+.question-notes{min-height:78px;resize:vertical;font-family:inherit}
+.question-preview{margin-top:8px;padding:10px;border-radius:10px;background:#0d1117;border:1px solid var(--border);
+  color:#d3d9df;font-family:var(--mono);font-size:12px;white-space:pre-wrap}
+.question-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:8px}
+.question-error{font-size:12px;color:var(--danger);min-height:18px;margin-right:auto;align-self:center}
+
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:#444}
+
+@media(max-width:768px){
+  .sidebar{position:fixed;z-index:100;height:100vh;
+    box-shadow:4px 0 20px rgba(0,0,0,.5)}
+  .sidebar.collapsed{margin-left:-280px}
+}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="sb-head"><h2>🧠 Gnome AI</h2></div>
+    <div class="new-chat-btn">
+      <button class="btn btn-primary" style="width:100%" onclick="createChat()">+ New Chat</button>
+    </div>
+    <div class="chat-list" id="chatList"></div>
+    <div class="settings">
+      <label>llama-server URL</label>
+      <input type="text" id="llamaUrl" placeholder="http://127.0.0.1:8090/v1">
+      <label>Firecrawl URL</label>
+      <input type="text" id="firecrawlUrl" placeholder="http://127.0.0.1:3002">
+      <label>Firecrawl API Key</label>
+      <input type="password" id="firecrawlKey" placeholder="Optional">
+      <button class="btn btn-primary btn-sm" onclick="saveWebSettings()">Save Web + LLM</button>
+      <div class="status" id="keyStatus"></div>
+      <div style="height:14px"></div>
+      <label>WhatsApp Assistant Name</label>
+      <input type="text" id="waAssistantName" placeholder="Gnome AI">
+      <label class="check-row"><input type="checkbox" id="waEnabled"> Enable bridge on startup</label>
+      <label class="check-row"><input type="checkbox" id="waOwnNumber"> Dedicated WhatsApp number</label>
+      <label>Allowed JIDs</label>
+      <textarea id="waAllowedJids" placeholder="Blank = only self-chat"></textarea>
+      <div class="hint">Lasă gol ca să răspundă doar în self-chat. Pentru grupuri sau DM-uri specifice, pune câte un JID pe linie.</div>
+      <div class="btn-row">
+        <button class="btn btn-primary btn-sm" onclick="saveWhatsAppSettings()">Save WA</button>
+        <button class="btn btn-primary btn-sm" onclick="startWhatsApp()">Start</button>
+        <button class="btn btn-danger btn-sm" onclick="stopWhatsApp()">Stop</button>
+      </div>
+      <div class="status" id="waStatus"></div>
+      <div class="status" id="waIdentity"></div>
+      <div class="wa-qr-box" id="waQrBox">
+        <img id="waQrImage" alt="WhatsApp QR">
+        <div class="hint">Scanează codul din WhatsApp → Settings → Linked Devices → Link a Device</div>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="chat-head">
+      <button class="toggle" onclick="toggleSidebar()" title="Toggle sidebar">☰</button>
+      <span class="title" id="chatTitle">Gnome AI</span>
+      <select class="model-sel" id="modelSel" onchange="currentModel=this.value"></select>
+    </div>
+    <div class="messages" id="messages"></div>
+    <div class="preview-area" id="previewArea"></div>
+    <div class="input-bar">
+      <button class="upload-btn" onclick="document.getElementById('fileInput').click()" title="Upload file">📎</button>
+      <textarea id="inputBox" rows="1" placeholder="Ask Gnome anything..."
+        onkeydown="onKey(event)" oninput="autoResize(this)"></textarea>
+      <div class="input-tools">
+        <button class="upload-btn" id="pasteBtn" onclick="pasteIntoInput()" title="Paste text">Paste</button>
+        <button class="upload-btn" id="copyInputBtn" onclick="copyInputText()" title="Copy input">Copy</button>
+      </div>
+      <button class="btn btn-primary send-btn" onclick="send()">➤</button>
+    </div>
+  </main>
+</div>
+
+<input type="file" id="fileInput" hidden
+  accept=".txt,.pdf,.docx,.xlsx,.pptx,.json,.py,.jpg,.jpeg,.png,.gif,.bmp">
+<button id="selectionCopyBtn" class="selection-copy-btn" type="button">Copy Selection</button>
+<div class="question-modal" id="questionModal">
+  <div class="question-card">
+    <h3>Input Needed</h3>
+    <div class="sub">Gnome a cerut o clarificare înainte să poată continua.</div>
+    <div id="questionModalBody"></div>
+    <div class="question-actions">
+      <div class="question-error" id="questionError"></div>
+      <button class="btn btn-primary" id="questionSubmitBtn" onclick="submitPendingQuestion()">Submit Answers</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ================================================================
+// STATE
+// ================================================================
+let chatId = '';
+let models = ['gemma-3n-E4B-it-Q4_K_M'];
+let currentModel = 'gemma-3n-E4B-it-Q4_K_M';
+let streaming = false;
+let esSource = null;
+let sidebarOpen = true;
+let pendingFile = null;
+let lastChatVersion = '';
+let activePendingQuestion = null;
+let pollingInFlight = false;
+
+// ================================================================
+// DOM
+// ================================================================
+const $ = s => document.querySelector(s);
+const msgBox = $('#messages');
+const inputBox = $('#inputBox');
+const previewArea = $('#previewArea');
+const selectionCopyBtn = $('#selectionCopyBtn');
+const questionModal = $('#questionModal');
+const questionModalBody = $('#questionModalBody');
+const questionError = $('#questionError');
+const questionSubmitBtn = $('#questionSubmitBtn');
+let currentSelectionText = '';
+
+// ================================================================
+// API
+// ================================================================
+async function api(method, path, body) {
+  const opts = { method, headers: {} };
+  if (body) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const r = await fetch(path, opts);
+  const text = await r.text();
+  try { return JSON.parse(text); }
+  catch { throw new Error(`Server error (${r.status}): ${text.substring(0,200)}`); }
+}
+
+// ================================================================
+// INIT
+// ================================================================
+async function init() {
+  try {
+    const cfg = await api('GET', '/api/config');
+    $('#llamaUrl').value = cfg.llama_base_url || 'http://127.0.0.1:8090/v1';
+    $('#firecrawlUrl').value = cfg.firecrawl_api_url || 'http://127.0.0.1:3002';
+    $('#firecrawlKey').value = cfg.firecrawl_api_key || '';
+    $('#waAssistantName').value = cfg.whatsapp_assistant_name || 'Gnome AI';
+    $('#waEnabled').checked = !!cfg.whatsapp_enabled;
+    $('#waOwnNumber').checked = !!cfg.whatsapp_has_own_number;
+    $('#waAllowedJids').value = (cfg.whatsapp_allowed_jids || []).join('\n');
+    updateKeyStatus();
+    models = await api('GET', '/api/models');
+    currentModel = models[0] || 'gemma-3n-E4B-it-Q4_K_M';
+    $('#modelSel').innerHTML = models.map(m =>
+      `<option value="${m}" ${m===currentModel?'selected':''}>${m}</option>`
+    ).join('');
+    const chats = await api('GET', '/api/chats');
+    chatId = chats.length > 0 ? chats[chats.length-1].id : (await api('POST','/api/chats/new')).id;
+    renderSidebar(chats);
+    await loadChat(chatId);
+    await refreshWhatsAppStatus();
+    setInterval(refreshWhatsAppStatus, 3000);
+    setInterval(pollCurrentChatState, 1500);
+  } catch(e) { console.error('Init failed:', e); }
+  inputBox.focus();
+}
+
+// ================================================================
+// SIDEBAR
+// ================================================================
+function renderSidebar(chats) {
+  $('#chatList').innerHTML = chats.map(c => `
+    <div class="chat-item ${c.id===chatId?'active':''}" onclick="switchChat('${c.id}')">
+      <span class="title">${esc(`${c.channel==='whatsapp'?'💬 ':''}${c.title||c.id}`)}</span>
+      <button class="del" onclick="event.stopPropagation();deleteChat('${c.id}')" title="Delete">🗑</button>
+    </div>`).join('');
+}
+async function refreshSidebar() { renderSidebar(await api('GET','/api/chats')); }
+function toggleSidebar() {
+  sidebarOpen = !sidebarOpen;
+  $('#sidebar').classList.toggle('collapsed', !sidebarOpen);
+}
+
+// ================================================================
+// CHAT OPERATIONS
+// ================================================================
+async function loadChat(cid) {
+  chatId = cid;
+  const chat = await api('GET', `/api/chats/${cid}`);
+  $('#chatTitle').textContent = chat.title || cid;
+  renderMessages(chat.messages);
+  lastChatVersion = getChatVersion(chat);
+  hidePendingQuestion();
+  clearPreview();
+  await refreshSidebar();
+}
+async function createChat() {
+  chatId = (await api('POST','/api/chats/new')).id;
+  await refreshSidebar();
+  await loadChat(chatId);
+}
+async function switchChat(cid) { await loadChat(cid); }
+async function deleteChat(cid) {
+  const r = await api('DELETE', `/api/chats/${cid}`);
+  chatId = r.active;
+  await refreshSidebar();
+  await loadChat(chatId);
+}
+
+// ================================================================
+// RENDER MESSAGES
+// ================================================================
+function renderMessages(messages) {
+  msgBox.innerHTML = '';
+  for (const m of messages) appendMessage(m.role, m.content, false);
+  scrollToBottom();
+}
+
+function getChatVersion(chat) {
+  const messages = chat?.messages || [];
+  const last = messages.length ? messages[messages.length - 1] : null;
+  return `${messages.length}:${last?.timestamp || ''}`;
+}
+
+async function pollCurrentChatState() {
+  if (!chatId || pollingInFlight) return;
+  pollingInFlight = true;
+  try {
+    if (!streaming) {
+      const chat = await api('GET', `/api/chats/${chatId}`);
+      const version = getChatVersion(chat);
+      if (version !== lastChatVersion) {
+        $('#chatTitle').textContent = chat.title || chatId;
+        renderMessages(chat.messages);
+        lastChatVersion = version;
+      }
+    }
+    const pending = await api('GET', `/api/chats/${chatId}/pending-question`);
+    if (pending?.pending && pending.question) {
+      showPendingQuestion(pending.question);
+    } else if (activePendingQuestion) {
+      hidePendingQuestion();
+    }
+  } catch (e) {
+    console.debug('pollCurrentChatState:', e);
+  } finally {
+    pollingInFlight = false;
+  }
+}
+
+function escAttr(s) {
+  return esc(String(s)).replace(/'/g, '&#39;');
+}
+
+function showPendingQuestion(question) {
+  if (activePendingQuestion?.id === question.id) return;
+  activePendingQuestion = question;
+  questionError.textContent = '';
+  questionSubmitBtn.disabled = false;
+
+  questionModalBody.innerHTML = (question.questions || []).map((q, qIndex) => {
+    const name = `question_${qIndex}`;
+    const otherId = `other_${qIndex}`;
+    const notesId = `notes_${qIndex}`;
+    const optionsHtml = (q.options || []).map((opt, optIndex) => {
+      const inputType = q.multiSelect ? 'checkbox' : 'radio';
+      const inputId = `${name}_${optIndex}`;
+      const preview = opt.preview
+        ? `<div class="question-preview">${esc(opt.preview)}</div>`
+        : '';
+      return `
+        <label class="question-option" for="${escAttr(inputId)}">
+          <input type="${inputType}" id="${escAttr(inputId)}" name="${escAttr(name)}" value="${escAttr(opt.label)}">
+          <div class="opt-main">
+            <div class="opt-label">${esc(opt.label)}</div>
+            <div class="opt-desc">${esc(opt.description || '')}</div>
+            ${preview}
+          </div>
+        </label>`;
+    }).join('');
+    return `
+      <div class="question-block" data-question-index="${qIndex}">
+        <div class="question-chip">${esc(q.header || `Question ${qIndex + 1}`)}</div>
+        <div class="question-text">${esc(q.question)}</div>
+        <div class="question-options">${optionsHtml}</div>
+        <input class="question-other" id="${escAttr(otherId)}" type="text" placeholder="Other answer (optional)">
+        <textarea class="question-notes" id="${escAttr(notesId)}" placeholder="Optional notes"></textarea>
+      </div>`;
+  }).join('');
+  questionModal.classList.add('open');
+}
+
+function hidePendingQuestion() {
+  activePendingQuestion = null;
+  questionModal.classList.remove('open');
+  questionModalBody.innerHTML = '';
+  questionError.textContent = '';
+  questionSubmitBtn.disabled = false;
+}
+
+async function submitPendingQuestion() {
+  if (!activePendingQuestion) return;
+  const answers = {};
+  const annotations = {};
+
+  for (const [qIndex, question] of (activePendingQuestion.questions || []).entries()) {
+    const name = `question_${qIndex}`;
+    const selector = question.multiSelect
+      ? `input[name="${name}"]:checked`
+      : `input[name="${name}"]:checked`;
+    const checked = Array.from(questionModalBody.querySelectorAll(selector));
+    const otherValue = (document.getElementById(`other_${qIndex}`)?.value || '').trim();
+    const notesValue = (document.getElementById(`notes_${qIndex}`)?.value || '').trim();
+
+    let answerValue = '';
+    if (question.multiSelect) {
+      const values = checked.map(el => el.value).filter(Boolean);
+      if (otherValue) values.push(otherValue);
+      answerValue = values.join(', ');
+    } else {
+      answerValue = checked[0]?.value || otherValue;
+    }
+    if (!answerValue) {
+      questionError.textContent = `Completează răspunsul pentru: ${question.header || question.question}`;
+      return;
+    }
+    answers[question.question] = answerValue;
+    if (notesValue) annotations[question.question] = { notes: notesValue };
+  }
+
+  questionSubmitBtn.disabled = true;
+  questionError.textContent = '';
+  try {
+    await api('POST', `/api/chats/${chatId}/pending-question/answer`, {
+      id: activePendingQuestion.id,
+      answers,
+      annotations,
+    });
+    hidePendingQuestion();
+  } catch (e) {
+    questionSubmitBtn.disabled = false;
+    questionError.textContent = e.message || 'Nu am putut trimite răspunsurile.';
+  }
+}
+
+function createMessageShell(role) {
+  const row = document.createElement('div');
+  row.className = `msg-row ${role}`;
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = role === 'user' ? 'Y' : 'G';
+
+  const body = document.createElement('div');
+  body.className = 'msg-body';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+
+  body.appendChild(bubble);
+  row.appendChild(avatar);
+  row.appendChild(body);
+  msgBox.appendChild(row);
+
+  return { row, body, bubble };
+}
+
+function extractBubbleText(bubble) {
+  const clone = bubble.cloneNode(true);
+  clone.querySelectorAll('.copy-btn,.lang-tag,.download-link').forEach(el => el.remove());
+  return (clone.innerText || clone.textContent || '').trim();
+}
+
+function getMessageCopyText(role, content, bubble) {
+  if (role === 'user') {
+    if (typeof content === 'object' && content?.type === 'image') {
+      return content.filename || content.path?.split('/').pop() || 'image';
+    }
+    return String(content ?? '').trim();
+  }
+  return extractBubbleText(bubble);
+}
+
+function addMessageActions(body, getText) {
+  if (body.querySelector('.msg-actions')) return;
+  const actions = document.createElement('div');
+  actions.className = 'msg-actions';
+
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'action-btn';
+  copyBtn.textContent = 'Copy';
+  copyBtn.onclick = async () => {
+    const text = getText();
+    const ok = await writeClipboardText(text);
+    flashButton(copyBtn, ok ? 'Copied!' : 'Failed');
+  };
+
+  actions.appendChild(copyBtn);
+  body.appendChild(actions);
+}
+
+function appendMessage(role, content, scroll=true) {
+  const { body, bubble } = createMessageShell(role);
+
+  if (role === 'user') {
+    if (typeof content === 'object' && content.type === 'image') {
+      const fname = content.filename || content.path?.split('/').pop() || 'image';
+      bubble.innerHTML = `<em>📎 ${esc(fname)}</em>`;
+    } else {
+      bubble.innerHTML = `<p>${esc(String(content))}</p>`;
+    }
+  } else {
+    bubble.innerHTML = renderMarkdown(String(content));
+    addCopyButtons(bubble);
+  }
+
+  addMessageActions(body, () => getMessageCopyText(role, content, bubble));
+  if (scroll) scrollToBottom();
+  return bubble;
+}
+
+function scrollToBottom() {
+  requestAnimationFrame(() => { msgBox.scrollTop = msgBox.scrollHeight; });
+}
+
+// ================================================================
+// DOWNLOAD LINK — added to bubble after generation
+// ================================================================
+function addDownloadLink(bubble, fileUrl, filename) {
+  const existing = bubble.querySelector('.download-link');
+  if (existing) existing.remove();
+  const a = document.createElement('a');
+  a.href = fileUrl;
+  a.download = filename;
+  a.className = 'download-link';
+  a.innerHTML = `<span class="dl-icon">📥</span> Download ${esc(filename)}`;
+  bubble.appendChild(a);
+}
+
+// ================================================================
+// DOCUMENT GENERATION DETECTION
+// ================================================================
+function isGenerationRequest(text) {
+  const q = text.toLowerCase();
+  const actions = ['generate','create','make','build','write','design',
+                   'produce','convert','export','give me','build me',
+                   'create for me','make me','generate for me'];
+  const formats = ['docx','doc','xlsx','xls','pptx','ppt','document',
+                   'spreadsheet','excel','powerpoint','presentation',
+                   'report','invoice','letter','resume','cv'];
+  const hasAction = actions.some(a => q.includes(a));
+  const hasFormat = formats.some(f => q.includes(f));
+  return hasAction && hasFormat;
+}
+
+// ================================================================
+// FILE PREVIEW
+// ================================================================
+$('#fileInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  let dataUrl = null;
+  if (file.type.startsWith('image/')) dataUrl = await readFileAsDataUrl(file);
+  pendingFile = { file, dataUrl, filename: file.name };
+  renderPreview();
+  inputBox.focus();
+});
+
+function readFileAsDataUrl(file) {
+  return new Promise(resolve => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => resolve(null);
+    r.readAsDataURL(file);
+  });
+}
+
+function renderPreview() {
+  if (!pendingFile) { previewArea.innerHTML=''; previewArea.className='preview-area'; return; }
+  const pf = pendingFile;
+  let thumb = pf.dataUrl
+    ? `<img src="${pf.dataUrl}" alt="${esc(pf.filename)}">`
+    : `<div class="file-icon">${getIcon(pf.filename)}</div>`;
+  previewArea.innerHTML = `
+    <div class="file-chip">
+      ${thumb}
+      <div class="file-info">
+        <span class="file-name">${esc(pf.filename)}</span>
+        <span class="file-type">${pf.file.type||'file'}</span>
+      </div>
+      <button class="remove-btn" onclick="removePendingFile()" title="Remove">✕</button>
+    </div>`;
+  previewArea.className = 'preview-area has-files';
+}
+
+function getIcon(fname) {
+  const ext = fname.split('.').pop().toLowerCase();
+  const map = {pdf:'📄',docx:'📝',doc:'📝',xlsx:'📊',xls:'📊',pptx:'📽️',ppt:'📽️',
+               txt:'📃',py:'🐍',json:'{}',html:'🌐'};
+  return map[ext]||'📎';
+}
+
+function removePendingFile() { pendingFile=null; renderPreview(); inputBox.focus(); }
+function clearPreview() { pendingFile=null; renderPreview(); }
+
+// ================================================================
+// SEND — routes to generation or normal chat
+// ================================================================
+async function send() {
+  const text = inputBox.value.trim();
+  if ((!text && !pendingFile) || streaming) return;
+
+  const msgText = text || (pendingFile ? `Analyze the uploaded file: ${pendingFile.filename}` : '');
+  inputBox.value = '';
+  autoResize(inputBox);
+  streaming = true;
+
+  appendMessage('user', msgText);
+
+  // ── Handle file upload if pending ──
+  if (pendingFile) {
+    const fd = new FormData();
+    fd.append('file', pendingFile.file);
+    try {
+      const r = await fetch(`/api/upload/${chatId}`, { method:'POST', body:fd });
+      const res = await r.json();
+      if (!res.ok) {
+        appendMessage('gnome', `⚠️ Upload error: ${res.error||'Unknown'}`);
+        streaming = false;
+        return;
+      }
+      await api('POST', `/api/chats/${chatId}/messages`, {
+        role:'user', content: msgText
+      });
+    } catch(err) {
+      appendMessage('gnome', `⚠️ Upload failed: ${err.message}`);
+      streaming = false;
+      return;
+    }
+    clearPreview();
+  } else {
+    await api('POST', `/api/chats/${chatId}/messages`, {
+      role:'user', content: msgText
+    });
+  }
+
+  // ── Route: document generation or normal chat ──
+  if (isGenerationRequest(msgText)) {
+    await handleGeneration(msgText);
+  } else {
+    await handleNormalChat(msgText);
+  }
+}
+
+// ================================================================
+// DOCUMENT GENERATION HANDLER
+// ================================================================
+async function handleGeneration(query) {
+  // Thinking indicator
+  const { row, body, bubble } = createMessageShell('gnome');
+  bubble.innerHTML = `
+    <div class="thinking">Generating document<span class="dots"><span></span><span></span><span></span></span></div>`;
+  scrollToBottom();
+  addMessageActions(body, () => getMessageCopyText('gnome', '', bubble));
+
+  try {
+    const res = await api('POST', `/api/generate/${chatId}`, {
+      query, model: currentModel
+    });
+
+    if (res.error) {
+      bubble.innerHTML = `<p style="color:var(--danger)">⚠️ ${esc(res.error)}</p>`;
+    } else {
+      // Render the model's explanation (it's in the response as tokens already)
+      // The generation endpoint streams tokens via SSE — but we used JSON.
+      // So the response is the full text. We need to render it.
+      // Actually the generation endpoint streams via SSE too...
+      // Let me handle both cases.
+      if (res.full_response) {
+        bubble.innerHTML = renderMarkdown(res.full_response);
+        addCopyButtons(bubble);
+      }
+
+      if (res.file_url) {
+        addDownloadLink(bubble, res.file_url, res.filename || 'file');
+      }
+    }
+
+    // Save assistant message
+    const saveContent = bubble.innerText || bubble.textContent || 'Generated file.';
+    await api('POST', `/api/chats/${chatId}/messages`, {
+      role: 'gnome', content: saveContent
+    });
+
+  } catch(err) {
+    bubble.innerHTML = `<p style="color:var(--danger)">Error: ${esc(err.message)}</p>`;
+  }
+
+  streaming = false;
+  addCopyButtons(bubble);
+  inputBox.focus();
+}
+
+// ================================================================
+// NORMAL CHAT HANDLER (SSE streaming)
+// ================================================================
+async function handleNormalChat(query) {
+  // Thinking indicator
+  const { row, body, bubble } = createMessageShell('gnome');
+  bubble.innerHTML = `
+    <div class="thinking">Thinking<span class="dots"><span></span><span></span><span></span></span></div>`;
+  addMessageActions(body, () => getMessageCopyText('gnome', '', bubble));
+  scrollToBottom();
+
+  try {
+    const initRes = await api('POST', `/api/chats/${chatId}/start-stream`, {
+      query, model: currentModel
+    });
+    const url = `/api/chat/stream/${chatId}/${initRes.index}?query=${encodeURIComponent(query)}&model=${encodeURIComponent(currentModel)}`;
+
+    let fullContent = '';
+
+    if (esSource) esSource.close();
+    esSource = new EventSource(url);
+
+    esSource.onmessage = (ev) => {
+      if (ev.data === '[DONE]') {
+        esSource.close();
+        esSource = null;
+        streaming = false;
+        api('POST', `/api/chats/${chatId}/messages`, { role:'gnome', content: fullContent });
+        addCopyButtons(bubble);
+        inputBox.focus();
+        return;
+      }
+      try {
+        const d = JSON.parse(ev.data);
+
+        // Token streaming
+        if (d.token) {
+          fullContent += d.token;
+          bubble.innerHTML = renderMarkdown(fullContent);
+          scrollToBottom();
+        }
+
+        // File download (from generation path within SSE)
+        if (d.file_url) {
+          addDownloadLink(bubble, d.file_url, d.filename || 'file');
+        }
+      } catch {}
+    };
+
+    esSource.onerror = () => {
+      if (esSource) { esSource.close(); esSource = null; }
+      streaming = false;
+      if (!fullContent) bubble.innerHTML = '<p style="color:var(--danger)">Connection lost.</p>';
+      inputBox.focus();
+    };
+  } catch(err) {
+    streaming = false;
+    row.querySelector('.bubble').innerHTML =
+      `<p style="color:var(--danger)">Error: ${esc(err.message)}</p>`;
+  }
+}
+
+// ================================================================
+// MARKDOWN
+// ================================================================
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function renderMarkdown(md) {
+  if (!md) return '';
+  const lines = md.split('\n');
+  let html='', inCode=false, codeBuf='', codeLang='';
+  let inUl=false, inOl=false;
+
+  function closeLists() {
+    if(inUl){html+='</ul>';inUl=false}
+    if(inOl){html+='</ol>';inOl=false}
+  }
+
+  for(let i=0;i<lines.length;i++){
+    const line=lines[i];
+    if(line.trimStart().startsWith('```')){
+      if(inCode){
+        html+=`<pre><span class="lang-tag">${esc(codeLang)}</span><code class="language-${esc(codeLang)}">${esc(codeBuf.trimEnd())}</code></pre>`;
+        inCode=false;codeBuf='';
+      }else{closeLists();inCode=true;codeLang=line.trim().slice(3).trim()||'text';}
+      continue;
+    }
+    if(inCode){codeBuf+=line+'\n';continue;}
+    closeLists();
+    if(line.trim()===''){html+='<br>';continue;}
+    const hm=line.match(/^(#{1,6})\s+(.+)/);
+    if(hm){html+=`<h${hm[1].length}>${inline(hm[2])}</h${hm[1].length}>`;continue;}
+    if(/^(-{3,}|\*{3,}|_{3,})$/.test(line.trim())){html+='<hr>';continue;}
+    const ulm=line.match(/^[\s]*[-*+]\s+(.+)/);
+    if(ulm){if(!inUl){html+='<ul>';inUl=true}html+=`<li>${inline(ulm[1])}</li>`;continue;}
+    const olm=line.match(/^[\s]*\d+\.\s+(.+)/);
+    if(olm){if(!inOl){html+='<ol>';inOl=true}html+=`<li>${inline(olm[1])}</li>`;continue;}
+    if(line.trimStart().startsWith('>')){html+=`<blockquote>${inline(line.trim().slice(1).trim())}</blockquote>`;continue;}
+    if(line.includes('|')&&i+1<lines.length&&/^\|?[\s\-:|]+\|?$/.test(lines[i+1].trim())){
+      const hdrs=line.split('|').map(c=>c.trim()).filter(Boolean);
+      i+=2;html+='<table><thead><tr>';
+      hdrs.forEach(h=>html+=`<th>${inline(h)}</th>`);
+      html+='</tr></thead><tbody>';
+      while(i<lines.length&&lines[i].includes('|')){
+        html+='<tr>';
+        lines[i].split('|').map(c=>c.trim()).filter(Boolean).forEach(c=>html+=`<td>${inline(c)}</td>`);
+        html+='</tr>';i++;
+      }
+      html+='</tbody></table>';i--;continue;
+    }
+    html+=`<p>${inline(line)}</p>`;
+  }
+  if(inCode)html+=`<pre><span class="lang-tag">${esc(codeLang)}</span><code class="language-${esc(codeLang)}">${esc(codeBuf.trimEnd())}</code></pre>`;
+  closeLists();
+  return html;
+}
+
+function inline(text) {
+  const codes=[];
+  text=text.replace(/`([^`]+)`/g,(_,c)=>{codes.push(c);return `\x00${codes.length-1}\x00`;});
+  text=text.replace(/\*\*\*(.+?)\*\*\*/g,'<strong><em>$1</em></strong>');
+  text=text.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
+  text=text.replace(/\*(.+?)\*/g,'<em>$1</em>');
+  text=text.replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank">$1</a>');
+  text=text.replace(/\x00(\d+)\x00/g,(_,i)=>`<code>${esc(codes[parseInt(i)])}</code>`);
+  return text;
+}
+
+// ================================================================
+// COPY BUTTONS
+// ================================================================
+async function writeClipboardText(text) {
+  const value = String(text ?? '');
+  if (!value) return false;
+
+  try {
+    await navigator.clipboard.writeText(value);
+    return true;
+  } catch {}
+
+  const ta = document.createElement('textarea');
+  ta.value = value;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  ta.setSelectionRange(0, ta.value.length);
+
+  let ok = false;
+  try { ok = document.execCommand('copy'); }
+  catch {}
+
+  document.body.removeChild(ta);
+  return ok;
+}
+
+async function readClipboardText() {
+  try {
+    return await navigator.clipboard.readText();
+  } catch {
+    return '';
+  }
+}
+
+function flashButton(btn, text) {
+  const original = btn.dataset.label || btn.textContent;
+  btn.dataset.label = original;
+  btn.textContent = text;
+  setTimeout(() => { btn.textContent = original; }, 1500);
+}
+
+function hideSelectionCopyButton() {
+  selectionCopyBtn.style.display = 'none';
+}
+
+function positionSelectionCopyButton(left, top) {
+  const maxLeft = Math.max(12, window.innerWidth - 150);
+  const safeLeft = Math.max(12, Math.min(left, maxLeft));
+  const safeTop = Math.max(12, top);
+  selectionCopyBtn.style.left = `${safeLeft}px`;
+  selectionCopyBtn.style.top = `${safeTop}px`;
+  selectionCopyBtn.style.display = 'block';
+}
+
+function getDomSelectionState() {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+
+  const text = sel.toString().trim();
+  if (!text) return null;
+
+  const range = sel.getRangeAt(0);
+  const node = range.commonAncestorContainer.nodeType === Node.TEXT_NODE
+    ? range.commonAncestorContainer.parentElement
+    : range.commonAncestorContainer;
+  if (!node || !node.closest || !node.closest('.bubble')) return null;
+
+  const rect = range.getBoundingClientRect();
+  if (!rect.width && !rect.height) return null;
+
+  return {
+    text,
+    left: rect.left + (rect.width / 2) - 56,
+    top: rect.top - 42,
+  };
+}
+
+function getInputSelectionState() {
+  const start = inputBox.selectionStart ?? 0;
+  const end = inputBox.selectionEnd ?? 0;
+  if (start === end) return null;
+
+  const text = inputBox.value.slice(start, end).trim();
+  if (!text) return null;
+
+  const rect = inputBox.getBoundingClientRect();
+  return {
+    text,
+    left: rect.right - 128,
+    top: rect.top - 42,
+  };
+}
+
+function refreshSelectionCopyButton() {
+  const domState = getDomSelectionState();
+  const inputState = document.activeElement === inputBox
+    ? getInputSelectionState()
+    : null;
+  const state = domState || inputState;
+
+  if (!state) {
+    currentSelectionText = '';
+    hideSelectionCopyButton();
+    return;
+  }
+
+  currentSelectionText = state.text;
+  positionSelectionCopyButton(state.left, state.top);
+}
+
+function addCopyButtons(bubble) {
+  bubble.querySelectorAll('pre').forEach(pre => {
+    if (pre.querySelector('.copy-btn')) return;
+    const btn = document.createElement('button');
+    btn.className = 'copy-btn';
+    btn.textContent = 'Copy';
+    btn.onclick = async () => {
+      const ok = await writeClipboardText(pre.querySelector('code').textContent);
+      flashButton(btn, ok ? 'Copied!' : 'Failed');
+    };
+    pre.appendChild(btn);
+  });
+}
+
+function copyInputText() {
+  const btn = $('#copyInputBtn');
+  writeClipboardText(inputBox.value).then(ok => {
+    flashButton(btn, ok ? 'Copied!' : 'Failed');
+  });
+}
+
+function insertAtCursor(el, text) {
+  const start = el.selectionStart ?? el.value.length;
+  const end = el.selectionEnd ?? el.value.length;
+  el.setRangeText(text, start, end, 'end');
+  autoResize(el);
+  el.focus();
+}
+
+async function pasteIntoInput() {
+  const btn = $('#pasteBtn');
+  const text = await readClipboardText();
+  if (!text) {
+    flashButton(btn, 'Empty');
+    return;
+  }
+  insertAtCursor(inputBox, text);
+  flashButton(btn, 'Pasted!');
+}
+
+selectionCopyBtn.addEventListener('mousedown', (e) => {
+  e.preventDefault();
+});
+
+selectionCopyBtn.addEventListener('click', async () => {
+  if (!currentSelectionText) return;
+  const ok = await writeClipboardText(currentSelectionText);
+  flashButton(selectionCopyBtn, ok ? 'Copied!' : 'Failed');
+});
+
+document.addEventListener('selectionchange', refreshSelectionCopyButton);
+document.addEventListener('mouseup', () => setTimeout(refreshSelectionCopyButton, 0));
+document.addEventListener('keyup', refreshSelectionCopyButton);
+inputBox.addEventListener('select', refreshSelectionCopyButton);
+window.addEventListener('scroll', refreshSelectionCopyButton, true);
+window.addEventListener('resize', refreshSelectionCopyButton);
+
+document.addEventListener('keydown', async (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== 'c') return;
+  refreshSelectionCopyButton();
+  if (!currentSelectionText) return;
+  const ok = await writeClipboardText(currentSelectionText);
+  if (ok) e.preventDefault();
+});
+
+// ================================================================
+// INPUT
+// ================================================================
+function onKey(e) { if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();} }
+function autoResize(el) { el.style.height='auto'; el.style.height=Math.min(el.scrollHeight,160)+'px'; }
+
+// ================================================================
+// WEB + LLM SETTINGS
+// ================================================================
+async function saveWebSettings() {
+  await api('POST','/api/config',{
+    llama_base_url: $('#llamaUrl').value.trim(),
+    firecrawl_api_url: $('#firecrawlUrl').value.trim(),
+    firecrawl_api_key: $('#firecrawlKey').value.trim(),
+  });
+  models = await api('GET', '/api/models');
+  currentModel = models[0] || currentModel;
+  $('#modelSel').innerHTML = models.map(m =>
+    `<option value="${m}" ${m===currentModel?'selected':''}>${m}</option>`
+  ).join('');
+  updateKeyStatus();
+}
+function updateKeyStatus() {
+  const llamaUrl = $('#llamaUrl').value.trim();
+  const firecrawlUrl = $('#firecrawlUrl').value.trim();
+  const el = $('#keyStatus');
+  if (llamaUrl && firecrawlUrl) {
+    el.textContent = '✓ llama-server + Firecrawl configured';
+    el.className = 'status status-ok';
+  } else if (llamaUrl || firecrawlUrl) {
+    el.textContent = 'Incomplete config — set both llama-server URL and Firecrawl URL';
+    el.className = 'status status-note';
+  } else {
+    el.textContent = 'No local web/LLM endpoints configured';
+    el.className = 'status status-err';
+  }
+}
+
+function getWhatsAppAllowedJids() {
+  return $('#waAllowedJids').value
+    .split(/\n|,/)
+    .map(v => v.trim())
+    .filter(Boolean);
+}
+
+async function saveWhatsAppSettings() {
+  await api('POST', '/api/config', {
+    whatsapp_enabled: $('#waEnabled').checked,
+    whatsapp_assistant_name: $('#waAssistantName').value.trim() || 'Gnome AI',
+    whatsapp_has_own_number: $('#waOwnNumber').checked,
+    whatsapp_allowed_jids: getWhatsAppAllowedJids(),
+  });
+  await refreshWhatsAppStatus();
+}
+
+async function startWhatsApp() {
+  await api('POST', '/api/whatsapp/start');
+  await refreshWhatsAppStatus();
+}
+
+async function stopWhatsApp() {
+  await api('POST', '/api/whatsapp/stop');
+  await refreshWhatsAppStatus();
+}
+
+async function refreshWhatsAppStatus() {
+  try {
+    const s = await api('GET', '/api/whatsapp/status');
+    const statusEl = $('#waStatus');
+    const idEl = $('#waIdentity');
+    const qrBox = $('#waQrBox');
+    const qrImg = $('#waQrImage');
+
+    $('#waEnabled').checked = !!s.enabled;
+
+    let text = 'Disabled';
+    let klass = 'status status-note';
+    if (s.connected) {
+      text = '✓ Connected';
+      klass = 'status status-ok';
+    } else if (s.qr_available) {
+      text = 'Authentication required — scan the QR code';
+      klass = 'status status-ok';
+    } else if (s.bridge_running) {
+      text = 'Bridge running';
+      klass = 'status status-note';
+    }
+    if (s.last_error) text += ` • ${s.last_error}`;
+
+    statusEl.textContent = text;
+    statusEl.className = klass;
+
+    const allowed = (s.allowed_jids || []).length;
+    if (s.own_jid) {
+      idEl.textContent = allowed
+        ? `Self chat: ${s.own_jid} • Allowed JIDs: ${allowed}`
+        : `Self chat only: ${s.own_jid}`;
+      idEl.className = 'status status-note';
+    } else {
+      idEl.textContent = allowed
+        ? `Allowed JIDs configured: ${allowed}`
+        : 'Blank allowed list means self-chat only.';
+      idEl.className = 'status status-note';
+    }
+
+    if (s.qr_available) {
+      qrBox.style.display = 'block';
+      qrImg.src = `/api/whatsapp/qr?ts=${Date.now()}`;
+    } else {
+      qrBox.style.display = 'none';
+      qrImg.removeAttribute('src');
+    }
+  } catch (e) {
+    const statusEl = $('#waStatus');
+    statusEl.textContent = `Status unavailable: ${e.message}`;
+    statusEl.className = 'status status-err';
+  }
+}
+
+// ================================================================
+// GO
+// ================================================================
+init();
+</script>
+</body>
+</html>
