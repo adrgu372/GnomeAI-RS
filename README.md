@@ -2,11 +2,6 @@
 
 Self-hosted Rust AI agent backend with a bundled web UI.
 
-This folder is a publishable project snapshot. It includes only source code,
-build files, the browser UI, and the optional WhatsApp bridge code. It does
-not include chat history, uploaded files, generated documents, logs, auth
-state, or personal configuration.
-
 ## Included
 
 - Rust backend source under `src/`
