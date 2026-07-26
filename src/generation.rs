@@ -1,21 +1,21 @@
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command as StdCommand,
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::{Context, anyhow};
 use regex::Regex;
 use serde_json::{Value, json};
-use tokio::{process::Command, sync::RwLock, time::timeout};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
     config::AppConfig,
     llama::LlamaClient,
     memory::{MemoryStore, append_memory_block, build_working_memory_block},
+    sandbox::{SandboxPolicy, spawn_sandboxed},
     storage::{AppPaths, ChatMessage, build_context},
 };
 
@@ -94,7 +94,7 @@ pub async fn generate_document(
     chat_id: Option<&str>,
     output_format: &str,
 ) -> anyhow::Result<Value> {
-    let example_structure = get_example_structure(history, output_format);
+    let example_structure = get_example_structure(history, output_format).await;
     let ctx = build_context(history, cfg.history_window);
     let memory_block = match memory_state {
         Some(store_state) => {
@@ -193,35 +193,46 @@ async fn execute_generation_code(
         let wrapped = format!("OUTPUT_PATH = r'{}'\n\n{code}\n", output_file.display());
         fs::write(&script_path, wrapped)?;
 
-        let child = Command::new("python3")
-            .arg(&script_path)
-            .current_dir(&tmp_dir)
-            .kill_on_drop(true)
-            .spawn()
-            .context("failed to start python3")?;
-        let output = match timeout(Duration::from_secs(120), child.wait_with_output()).await {
-            Ok(result) => result?,
-            Err(_) => {
-                return Ok(GenerationResult {
-                    ok: false,
-                    url: None,
-                    download_name: None,
-                    error: "Code execution timed out (120s limit)".into(),
-                });
-            }
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() {
+        let mut policy = SandboxPolicy::workspace_write(&tmp_dir);
+        policy.writable = vec![tmp_dir.clone()];
+        policy.allow_network = false;
+        policy.require_landlock = true;
+        policy.timeout_ms = 120_000;
+        policy.max_output_bytes = 128 * 1024;
+        policy.env_allowlist = vec!["PATH".into(), "LANG".into(), "LC_ALL".into()];
+        let output = spawn_sandboxed(
+            &policy,
+            "python3",
+            &[script_path.to_string_lossy().into_owned()],
+        )
+        .await
+        .context("failed to start sandboxed python3")?;
+        if output.timed_out {
+            return Ok(GenerationResult {
+                ok: false,
+                url: None,
+                download_name: None,
+                error: "Code execution timed out (120s limit)".into(),
+            });
+        }
+        if output.cancelled {
+            return Ok(GenerationResult {
+                ok: false,
+                url: None,
+                download_name: None,
+                error: "Code execution was cancelled".into(),
+            });
+        }
+        if output.exit_code != Some(0) {
             return Ok(GenerationResult {
                 ok: false,
                 url: None,
                 download_name: None,
                 error: tail(
-                    if stderr.trim().is_empty() {
-                        stdout.as_ref()
+                    if output.stderr.trim().is_empty() {
+                        &output.stdout
                     } else {
-                        stderr.as_ref()
+                        &output.stderr
                     },
                     500,
                 ),
@@ -231,13 +242,14 @@ async fn execute_generation_code(
         let generated = find_generated_file(&tmp_dir, output_format).ok_or_else(|| {
             anyhow!(
                 "No .{output_format} file was created.\nstdout: {}\nstderr: {}",
-                tail(stdout.as_ref(), 300),
-                tail(stderr.as_ref(), 300)
+                tail(&output.stdout, 300),
+                tail(&output.stderr, 300)
             )
         })?;
         let final_name = format!("gen_{gen_id}.{output_format}");
         let dest = paths.generated_dir.join(&final_name);
         fs::copy(generated, &dest)?;
+        fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600))?;
 
         Ok(GenerationResult {
             ok: true,
@@ -280,7 +292,7 @@ fn tail(text: &str, max_chars: usize) -> String {
     chars[start..].iter().collect()
 }
 
-fn get_example_structure(history: &[ChatMessage], output_format: &str) -> String {
+async fn get_example_structure(history: &[ChatMessage], output_format: &str) -> String {
     let Some((target_ext, script)) = (match output_format {
         "docx" => Some(("docx", DOCX_STRUCTURE_SCRIPT)),
         "xlsx" => Some(("xlsx", XLSX_STRUCTURE_SCRIPT)),
@@ -303,27 +315,42 @@ fn get_example_structure(history: &[ChatMessage], output_format: &str) -> String
         if !path.exists() {
             continue;
         }
-        return run_structure_script(script, path);
+        return run_structure_script(script, path).await;
     }
     String::new()
 }
 
-fn run_structure_script(script: &str, path: &Path) -> String {
-    let output = StdCommand::new("python3")
-        .arg("-c")
-        .arg(script)
-        .arg(path)
-        .output();
-    match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .chars()
-            .take(8_000)
-            .collect(),
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            format!("Could not parse example: {}", tail(stderr.as_ref(), 500))
+async fn run_structure_script(script: &str, path: &Path) -> String {
+    let Some(cwd) = path.parent() else {
+        return "Could not parse example: invalid path".into();
+    };
+    let mut policy = SandboxPolicy::read_only(cwd);
+    policy.allow_network = false;
+    policy.require_landlock = true;
+    policy.timeout_ms = 30_000;
+    policy.max_output_bytes = 16 * 1024;
+    policy.env_allowlist = vec!["PATH".into(), "LANG".into(), "LC_ALL".into()];
+    let args = vec![
+        "-c".into(),
+        script.into(),
+        path.to_string_lossy().into_owned(),
+    ];
+    match spawn_sandboxed(&policy, "python3", &args).await {
+        Ok(output) if output.exit_code == Some(0) && !output.timed_out => {
+            output.stdout.trim().chars().take(8_000).collect()
         }
+        Ok(output) if output.timed_out => "Could not parse example: timed out".into(),
+        Ok(output) => format!(
+            "Could not parse example: {}",
+            tail(
+                if output.stderr.trim().is_empty() {
+                    &output.stdout
+                } else {
+                    &output.stderr
+                },
+                500
+            )
+        ),
         Err(err) => format!("Could not parse example: {err}"),
     }
 }

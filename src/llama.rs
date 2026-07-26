@@ -35,6 +35,10 @@ impl LlamaClient {
     }
 
     pub async fn list_models(&self, cfg: &AppConfig) -> anyhow::Result<Vec<ModelInfo>> {
+        if cfg.provider_protocol == "anthropic" {
+            return Ok(Vec::new());
+        }
+        ensure_web_provider_supported(cfg)?;
         let mut last_error = None;
         for url in candidate_model_urls(cfg) {
             let result = self.http.get(&url).headers(headers(cfg)?).send().await;
@@ -98,6 +102,12 @@ impl LlamaClient {
         messages: Vec<Value>,
         temperature: f64,
     ) -> anyhow::Result<TokenStream> {
+        if cfg.provider_protocol == "anthropic" {
+            return self
+                .anthropic_chat_stream(cfg, model, messages, temperature)
+                .await;
+        }
+        ensure_web_provider_supported(cfg)?;
         let has_images = messages_have_images(&messages);
         let mut last_error = None;
         let mut attempted = false;
@@ -118,13 +128,14 @@ impl LlamaClient {
                     "stream": true,
                 })
             } else {
-                json!({
+                let mut payload = json!({
                     "model": model,
                     "messages": messages,
                     "temperature": temperature,
-                    "max_tokens": cfg.llama_max_tokens,
                     "stream": true,
-                })
+                });
+                set_openai_token_limit(cfg, &mut payload);
+                payload
             };
 
             let response = self
@@ -174,6 +185,12 @@ impl LlamaClient {
         tools: Option<Vec<Value>>,
         tool_choice: Option<Value>,
     ) -> anyhow::Result<LlamaResponse> {
+        if cfg.provider_protocol == "anthropic" {
+            return self
+                .anthropic_chat(cfg, model, messages, temperature, tools)
+                .await;
+        }
+        ensure_web_provider_supported(cfg)?;
         let has_images = messages_have_images(&messages);
         let has_tools = tools.as_ref().is_some_and(|items| !items.is_empty());
         let mut last_error = None;
@@ -202,9 +219,9 @@ impl LlamaClient {
                     "model": model,
                     "messages": messages,
                     "temperature": temperature,
-                    "max_tokens": cfg.llama_max_tokens,
                     "stream": false,
                 });
+                set_openai_token_limit(cfg, &mut payload);
                 if let Some(tools) = tools.clone() {
                     payload["tools"] = Value::Array(tools);
                     if let Some(tool_choice) = tool_choice.clone() {
@@ -264,6 +281,118 @@ impl LlamaClient {
         }
         Err(last_error.unwrap_or_else(|| anyhow!("llama-server request failed")))
     }
+
+    async fn anthropic_chat(
+        &self,
+        cfg: &AppConfig,
+        model: &str,
+        messages: Vec<Value>,
+        temperature: f64,
+        tools: Option<Vec<Value>>,
+    ) -> anyhow::Result<LlamaResponse> {
+        let (system, messages) = anthropic_messages(&messages);
+        let mut payload = json!({
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": cfg.llama_max_tokens,
+            "stream": false,
+        });
+        if !system.is_empty() {
+            payload["system"] = json!(system);
+        }
+        if let Some(tools) = tools {
+            let tools = tools
+                .iter()
+                .filter_map(anthropic_tool_schema)
+                .collect::<Vec<_>>();
+            if !tools.is_empty() {
+                payload["tools"] = Value::Array(tools);
+            }
+        }
+
+        let url = anthropic_messages_url(cfg);
+        let response = self
+            .http
+            .post(&url)
+            .headers(anthropic_headers(cfg)?)
+            .json(&payload)
+            .send()
+            .await
+            .context("Anthropic request failed")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            bail!(
+                "Anthropic returned {status}: {}",
+                body.chars().take(800).collect::<String>()
+            );
+        }
+        let response: Value = response
+            .json()
+            .await
+            .context("failed to parse Anthropic response")?;
+        Ok(anthropic_response(&response))
+    }
+
+    async fn anthropic_chat_stream(
+        &self,
+        cfg: &AppConfig,
+        model: &str,
+        messages: Vec<Value>,
+        temperature: f64,
+    ) -> anyhow::Result<TokenStream> {
+        let (system, messages) = anthropic_messages(&messages);
+        let mut payload = json!({
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": cfg.llama_max_tokens,
+            "stream": true,
+        });
+        if !system.is_empty() {
+            payload["system"] = json!(system);
+        }
+        let url = anthropic_messages_url(cfg);
+        let response = self
+            .http
+            .post(&url)
+            .headers(anthropic_headers(cfg)?)
+            .json(&payload)
+            .send()
+            .await
+            .context("Anthropic streaming request failed")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            bail!(
+                "Anthropic returned {status}: {}",
+                body.chars().take(800).collect::<String>()
+            );
+        }
+        Ok(Box::pin(stream_anthropic_tokens(response)))
+    }
+}
+
+fn ensure_web_provider_supported(cfg: &AppConfig) -> anyhow::Result<()> {
+    match cfg.provider_protocol.as_str() {
+        "codex" => bail!(
+            "OpenAI account login is available in the terminal agent; choose an API provider in WebTool"
+        ),
+        "claude-cli" => bail!(
+            "Claude Code account login is available in the terminal agent; choose an API provider in WebTool"
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn set_openai_token_limit(cfg: &AppConfig, payload: &mut Value) {
+    let key = if cfg.provider_id == "openai" {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    payload[key] = json!(cfg.llama_max_tokens);
 }
 
 fn stream_tokens_from_response(
@@ -358,6 +487,248 @@ fn headers(cfg: &AppConfig) -> anyhow::Result<HeaderMap> {
         headers.insert(AUTHORIZATION, HeaderValue::from_str(&value)?);
     }
     Ok(headers)
+}
+
+fn anthropic_headers(cfg: &AppConfig) -> anyhow::Result<HeaderMap> {
+    if cfg.llama_api_key.trim().is_empty() {
+        bail!("Anthropic API key is missing");
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        "x-api-key",
+        HeaderValue::from_str(cfg.llama_api_key.trim())?,
+    );
+    headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    Ok(headers)
+}
+
+fn anthropic_messages_url(cfg: &AppConfig) -> String {
+    let base = cfg.llama_base_url.trim().trim_end_matches('/');
+    if base.ends_with("/messages") {
+        base.to_string()
+    } else if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    }
+}
+
+fn anthropic_messages(messages: &[Value]) -> (String, Vec<Value>) {
+    let system = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+        .filter_map(|message| message.get("content"))
+        .map(extract_message_text)
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let mut converted = Vec::<Value>::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        let (role, mut blocks) = match role {
+            "system" => continue,
+            "assistant" | "gnome" => {
+                let mut blocks =
+                    anthropic_content_blocks(message.get("content").unwrap_or(&Value::Null));
+                if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+                    for call in calls {
+                        let function = call.get("function").unwrap_or(&Value::Null);
+                        let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let input = function
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                            .unwrap_or_else(|| json!({}));
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": call.get("id").and_then(Value::as_str).unwrap_or("call"),
+                            "name": name,
+                            "input": input,
+                        }));
+                    }
+                }
+                ("assistant", blocks)
+            }
+            "tool" => (
+                "user",
+                vec![json!({
+                    "type": "tool_result",
+                    "tool_use_id": message
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("call"),
+                    "content": extract_message_text(
+                        message.get("content").unwrap_or(&Value::Null)
+                    ),
+                })],
+            ),
+            _ => (
+                "user",
+                anthropic_content_blocks(message.get("content").unwrap_or(&Value::Null)),
+            ),
+        };
+        if blocks.is_empty() {
+            blocks.push(json!({"type": "text", "text": ""}));
+        }
+
+        if let Some(previous) = converted.last_mut()
+            && previous.get("role").and_then(Value::as_str) == Some(role)
+            && let Some(content) = previous.get_mut("content").and_then(Value::as_array_mut)
+        {
+            content.extend(blocks);
+        } else {
+            converted.push(json!({"role": role, "content": blocks}));
+        }
+    }
+    (system, converted)
+}
+
+fn anthropic_content_blocks(content: &Value) -> Vec<Value> {
+    match content {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                let kind = item.get("type").and_then(Value::as_str);
+                if kind == Some("text") {
+                    return Some(json!({
+                        "type": "text",
+                        "text": item.get("text").and_then(Value::as_str).unwrap_or(""),
+                    }));
+                }
+                if matches!(kind, Some("image_url" | "input_image" | "image")) {
+                    let url = item
+                        .pointer("/image_url/url")
+                        .or_else(|| item.get("image_url"))
+                        .or_else(|| item.get("url"))
+                        .and_then(Value::as_str)?;
+                    if let Some(data) = url.strip_prefix("data:")
+                        && let Some((media_type, encoded)) = data.split_once(";base64,")
+                    {
+                        return Some(json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": encoded,
+                            }
+                        }));
+                    }
+                    return Some(json!({
+                        "type": "image",
+                        "source": {"type": "url", "url": url},
+                    }));
+                }
+                let text = extract_message_text(item);
+                (!text.is_empty()).then(|| json!({"type": "text", "text": text}))
+            })
+            .collect(),
+        _ => {
+            let text = extract_message_text(content);
+            vec![json!({"type": "text", "text": text})]
+        }
+    }
+}
+
+fn anthropic_tool_schema(tool: &Value) -> Option<Value> {
+    let function = tool.get("function")?;
+    let name = function.get("name").and_then(Value::as_str)?;
+    Some(json!({
+        "name": name,
+        "description": function
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        "input_schema": function
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object"})),
+    }))
+}
+
+fn anthropic_response(payload: &Value) -> LlamaResponse {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    if let Some(blocks) = payload.get("content").and_then(Value::as_array) {
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    text.push_str(block.get("text").and_then(Value::as_str).unwrap_or(""));
+                }
+                Some("tool_use") => {
+                    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                    if !name.is_empty() {
+                        tool_calls.push(json!({
+                            "id": block.get("id").and_then(Value::as_str).unwrap_or("call"),
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": block
+                                    .get("input")
+                                    .cloned()
+                                    .unwrap_or_else(|| json!({}))
+                                    .to_string(),
+                            }
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    LlamaResponse {
+        content: text,
+        tool_calls,
+    }
+}
+
+fn stream_anthropic_tokens(
+    response: reqwest::Response,
+) -> impl Stream<Item = anyhow::Result<String>> + Send {
+    try_stream! {
+        let mut chunks = response.bytes_stream();
+        let mut buffer = String::new();
+        while let Some(chunk) = chunks.next().await {
+            buffer.push_str(&String::from_utf8_lossy(&chunk?));
+            while let Some(pos) = buffer.find('\n') {
+                let mut line = buffer[..pos].to_string();
+                buffer.drain(..=pos);
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+                let line = line.trim();
+                let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                    continue;
+                };
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+                let payload: Value = serde_json::from_str(data)?;
+                if payload.get("type").and_then(Value::as_str) == Some("error") {
+                    let message = payload
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown Anthropic stream error");
+                    Err(anyhow!("Anthropic stream error: {message}"))?;
+                }
+                if payload.pointer("/delta/type").and_then(Value::as_str)
+                    == Some("text_delta")
+                    && let Some(text) = payload.pointer("/delta/text").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    yield text.to_string();
+                }
+            }
+        }
+    }
 }
 
 pub fn parse_models(payload: &Value) -> Vec<ModelInfo> {

@@ -1,17 +1,19 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose};
 use mime_guess::MimeGuess;
 use regex::Regex;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::storage::AppPaths;
+use crate::{
+    sandbox::{SandboxPolicy, spawn_sandboxed},
+    storage::{AppPaths, write_private},
+};
 
 pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "bmp", "gif", "webp"];
 
@@ -99,11 +101,11 @@ pub fn file_type_from_name(filename: &str) -> String {
     }
 }
 
-pub fn read_file(path: &Path) -> anyhow::Result<ReadFileResult> {
+pub async fn read_file(path: &Path) -> anyhow::Result<ReadFileResult> {
     let file_type = file_type_from_name(path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
     match file_type.as_str() {
         "image" => {
-            let ocr = ocr_image(path).unwrap_or_default();
+            let ocr = ocr_image(path).await.unwrap_or_default();
             Ok(ReadFileResult {
                 file_type,
                 path: path.to_path_buf(),
@@ -112,8 +114,9 @@ pub fn read_file(path: &Path) -> anyhow::Result<ReadFileResult> {
             })
         }
         "pdf" => {
-            let content =
-                pdftotext(path).unwrap_or_else(|_| "PDF text extraction unavailable.".into());
+            let content = pdftotext(path)
+                .await
+                .unwrap_or_else(|_| "PDF text extraction unavailable.".into());
             Ok(ReadFileResult {
                 file_type,
                 path: path.to_path_buf(),
@@ -136,32 +139,60 @@ pub fn read_file(path: &Path) -> anyhow::Result<ReadFileResult> {
     }
 }
 
-fn ocr_image(path: &Path) -> anyhow::Result<String> {
-    let output = Command::new("tesseract")
-        .arg(path)
-        .arg("stdout")
-        .arg("--oem")
-        .arg("1")
-        .arg("--psm")
-        .arg("3")
-        .output()
-        .with_context(|| "failed to run tesseract")?;
-    if !output.status.success() {
-        return Ok(String::new());
+async fn run_parser(path: &Path, program: &str, args: Vec<String>) -> anyhow::Result<String> {
+    let cwd = path
+        .parent()
+        .ok_or_else(|| anyhow!("uploaded file has no parent directory"))?;
+    let mut policy = SandboxPolicy::read_only(cwd);
+    policy.allow_network = false;
+    policy.require_landlock = true;
+    policy.timeout_ms = 30_000;
+    policy.max_output_bytes = 1024 * 1024;
+    policy.env_allowlist = vec!["PATH".into(), "LANG".into(), "LC_ALL".into()];
+    let output = spawn_sandboxed(&policy, program, &args)
+        .await
+        .with_context(|| format!("failed to run sandboxed {program}"))?;
+    if output.timed_out {
+        bail!("{program} timed out after 30 seconds");
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    if output.exit_code != Some(0) {
+        let detail = if output.stderr.trim().is_empty() {
+            output.stdout.trim()
+        } else {
+            output.stderr.trim()
+        };
+        bail!("{program} failed: {detail}");
+    }
+    Ok(output.stdout.trim().to_string())
 }
 
-fn pdftotext(path: &Path) -> anyhow::Result<String> {
-    let output = Command::new("pdftotext")
-        .arg(path)
-        .arg("-")
-        .output()
-        .with_context(|| "failed to run pdftotext")?;
-    if !output.status.success() {
+async fn ocr_image(path: &Path) -> anyhow::Result<String> {
+    let output = run_parser(
+        path,
+        "tesseract",
+        vec![
+            path.to_string_lossy().into_owned(),
+            "stdout".into(),
+            "--oem".into(),
+            "1".into(),
+            "--psm".into(),
+            "3".into(),
+        ],
+    )
+    .await?;
+    if output.is_empty() {
         return Ok(String::new());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(output)
+}
+
+async fn pdftotext(path: &Path) -> anyhow::Result<String> {
+    run_parser(
+        path,
+        "pdftotext",
+        vec![path.to_string_lossy().into_owned(), "-".into()],
+    )
+    .await
 }
 
 pub fn encode_image_as_base64(path: &Path) -> anyhow::Result<String> {
@@ -177,7 +208,7 @@ pub fn encode_image_as_data_url(path: &Path) -> anyhow::Result<String> {
     ))
 }
 
-pub fn save_base64_image(
+pub async fn save_base64_image(
     paths: &AppPaths,
     media_dir: &Path,
     filename: Option<&str>,
@@ -208,8 +239,8 @@ pub fn save_base64_image(
         ));
     }
     let dest = unique_upload_path(media_dir, &clean)?;
-    fs::write(&dest, raw)?;
-    let read = read_file(&dest)?;
+    write_private(&dest, &raw)?;
+    let read = read_file(&dest).await?;
     let final_name = dest
         .file_name()
         .and_then(|name| name.to_str())

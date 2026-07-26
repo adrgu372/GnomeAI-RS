@@ -1,5 +1,7 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -33,8 +35,14 @@ pub struct AppPaths {
 impl AppPaths {
     pub fn new(app_dir: PathBuf) -> anyhow::Result<Self> {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| app_dir.clone());
+        let asset_dir = std::env::var_os("GNOMEF_RS_ASSETS").map(PathBuf::from);
         let index_file = [
             app_dir.join("index.html"),
+            asset_dir
+                .as_ref()
+                .map(|dir| dir.join("index.html"))
+                .unwrap_or_else(|| app_dir.join("index.html")),
+            PathBuf::from("/usr/share/gnomeai-rs/index.html"),
             app_dir
                 .parent()
                 .map(|parent| parent.join("index.html"))
@@ -48,6 +56,11 @@ impl AppPaths {
         .unwrap_or_else(|| app_dir.join("index.html"));
         let whatsapp_bridge_file = [
             app_dir.join("whatsapp").join("bridge.mjs"),
+            asset_dir
+                .as_ref()
+                .map(|dir| dir.join("whatsapp").join("bridge.mjs"))
+                .unwrap_or_else(|| app_dir.join("whatsapp").join("bridge.mjs")),
+            PathBuf::from("/usr/share/gnomeai-rs/whatsapp/bridge.mjs"),
             app_dir
                 .parent()
                 .map(|parent| parent.join("whatsapp").join("bridge.mjs"))
@@ -84,6 +97,7 @@ impl AppPaths {
 
     pub fn ensure_dirs(&self) -> anyhow::Result<()> {
         for dir in [
+            &self.app_dir,
             &self.chats_dir,
             &self.uploads_dir,
             &self.whatsapp_media_dir,
@@ -95,9 +109,46 @@ impl AppPaths {
         ] {
             fs::create_dir_all(dir)
                 .with_context(|| format!("failed to create {}", dir.display()))?;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("failed to protect {}", dir.display()))?;
         }
         Ok(())
     }
+}
+
+/// Atomically replace a private state file.
+///
+/// State can contain chat transcripts and persistent memory. Creating the
+/// temporary file as `0600` prevents a permissive umask from exposing either
+/// the old or new contents to other local users.
+pub fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to protect {}", parent.display()))?;
+
+    let temporary = parent.join(format!(".state-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to protect {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,8 +274,7 @@ pub fn load_chat(paths: &AppPaths, cid: &str) -> anyhow::Result<Chat> {
 pub fn save_chat(paths: &AppPaths, chat: &Chat) -> anyhow::Result<()> {
     let path = chat_file_path(paths, &chat.id)?;
     let raw = serde_json::to_string_pretty(chat)?;
-    fs::write(path, raw)?;
-    Ok(())
+    write_private(&path, raw.as_bytes())
 }
 
 pub fn delete_chat(paths: &AppPaths, cid: &str) -> anyhow::Result<()> {
@@ -238,7 +288,10 @@ pub fn delete_chat(paths: &AppPaths, cid: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{LazyLock, Mutex},
+    };
 
     static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -247,16 +300,8 @@ mod tests {
         let _guard = CWD_LOCK.lock().unwrap();
         let original_cwd = std::env::current_dir().unwrap();
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let project_index = [
-            manifest_dir.join("index.html"),
-            manifest_dir
-                .parent()
-                .map(|parent| parent.join("index.html"))
-                .unwrap_or_else(|| manifest_dir.join("index.html")),
-        ]
-        .into_iter()
-        .find(|path| path.exists())
-        .expect("missing project index.html");
+        let project_index = manifest_dir.join("index.html");
+        assert!(project_index.exists(), "missing project index.html");
         let expected_index = project_index.canonicalize().unwrap_or(project_index);
 
         let temp_dir = std::env::temp_dir().join(format!(
@@ -264,10 +309,36 @@ mod tests {
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         std::env::set_current_dir(&manifest_dir).unwrap();
+        // Pin the asset directory: it outranks any system-wide install under
+        // /usr/share, which would otherwise make this test machine-dependent.
+        unsafe {
+            std::env::set_var("GNOMEF_RS_ASSETS", &manifest_dir);
+        }
         let paths = AppPaths::new(temp_dir.clone()).unwrap();
+        unsafe {
+            std::env::remove_var("GNOMEF_RS_ASSETS");
+        }
         assert_eq!(paths.index_file, expected_index);
         let _ = std::env::set_current_dir(original_cwd);
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn state_directories_and_chats_are_private() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("gnomef-private-state-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths::new(temp_dir.clone()).unwrap();
+        let chat = new_chat(&paths).unwrap();
+
+        let dir_mode = fs::metadata(&temp_dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(chat_file_path(&paths, &chat.id).unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        fs::remove_dir_all(temp_dir).unwrap();
     }
 }
 

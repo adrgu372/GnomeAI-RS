@@ -1,4 +1,4 @@
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, path::PathBuf, process::Stdio, time::Duration};
 
 use anyhow::anyhow;
 use regex::Regex;
@@ -23,6 +23,12 @@ pub struct FirecrawlBundle {
 }
 
 pub async fn firecrawl_search(cfg: &AppConfig, query: &str) -> FirecrawlBundle {
+    if !cfg.web_search_enabled {
+        return FirecrawlBundle {
+            entries: Vec::new(),
+            text: "[Firecrawl: Web Search is disabled.]".into(),
+        };
+    }
     if firecrawl_base_url(cfg).is_empty() {
         return FirecrawlBundle {
             entries: Vec::new(),
@@ -32,6 +38,7 @@ pub async fn firecrawl_search(cfg: &AppConfig, query: &str) -> FirecrawlBundle {
 
     let client = reqwest::Client::new();
     let result: anyhow::Result<FirecrawlBundle> = async {
+        ensure_local_firecrawl(&client, cfg).await?;
         let response = firecrawl_post(
             &client,
             cfg,
@@ -76,7 +83,145 @@ pub async fn firecrawl_search(cfg: &AppConfig, query: &str) -> FirecrawlBundle {
 
 pub async fn firecrawl_fetch(cfg: &AppConfig, url: &str) -> FirecrawlEntry {
     let client = reqwest::Client::new();
+    if !cfg.web_search_enabled {
+        return firecrawl_error_entry(url, "Web Search is disabled");
+    }
+    if let Err(error) = ensure_local_firecrawl(&client, cfg).await {
+        return firecrawl_error_entry(url, &error.to_string());
+    }
     scrape_result(&client, cfg, url).await
+}
+
+/// Serialises lazy startup process-wide: with parallel searches in flight,
+/// exactly one caller runs the launcher while the rest wait and re-check.
+static FIRECRAWL_LAUNCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn ensure_local_firecrawl(client: &reqwest::Client, cfg: &AppConfig) -> anyhow::Result<()> {
+    // Callers gate on `web_search_enabled` before reaching this point, so a
+    // disabled switch can never start containers. Keep the invariant here too.
+    if !cfg.web_search_enabled {
+        return Err(anyhow!("Web Search is disabled"));
+    }
+    let base = firecrawl_base_url(cfg);
+    if !is_local_firecrawl_url(&base) {
+        return Ok(());
+    }
+    if firecrawl_is_reachable(client, &base).await {
+        return Ok(());
+    }
+
+    let _launch_guard = FIRECRAWL_LAUNCH.lock().await;
+    // Someone else may have finished the launch while we waited for the lock.
+    if firecrawl_is_reachable(client, &base).await {
+        return Ok(());
+    }
+
+    let launcher = firecrawl_launcher().ok_or_else(|| {
+        anyhow!(
+            "local Firecrawl is not running and the lazy-start launcher was not found; \
+             install the packaged `gnomeai-firecrawl` script or point `firecrawl_api_url` \
+             to a running Firecrawl instance"
+        )
+    })?;
+    if !command_in_path("podman") {
+        return Err(anyhow!(
+            "Podman is not installed, so the packaged rootless Firecrawl cannot start. \
+             Install it (e.g. `sudo apt install podman`) or set `firecrawl_api_url` to a \
+             hosted Firecrawl endpoint"
+        ));
+    }
+    let output = tokio::process::Command::new(&launcher)
+        .arg("ensure")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| anyhow!("cannot run {}: {error}", launcher.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut detail: String = stderr.trim().chars().take(500).collect();
+        if detail.is_empty() {
+            detail = "no error output".into();
+        }
+        return Err(anyhow!(
+            "local Firecrawl could not start: {detail} — check `gnomeai-firecrawl logs` and \
+             that rootless Podman works for this user (`podman info`)"
+        ));
+    }
+
+    for _ in 0..60 {
+        if firecrawl_is_reachable(client, &base).await {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    Err(anyhow!(
+        "local Firecrawl did not become ready at {base} within 60 seconds; \
+         inspect `gnomeai-firecrawl status` and `gnomeai-firecrawl logs`"
+    ))
+}
+
+pub fn command_in_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                let candidate = dir.join(name);
+                candidate.is_file()
+            })
+        })
+        .unwrap_or(false)
+}
+
+async fn firecrawl_is_reachable(client: &reqwest::Client, base: &str) -> bool {
+    client
+        .get(base)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .is_ok()
+}
+
+fn is_local_firecrawl_url(base: &str) -> bool {
+    let lower = base.to_ascii_lowercase();
+    lower.starts_with("http://127.0.0.1:")
+        || lower.starts_with("http://localhost:")
+        || lower.starts_with("http://[::1]:")
+}
+
+fn firecrawl_launcher() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("GNOMEF_FIRECRAWL_LAUNCHER") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            if let Ok(path) = path.canonicalize() {
+                return Some(path);
+            }
+        }
+    }
+
+    let mut candidates = vec![
+        PathBuf::from("/usr/lib/gnomeai-rs/firecrawl/gnomeai-firecrawl"),
+        PathBuf::from("scripts/gnomeai-firecrawl"),
+    ];
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        candidates.push(parent.join("firecrawl").join("gnomeai-firecrawl"));
+        candidates.push(parent.join("..").join("scripts").join("gnomeai-firecrawl"));
+    }
+    candidates
+        .into_iter()
+        .filter(|path| path.is_file())
+        .find_map(|path| path.canonicalize().ok())
+}
+
+fn firecrawl_error_entry(url: &str, message: &str) -> FirecrawlEntry {
+    FirecrawlEntry {
+        title: String::new(),
+        url: url.to_string(),
+        description: String::new(),
+        content: format!("[Firecrawl error: {message}]"),
+    }
 }
 
 pub fn build_release_answer(query: &str, entries: &[FirecrawlEntry]) -> Option<String> {
@@ -353,12 +498,8 @@ async fn scrape_result(client: &reqwest::Client, cfg: &AppConfig, url: &str) -> 
     .await;
 
     let Ok(response) = response else {
-        return FirecrawlEntry {
-            title: String::new(),
-            url: url.into(),
-            description: String::new(),
-            content: String::new(),
-        };
+        let error = response.unwrap_err();
+        return firecrawl_error_entry(url, &error.to_string());
     };
     let payload = extract_scrape_payload(&response);
     let metadata = payload

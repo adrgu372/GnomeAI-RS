@@ -1,0 +1,194 @@
+#!/bin/sh
+set -eu
+
+# Lazy, rootless Firecrawl runtime for the Debian package. It deliberately uses
+# Podman instead of a privileged Docker daemon, so the installed application
+# never needs sudo.
+
+POD_NAME=gnomeai-firecrawl
+API_CONTAINER=gnomeai-firecrawl-api
+REDIS_CONTAINER=gnomeai-firecrawl-redis
+RABBIT_CONTAINER=gnomeai-firecrawl-rabbitmq
+POSTGRES_CONTAINER=gnomeai-firecrawl-postgres
+PLAYWRIGHT_CONTAINER=gnomeai-firecrawl-playwright
+
+# Official public Firecrawl images, pinned to the linux/amd64 manifests used
+# when this package was assembled. The complete matching source is distributed
+# beside the package documentation.
+API_IMAGE=ghcr.io/firecrawl/firecrawl@sha256:14baa3de4ed7636524359e21b01a86e5042997ab384eec5b1d77f5e1342d1222
+PLAYWRIGHT_IMAGE=ghcr.io/firecrawl/playwright-service@sha256:bd504f4f1068bbba36599bea38f4971d4d2e6b09a030a8b19baf0021ddbaedbc
+POSTGRES_IMAGE=ghcr.io/firecrawl/nuq-postgres@sha256:4ca6718b2cef40404b046db5cd37ae45db3e44d1a5750c80522f3587a5b193d5
+REDIS_IMAGE=docker.io/library/redis:7-alpine
+RABBIT_IMAGE=docker.io/library/rabbitmq:3.13-management-alpine
+
+state_root=${XDG_STATE_HOME:-${HOME:?HOME is not set}/.local/state}/gnomeai-rs/firecrawl
+data_root=${XDG_DATA_HOME:-${HOME:?HOME is not set}/.local/share}/gnomeai-rs/firecrawl
+action=${1:-ensure}
+
+mkdir -p "$state_root" "$data_root"
+
+healthcheck() {
+    command -v curl >/dev/null 2>&1 || return 1
+    curl --fail --silent --show-error --max-time 2 \
+        http://127.0.0.1:3002/ >/dev/null 2>&1
+}
+
+require_runtime() {
+    if ! command -v podman >/dev/null 2>&1; then
+        echo "Firecrawl local necesită Podman rootless. Instalează pachetul recomandat «podman»." >&2
+        exit 69
+    fi
+}
+
+pod_exists() {
+    podman pod exists "$POD_NAME"
+}
+
+container_exists() {
+    podman container exists "$1"
+}
+
+ensure_secret() {
+    secret_file=$state_root/bull-auth-key
+    if [ ! -s "$secret_file" ]; then
+        umask 077
+        od -An -N24 -tx1 /dev/urandom | tr -d ' \n' >"$secret_file"
+    fi
+    cat "$secret_file"
+}
+
+create_pod() {
+    if ! pod_exists; then
+        podman pod create \
+            --name "$POD_NAME" \
+            --publish 127.0.0.1:3002:3002 >/dev/null
+    fi
+}
+
+create_services() {
+    if ! container_exists "$REDIS_CONTAINER"; then
+        podman run -d --pod "$POD_NAME" --name "$REDIS_CONTAINER" \
+            --restart on-failure \
+            "$REDIS_IMAGE" redis-server --bind 0.0.0.0 >/dev/null
+    fi
+
+    if ! container_exists "$RABBIT_CONTAINER"; then
+        podman run -d --pod "$POD_NAME" --name "$RABBIT_CONTAINER" \
+            --restart on-failure \
+            "$RABBIT_IMAGE" rabbitmq-server >/dev/null
+    fi
+
+    podman volume exists gnomeai-firecrawl-postgres-data ||
+        podman volume create gnomeai-firecrawl-postgres-data >/dev/null
+    if ! container_exists "$POSTGRES_CONTAINER"; then
+        podman run -d --pod "$POD_NAME" --name "$POSTGRES_CONTAINER" \
+            --restart on-failure \
+            -e POSTGRES_USER=firecrawl \
+            -e POSTGRES_PASSWORD=firecrawl_local \
+            -e POSTGRES_DB=firecrawl \
+            -v gnomeai-firecrawl-postgres-data:/var/lib/postgresql/data \
+            "$POSTGRES_IMAGE" >/dev/null
+    fi
+
+    if ! container_exists "$PLAYWRIGHT_CONTAINER"; then
+        podman run -d --pod "$POD_NAME" --name "$PLAYWRIGHT_CONTAINER" \
+            --restart on-failure \
+            -e PORT=3000 \
+            -e BLOCK_MEDIA=true \
+            -e MAX_CONCURRENT_PAGES=4 \
+            --tmpfs /tmp/.cache:rw,nosuid,nodev,size=1g \
+            "$PLAYWRIGHT_IMAGE" >/dev/null
+    fi
+
+    if ! container_exists "$API_CONTAINER"; then
+        bull_key=$(ensure_secret)
+        podman run -d --pod "$POD_NAME" --name "$API_CONTAINER" \
+            --restart on-failure \
+            -e HOST=0.0.0.0 \
+            -e PORT=3002 \
+            -e INTERNAL_PORT=3002 \
+            -e ENV=local \
+            -e USE_DB_AUTHENTICATION=false \
+            -e REDIS_URL=redis://127.0.0.1:6379 \
+            -e REDIS_RATE_LIMIT_URL=redis://127.0.0.1:6379 \
+            -e PLAYWRIGHT_MICROSERVICE_URL=http://127.0.0.1:3000/scrape \
+            -e POSTGRES_USER=firecrawl \
+            -e POSTGRES_PASSWORD=firecrawl_local \
+            -e POSTGRES_DB=firecrawl \
+            -e POSTGRES_HOST=127.0.0.1 \
+            -e POSTGRES_PORT=5432 \
+            -e NUQ_RABBITMQ_URL=amqp://127.0.0.1:5672 \
+            -e BULL_AUTH_KEY="$bull_key" \
+            -e NUM_WORKERS_PER_QUEUE=4 \
+            -e CRAWL_CONCURRENT_REQUESTS=4 \
+            -e MAX_CONCURRENT_JOBS=3 \
+            -e BROWSER_POOL_SIZE=3 \
+            "$API_IMAGE" node dist/src/harness.js --start-docker >/dev/null
+    fi
+}
+
+ensure_running() {
+    if healthcheck; then
+        exit 0
+    fi
+    require_runtime
+
+    # Serialise first-use image pulls and container creation across WebTool and
+    # terminal-agent processes.
+    exec 9>"$state_root/start.lock"
+    flock 9
+    if healthcheck; then
+        exit 0
+    fi
+
+    if pod_exists; then
+        podman pod start "$POD_NAME" >/dev/null 2>&1 || true
+    fi
+    create_pod
+    create_services
+
+    attempt=0
+    while [ "$attempt" -lt 120 ]; do
+        if healthcheck; then
+            echo "Firecrawl este disponibil la http://127.0.0.1:3002"
+            exit 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+
+    echo "Firecrawl nu a devenit disponibil. Verifică: podman logs $API_CONTAINER" >&2
+    exit 70
+}
+
+case "$action" in
+    ensure|start)
+        ensure_running
+        ;;
+    status)
+        if healthcheck; then
+            echo "running http://127.0.0.1:3002"
+        elif command -v podman >/dev/null 2>&1 && pod_exists; then
+            podman pod ps --filter "name=$POD_NAME"
+            exit 1
+        else
+            echo "stopped"
+            exit 1
+        fi
+        ;;
+    stop)
+        require_runtime
+        if pod_exists; then
+            podman pod stop "$POD_NAME" >/dev/null
+        fi
+        ;;
+    logs)
+        require_runtime
+        podman logs "$API_CONTAINER"
+        ;;
+    *)
+        echo "usage: gnomeai-firecrawl ensure|start|status|stop|logs" >&2
+        exit 64
+        ;;
+esac
+

@@ -1,4 +1,9 @@
-use std::{fs, path::Path};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::Path,
+};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -7,6 +12,9 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    pub provider_id: String,
+    pub provider_protocol: String,
+    pub web_search_enabled: bool,
     pub firecrawl_api_key: String,
     pub firecrawl_api_url: String,
     pub firecrawl_count: u32,
@@ -29,6 +37,9 @@ pub struct AppConfig {
     pub history_window: usize,
     pub max_messages: usize,
     pub memory_enabled: bool,
+    /// Maximum age of cross-chat facts and summaries used in prompts.
+    /// `0` keeps all ages eligible.
+    pub memory_max_age_days: u32,
     pub memory_max_facts_in_prompt: usize,
     pub memory_max_recent_summaries_in_prompt: usize,
     pub memory_extract_message_window: usize,
@@ -42,11 +53,18 @@ pub struct AppConfig {
     pub whatsapp_assistant_name: String,
     pub whatsapp_has_own_number: bool,
     pub whatsapp_allowed_jids: Vec<String>,
+    /// Per-process CSRF/API token for the local WebTool. It is injected at
+    /// startup and deliberately never serialized to config.json.
+    #[serde(skip)]
+    pub web_api_token: String,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            provider_id: "custom".into(),
+            provider_protocol: "openai".into(),
+            web_search_enabled: false,
             firecrawl_api_key: String::new(),
             firecrawl_api_url: "http://127.0.0.1:3002".into(),
             firecrawl_count: 5,
@@ -69,6 +87,7 @@ impl Default for AppConfig {
             history_window: 5,
             max_messages: 200,
             memory_enabled: true,
+            memory_max_age_days: 90,
             memory_max_facts_in_prompt: 12,
             memory_max_recent_summaries_in_prompt: 3,
             memory_extract_message_window: 12,
@@ -82,6 +101,7 @@ impl Default for AppConfig {
             whatsapp_assistant_name: "Gnome AI".into(),
             whatsapp_has_own_number: false,
             whatsapp_allowed_jids: Vec::new(),
+            web_api_token: String::new(),
         }
     }
 }
@@ -100,8 +120,31 @@ impl AppConfig {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        let raw = serde_json::to_string_pretty(self)?;
-        fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
+        let parent = path
+            .parent()
+            .with_context(|| format!("{} has no parent directory", path.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+        let temporary = parent.join(format!(".config-{}.tmp", uuid::Uuid::new_v4().simple()));
+        let raw = serde_json::to_vec_pretty(self)?;
+        let result = (|| -> anyhow::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(&raw)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            fs::rename(&temporary, path)
+                .with_context(|| format!("failed to replace {}", path.display()))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
     }
 
     pub fn normalize(&mut self) {
@@ -110,8 +153,22 @@ impl AppConfig {
             self.llama_api_mode = "chat".into();
         }
         self.llama_base_url = self.llama_base_url.trim().trim_end_matches('/').into();
+        self.provider_id = self.provider_id.trim().to_lowercase();
+        if self.provider_id.is_empty() {
+            self.provider_id = "custom".into();
+        }
+        self.provider_protocol = self.provider_protocol.trim().to_lowercase();
+        if !matches!(
+            self.provider_protocol.as_str(),
+            "openai" | "anthropic" | "codex" | "claude-cli"
+        ) {
+            self.provider_protocol = "openai".into();
+        }
         self.firecrawl_api_url = self.firecrawl_api_url.trim().trim_end_matches('/').into();
         self.memory_max_facts_in_prompt = self.memory_max_facts_in_prompt.clamp(1, 20);
+        if self.memory_max_age_days > 0 {
+            self.memory_max_age_days = self.memory_max_age_days.clamp(1, 3_650);
+        }
         self.memory_max_recent_summaries_in_prompt =
             self.memory_max_recent_summaries_in_prompt.clamp(0, 10);
         self.memory_extract_message_window = self.memory_extract_message_window.clamp(4, 30);
@@ -141,8 +198,10 @@ impl AppConfig {
                 }
             }
         }
+        let web_api_token = self.web_api_token.clone();
         if let Ok(mut merged) = serde_json::from_value::<Self>(value) {
             merged.normalize();
+            merged.web_api_token = web_api_token;
             *self = merged;
         }
     }
@@ -150,4 +209,25 @@ impl AppConfig {
 
 pub fn compact_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn runtime_web_token_is_neither_serialized_nor_lost_by_patch() {
+        let mut config = AppConfig::default();
+        config.web_api_token = "runtime-secret".into();
+        assert!(
+            !serde_json::to_string(&config)
+                .unwrap()
+                .contains("runtime-secret")
+        );
+
+        config.merge_patch(&json!({"default_model": "new-model"}));
+        assert_eq!(config.default_model, "new-model");
+        assert_eq!(config.web_api_token, "runtime-secret");
+    }
 }

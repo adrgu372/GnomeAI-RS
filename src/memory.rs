@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{
     config::AppConfig,
     llama::LlamaClient,
-    storage::{AppPaths, Chat, ChatMessage},
+    storage::{AppPaths, Chat, ChatMessage, write_private},
 };
 
 const MEMORY_EXTRACTOR_PROMPT: &str = r#"You are analyzing a conversation. Extract persistent, important facts about the user that should be remembered across future conversations. Follow the rules:
@@ -181,8 +181,15 @@ impl MemoryStore {
 
     pub fn save(&self, paths: &AppPaths) -> anyhow::Result<()> {
         let raw = serde_json::to_string_pretty(self)?;
-        fs::write(&paths.memory_store_file, raw)
+        write_private(&paths.memory_store_file, raw.as_bytes())
             .with_context(|| format!("failed to write {}", paths.memory_store_file.display()))
+    }
+
+    /// Wipe everything and persist the empty store.
+    pub fn clear(&mut self, paths: &AppPaths) -> anyhow::Result<()> {
+        self.facts.clear();
+        self.recent_conversations.clear();
+        self.save(paths)
     }
 
     pub fn normalize(&mut self) {
@@ -199,8 +206,12 @@ impl MemoryStore {
         }
         self.facts = cleaned_facts;
         dedupe_facts(&mut self.facts);
-        self.recent_conversations
-            .retain(|item| !item.chat_id.trim().is_empty() && !item.snippet.trim().is_empty());
+        self.recent_conversations.retain(|item| {
+            !item.chat_id.trim().is_empty()
+                && !item.snippet.trim().is_empty()
+                && !looks_like_secret(&item.title)
+                && !looks_like_secret(&item.snippet)
+        });
         self.recent_conversations.sort_by(|a, b| {
             b.updated_at
                 .cmp(&a.updated_at)
@@ -240,19 +251,29 @@ impl MemoryStore {
         }
         session_notes
             .push("Persistent memory is stored locally and shared across conversations.".into());
+        if cfg.memory_max_age_days == 0 {
+            session_notes.push("Memory age filter: no age limit.".into());
+        } else {
+            session_notes.push(format!(
+                "Memory age filter: only items from the last {} days.",
+                cfg.memory_max_age_days
+            ));
+        }
         session_notes.push(
             "Prefer newer/current user instructions over older memory if they conflict.".into(),
         );
 
         let query_terms = combined_terms(query, history);
+        let now = Utc::now();
+        let cutoff = memory_cutoff(cfg, now);
         let mut scored_facts = self
             .facts
             .iter()
             .enumerate()
+            .filter(|(_, fact)| cutoff.is_none_or(|cutoff| fact.timestamp >= cutoff))
             .map(|(index, fact)| (score_fact(fact, &query_terms, chat_id), index))
             .collect::<Vec<_>>();
         scored_facts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        let now = Utc::now();
         let mut selected_fact_indexes = scored_facts
             .into_iter()
             .filter(|(score, _)| *score > 0)
@@ -273,6 +294,7 @@ impl MemoryStore {
             .recent_conversations
             .iter()
             .filter(|item| Some(item.chat_id.as_str()) != chat_id)
+            .filter(|item| cutoff.is_none_or(|cutoff| item.updated_at >= cutoff))
             .map(|item| (score_recent_summary(item, &query_terms), item.clone()))
             .collect::<Vec<_>>();
         scored_recent.sort_by(|a, b| {
@@ -386,6 +408,40 @@ pub async fn build_working_memory_block(
     Ok(snapshot.prompt_block())
 }
 
+/// Compact memory block for the coding agent's system prompt: the top facts
+/// by confidence inside the shared age filter. No query scoring — a coding
+/// session has no "current question" yet when the prompt is built.
+pub fn agent_memory_block(store: &MemoryStore, cfg: &AppConfig) -> String {
+    if !cfg.memory_enabled {
+        return String::new();
+    }
+    let cutoff = memory_cutoff(cfg, Utc::now());
+    let mut facts: Vec<&MemoryFact> = store
+        .facts
+        .iter()
+        .filter(|fact| cutoff.is_none_or(|cutoff| fact.timestamp >= cutoff))
+        .collect();
+    facts.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.timestamp.cmp(&a.timestamp))
+    });
+    facts.truncate(cfg.memory_max_facts_in_prompt);
+    if facts.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![
+        "Cross-Conversation Memory (shared with WebTool)".to_string(),
+        "Persistent facts about the user. Prefer the current conversation when they conflict."
+            .to_string(),
+    ];
+    for fact in facts {
+        lines.push(format!("- [{}] {}", fact.category.as_str(), fact.fact));
+    }
+    lines.join("\n")
+}
+
 pub fn append_memory_block(base_prompt: &str, memory_block: Option<&str>) -> String {
     let memory_block = memory_block
         .map(str::trim)
@@ -431,9 +487,11 @@ pub async fn refresh_memory_from_chat(
 
     let existing_facts = {
         let store = store_state.read().await;
+        let cutoff = memory_cutoff(cfg, Utc::now());
         store
             .facts
             .iter()
+            .filter(|fact| cutoff.is_none_or(|cutoff| fact.timestamp >= cutoff))
             .take(cfg.memory_max_existing_facts_for_extraction)
             .map(|fact| {
                 json!({
@@ -473,6 +531,11 @@ pub async fn refresh_memory_from_chat(
     store.update_recent_conversation(chat, cfg);
     store.apply_extraction_result(cfg, &chat.id, extraction);
     store.save(paths)
+}
+
+fn memory_cutoff(cfg: &AppConfig, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    (cfg.memory_max_age_days > 0)
+        .then(|| now - ChronoDuration::days(i64::from(cfg.memory_max_age_days)))
 }
 
 fn render_conversation_for_extraction(chat: &Chat, window: usize) -> String {
@@ -533,7 +596,7 @@ fn summarize_chat(chat: &Chat) -> RecentConversationSummary {
     let mut parts = Vec::new();
     for message in chat.messages.iter().rev() {
         let text = message_to_text(message);
-        if text.is_empty() {
+        if text.is_empty() || looks_like_secret(&text) {
             continue;
         }
         parts.push(text);
@@ -543,13 +606,18 @@ fn summarize_chat(chat: &Chat) -> RecentConversationSummary {
     }
     parts.reverse();
     let snippet = preview(&parts.join(" | "), 260);
-    let keywords = tokenize_terms(&format!("{} {}", chat.title, snippet))
+    let title = if looks_like_secret(&chat.title) {
+        "Conversation".to_string()
+    } else {
+        normalize_ws(&chat.title)
+    };
+    let keywords = tokenize_terms(&format!("{title} {snippet}"))
         .into_iter()
         .take(12)
         .collect::<Vec<_>>();
     RecentConversationSummary {
         chat_id: chat.id.clone(),
-        title: normalize_ws(&chat.title),
+        title,
         snippet,
         updated_at: chat
             .messages
@@ -598,6 +666,74 @@ fn parse_extraction_response(text: &str) -> anyhow::Result<MemoryExtractionResul
     Ok(parsed)
 }
 
+/// True when a candidate fact looks like a credential. Secrets never enter
+/// cross-conversation memory, regardless of extractor confidence — the store
+/// is plain JSON on disk and gets pasted into prompts.
+pub fn looks_like_secret(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "api key",
+        "api_key",
+        "apikey",
+        "cheie api",
+        "cheia api",
+        "secret",
+        "password",
+        "parola",
+        "passphrase",
+        "private key",
+        "access token",
+        "auth token",
+        "api token",
+        "refresh token",
+        "bearer ",
+        "credential",
+    ];
+    if MARKERS.iter().any(|marker| lowered.contains(marker)) {
+        return true;
+    }
+
+    for word in text.split_whitespace() {
+        let trimmed =
+            word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
+        if trimmed.len() < 12 {
+            continue;
+        }
+        let lowered_word = trimmed.to_lowercase();
+        const PREFIXES: &[&str] = &[
+            "sk-",
+            "sk_",
+            "pk_",
+            "ghp_",
+            "gho_",
+            "github_pat_",
+            "xoxb-",
+            "xoxp-",
+            "akia",
+            "ya29.",
+            "eyj",
+        ];
+        if PREFIXES
+            .iter()
+            .any(|prefix| lowered_word.starts_with(prefix))
+        {
+            return true;
+        }
+        // Long mixed-alphanumeric blobs with no spaces are almost always keys.
+        if trimmed.len() >= 32
+            && trimmed
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+            && trimmed.chars().any(|ch| ch.is_ascii_digit())
+            && trimmed.chars().any(|ch| ch.is_ascii_uppercase())
+            && trimmed.chars().any(|ch| ch.is_ascii_lowercase())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn normalize_fact_for_storage(
     fact: &str,
     category: &MemoryCategory,
@@ -606,6 +742,9 @@ fn normalize_fact_for_storage(
         .trim_matches(|ch: char| ch.is_whitespace() || ch == '"' || ch == '\'' || ch == '.')
         .to_string();
     if normalized_fact.len() < 12 || normalized_fact.len() > 220 {
+        return None;
+    }
+    if looks_like_secret(&normalized_fact) {
         return None;
     }
     let normalized_category = infer_memory_category(&normalized_fact, category);
@@ -1046,6 +1185,7 @@ fn preview(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use std::os::unix::fs::PermissionsExt;
 
     fn sample_chat() -> Chat {
         Chat {
@@ -1171,6 +1311,51 @@ mod tests {
     }
 
     #[test]
+    fn working_memory_filters_facts_and_chats_by_age() {
+        let now = Utc::now();
+        let old = now - ChronoDuration::days(120);
+        let mut store = MemoryStore {
+            facts: vec![
+                MemoryFact {
+                    id: "recent".into(),
+                    fact: "User prefers Romanian responses".into(),
+                    confidence: 0.99,
+                    source_chat_id: "chat_recent".into(),
+                    timestamp: now,
+                    last_accessed: now,
+                    access_count: 0,
+                    category: MemoryCategory::UserPreference,
+                },
+                MemoryFact {
+                    id: "old".into(),
+                    fact: "User prefers very old English responses".into(),
+                    confidence: 0.99,
+                    source_chat_id: "chat_old".into(),
+                    timestamp: old,
+                    last_accessed: old,
+                    access_count: 0,
+                    category: MemoryCategory::UserPreference,
+                },
+            ],
+            recent_conversations: vec![RecentConversationSummary {
+                chat_id: "chat_old".into(),
+                title: "Old preference".into(),
+                snippet: "Discussed very old English responses.".into(),
+                updated_at: old,
+                keywords: vec!["responses".into()],
+            }],
+        };
+        let mut cfg = AppConfig::default();
+        cfg.memory_max_age_days = 30;
+        let snapshot = store.build_working_memory(&cfg, "responses", &[], Some("chat_current"));
+
+        assert_eq!(snapshot.facts.len(), 1);
+        assert_eq!(snapshot.facts[0].id, "recent");
+        assert!(snapshot.recent_conversations.is_empty());
+        assert!(snapshot.prompt_block().contains("last 30 days"));
+    }
+
+    #[test]
     fn parses_extraction_json_from_markdown_wrapper() {
         let text = "```json\n{\"new_facts\":[{\"fact\":\"User prefers Romanian\",\"confidence\":0.95,\"category\":\"UserPreference\"}],\"updated_facts\":[],\"facts_to_forget\":[]}\n```";
         let parsed = parse_extraction_response(text).unwrap();
@@ -1254,6 +1439,14 @@ mod tests {
             }],
         };
         store.save(&paths).unwrap();
+        assert_eq!(
+            fs::metadata(&paths.memory_store_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         let loaded = MemoryStore::load(&paths).unwrap();
         assert_eq!(loaded.facts.len(), 1);
         assert_eq!(loaded.recent_conversations.len(), 1);
@@ -1343,5 +1536,71 @@ mod tests {
         };
         store.normalize();
         assert_eq!(store.facts.len(), 1);
+    }
+
+    #[test]
+    fn secrets_never_survive_normalization() {
+        assert!(looks_like_secret(
+            "User's OpenAI api key is sk-abc123def456ghi789"
+        ));
+        assert!(looks_like_secret("parola contului este hunter2secret"));
+        assert!(looks_like_secret(
+            "GitHub token ghp_16C7e42F292c6912E7710c838347Ae178B4a"
+        ));
+        assert!(looks_like_secret(
+            "Uses the value Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb3dEf6h somewhere"
+        ));
+        assert!(!looks_like_secret("User prefers Romanian answers"));
+        assert!(!looks_like_secret(
+            "User's model has a 4096 token context window limit"
+        ));
+
+        let now = Utc::now();
+        let mut store = MemoryStore {
+            facts: vec![MemoryFact {
+                id: "mem_secret".into(),
+                fact: "User's Anthropic api key is sk-ant-xxxxxxxxxxxxxxxx".into(),
+                confidence: 0.99,
+                source_chat_id: "chat_001".into(),
+                timestamp: now,
+                last_accessed: now,
+                access_count: 0,
+                category: MemoryCategory::PersonalInfo,
+            }],
+            recent_conversations: vec![],
+        };
+        store.normalize();
+        assert!(store.facts.is_empty());
+    }
+
+    #[test]
+    fn secrets_never_enter_recent_conversation_summaries() {
+        let mut chat = sample_chat();
+        chat.title = "API key sk-ant-title-secret-123456789".into();
+        chat.messages.push(ChatMessage {
+            role: "user".into(),
+            content: Value::String(
+                "My Anthropic API key is sk-ant-message-secret-123456789".into(),
+            ),
+            timestamp: Utc::now(),
+            extra: Default::default(),
+        });
+
+        let summary = summarize_chat(&chat);
+        assert_eq!(summary.title, "Conversation");
+        assert!(!summary.snippet.contains("sk-ant"));
+
+        let mut store = MemoryStore {
+            facts: vec![],
+            recent_conversations: vec![RecentConversationSummary {
+                chat_id: "chat_leaky".into(),
+                title: "Normal title".into(),
+                snippet: "password is hunter2secret".into(),
+                updated_at: Utc::now(),
+                keywords: vec!["password".into()],
+            }],
+        };
+        store.normalize();
+        assert!(store.recent_conversations.is_empty());
     }
 }

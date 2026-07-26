@@ -1,0 +1,51 @@
+GnomeAI-RS for Debian
+=====================
+
+The package itself must be installed by an administrator, but both applications
+run as the desktop user afterward. Runtime data and API keys are stored with
+owner-only permissions under:
+
+  ${XDG_STATE_HOME:-$HOME/.local/state}/gnomeai-rs
+
+No application command should be launched with sudo.
+
+Applications
+------------
+
+The desktop menu contains:
+
+* GnomeAI-RS Agent — terminal coding agent with /workspace, /provider and
+  /websearch. The transcript supports mouse-wheel and keyboard scrolling.
+  Hold the left mouse button while using the wheel to extend a selection
+  beyond the viewport; releasing the button copies the selection.
+* GnomeAI-RS WebTool — local browser interface at http://127.0.0.1:8787.
+
+Equivalent commands:
+
+  gnomeai-rs /path/to/workspace
+  gnomeai-webtool
+
+Firecrawl
+---------
+
+When Web Search is OFF, no Firecrawl process is started. With Web Search ON,
+the first WebSearch/WebFetch request starts the bundled deployment through
+rootless Podman. Its official container images are downloaded once into the
+current user's Podman storage.
+
+Useful diagnostics:
+
+  gnomeai-firecrawl status
+  gnomeai-firecrawl logs
+  gnomeai-firecrawl stop
+
+Podman is a recommended dependency because a remote Firecrawl URL can also be
+configured instead. The local deployment binds only to 127.0.0.1:3002.
+
+Provider account authentication
+-------------------------------
+
+OpenAI account authentication is owned by the bundled official Codex runtime.
+Anthropic account authentication requires the official `claude` command.
+Those account-backed modes are selected from the terminal agent. WebTool uses
+API-backed providers, including the native Anthropic Messages API.

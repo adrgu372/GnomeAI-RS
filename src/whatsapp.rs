@@ -112,6 +112,7 @@ impl WhatsAppBridge {
                 format!("http://{}:{}", cfg.host, cfg.port),
             )
             .env("GNOME_WA_BRIDGE_PORT", cfg.whatsapp_bridge_port.to_string())
+            .env("GNOMEF_WEB_TOKEN", &cfg.web_api_token)
             .env("GNOME_WA_AUTH_DIR", &paths.whatsapp_auth_dir)
             .env("GNOME_WA_ASSISTANT_NAME", &cfg.whatsapp_assistant_name)
             .env(
@@ -140,6 +141,7 @@ impl WhatsAppBridge {
         let _ = self
             .http
             .post(bridge_url(cfg, "/shutdown"))
+            .header("X-Gnomef-Token", &cfg.web_api_token)
             .timeout(Duration::from_secs(1))
             .send()
             .await;
@@ -212,6 +214,7 @@ impl WhatsAppBridge {
         match self
             .http
             .get(bridge_url(cfg, "/status"))
+            .header("X-Gnomef-Token", &cfg.web_api_token)
             .timeout(Duration::from_millis(1500))
             .send()
             .await
@@ -229,6 +232,7 @@ pub async fn send_whatsapp_message(cfg: &AppConfig, chat_jid: &str, text: &str) 
     let payload = json!({"jid": chat_jid, "text": text});
     if let Err(err) = reqwest::Client::new()
         .post(bridge_url(cfg, "/send"))
+        .header("X-Gnomef-Token", &cfg.web_api_token)
         .json(&payload)
         .send()
         .await

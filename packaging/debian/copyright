@@ -1,0 +1,30 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: GnomeAI-RS
+Source: https://github.com/adrgu372/GnomeAI-RS
+
+Files: *
+Copyright: GnomeAI-RS contributors
+License: GPL-3.0
+ The complete license text is installed at
+ /usr/share/doc/gnomeai-rs/LICENSE.
+ .
+ On Debian systems, the GNU General Public License version 3 is also
+ available at /usr/share/common-licenses/GPL-3.
+
+Files: usr/lib/gnomeai-rs/codex/*
+Copyright: 2025 OpenAI
+License: Apache-2.0
+ The complete license text and the upstream NOTICE are installed under
+ /usr/lib/gnomeai-rs/codex/.
+ .
+ On Debian systems, the Apache License version 2.0 is also available at
+ /usr/share/common-licenses/Apache-2.0.
+
+Files: usr/share/doc/gnomeai-rs/firecrawl/*
+Copyright: Firecrawl contributors
+License: AGPL-3.0
+ The complete corresponding upstream source and license are installed under
+ /usr/share/doc/gnomeai-rs/firecrawl/.
+ .
+ On Debian systems, the GNU Affero General Public License version 3 is also
+ available at /usr/share/common-licenses/AGPL-3.

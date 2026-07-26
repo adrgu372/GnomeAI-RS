@@ -1,13 +1,18 @@
+mod app_dirs;
 mod chat_logic;
+mod codex_app_server;
 mod config;
 mod consistency;
 mod firecrawl;
 mod generation;
 mod llama;
 mod memory;
+mod provider;
+mod provider_catalog;
 mod questions;
 mod runtime;
 mod runtime_profile;
+mod sandbox;
 mod search;
 mod storage;
 mod tasks;
@@ -17,14 +22,24 @@ mod vision;
 mod whatsapp;
 
 use std::{
-    collections::HashSet, convert::Infallible, fs, net::SocketAddr, path::PathBuf, sync::Arc,
+    collections::{HashSet, VecDeque},
+    convert::Infallible,
+    fs,
+    net::SocketAddr,
+    os::unix::fs::PermissionsExt,
+    sync::Arc,
 };
 
 use async_stream::stream;
 use axum::{
     Json, Router,
-    extract::{Multipart, Path as AxumPath, Query, State},
-    http::{StatusCode, header::CONTENT_TYPE},
+    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, Request, State},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{CONTENT_DISPOSITION, CONTENT_TYPE, HOST},
+    },
+    middleware,
+    middleware::Next,
     response::{
         Html, IntoResponse, Response,
         sse::{Event, Sse},
@@ -35,7 +50,7 @@ use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex, RwLock};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -48,6 +63,9 @@ use crate::{
     generation::{detect_format, generate_document},
     llama::LlamaClient,
     memory::{MemoryStore, refresh_memory_from_chat, update_recent_memory_snapshot},
+    provider_catalog::{
+        AuthKind, PROVIDERS, ProviderSelection, ProviderSettingsStore, WireProtocol, preset,
+    },
     questions::PendingQuestions,
     runtime::RuntimeHandles,
     runtime_profile::RuntimeProfile,
@@ -70,7 +88,34 @@ struct AppState {
     pending_questions: PendingQuestions,
     runtime: RuntimeHandles,
     whatsapp: WhatsAppBridge,
-    wa_seen: Arc<Mutex<HashSet<String>>>,
+    wa_seen: Arc<Mutex<SeenMessages>>,
+    api_token: Arc<str>,
+}
+
+const WA_SEEN_LIMIT: usize = 10_000;
+
+#[derive(Default)]
+struct SeenMessages {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl SeenMessages {
+    /// Returns true for a duplicate. New IDs are retained in bounded FIFO
+    /// order so a long-lived bridge cannot grow memory without limit.
+    fn remember(&mut self, id: String) -> bool {
+        if self.ids.contains(&id) {
+            return true;
+        }
+        self.ids.insert(id.clone());
+        self.order.push_back(id);
+        while self.order.len() > WA_SEEN_LIMIT {
+            if let Some(expired) = self.order.pop_front() {
+                self.ids.remove(&expired);
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -96,21 +141,61 @@ impl IntoResponse for AppError {
     }
 }
 
+fn main() -> anyhow::Result<()> {
+    // The sandbox helper must run before Tokio starts worker threads.
+    sandbox::maybe_run_as_helper()?;
+    web_main()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn web_main() -> anyhow::Result<()> {
+    let startup_trace = std::env::var_os("GNOMEF_STARTUP_TRACE").is_some();
+    let trace_startup = |stage: &str| {
+        if startup_trace {
+            eprintln!("gnomef-web startup: {stage}");
+        }
+    };
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("gnomef_rs=info".parse()?))
         .init();
+    trace_startup("logging ready");
 
-    let app_dir = std::env::var("GNOMEF_RS_HOME")
-        .map(PathBuf::from)
-        .unwrap_or(std::env::current_dir()?);
+    let launch_dir = std::env::current_dir()?;
+    let app_dir = app_dirs::resolve_app_home(&launch_dir)?;
     let paths = Arc::new(AppPaths::new(app_dir)?);
+    trace_startup("state paths ready");
     let memory = Arc::new(RwLock::new(MemoryStore::load(paths.as_ref())?));
     let runtime_profile = Arc::new(RuntimeProfile::detect(paths.as_ref()));
-    let config = AppConfig::load(&paths.config_file)?;
+    trace_startup("memory and runtime profile ready");
+    let mut config = AppConfig::load(&paths.config_file)?;
+    let configured_api_token = std::env::var("GNOMEF_WEB_TOKEN")
+        .ok()
+        .filter(|token| token.len() >= 16);
+    let has_configured_api_token = configured_api_token.is_some();
+    let api_token = configured_api_token.unwrap_or_else(|| {
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        )
+    });
+    config.web_api_token = api_token.clone();
+    let provider_settings = ProviderSettingsStore::new(paths.store_dir.join("providers.json"));
+    if let Some(selection) = provider_settings.load()? {
+        apply_provider_selection(&selection, &mut config);
+    }
+    trace_startup("configuration ready");
 
     let bind_addr: SocketAddr = format!("{}:{}", config.host, config.port).parse()?;
+    let allow_remote = std::env::var("GNOMEF_ALLOW_REMOTE").as_deref() == Ok("1");
+    if !bind_addr.ip().is_loopback() {
+        if !allow_remote || !has_configured_api_token {
+            anyhow::bail!(
+                "refusing to expose WebTool on non-loopback address {bind_addr}; \
+                 set GNOMEF_ALLOW_REMOTE=1 and a GNOMEF_WEB_TOKEN of at least 16 characters"
+            );
+        }
+    }
     let state = AppState {
         paths,
         config: Arc::new(RwLock::new(config)),
@@ -120,8 +205,10 @@ async fn main() -> anyhow::Result<()> {
         pending_questions: PendingQuestions::default(),
         runtime: RuntimeHandles::default(),
         whatsapp: WhatsAppBridge::new(),
-        wa_seen: Arc::new(Mutex::new(HashSet::new())),
+        wa_seen: Arc::new(Mutex::new(SeenMessages::default())),
+        api_token: Arc::from(api_token),
     };
+    trace_startup("application state ready");
 
     {
         let cfg = state.config.read().await.clone();
@@ -137,6 +224,8 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/config", get(api_get_config).post(api_set_config))
+        .route("/api/providers", get(api_get_providers))
+        .route("/api/provider", post(api_set_provider))
         .route("/api/memory", get(api_get_memory))
         .route("/api/runtime/profile", get(api_runtime_profile))
         .route("/api/models", get(api_models))
@@ -147,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
             get(api_get_chat).delete(api_delete_chat),
         )
         .route("/api/chats/{cid}/clear", post(api_clear_chat))
+        .route("/api/chats/{cid}/rename", post(api_rename_chat))
         .route("/api/chats/{cid}/messages", post(api_add_message))
         .route("/api/chats/{cid}/start-stream", post(api_start_stream))
         .route(
@@ -174,12 +264,18 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/whatsapp/stop", post(api_whatsapp_stop))
         .route("/api/whatsapp/qr", get(api_whatsapp_qr))
         .route("/api/whatsapp/inbound", post(api_whatsapp_inbound))
-        .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(51 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            protect_local_api,
+        ))
         .with_state(state);
+    trace_startup("router ready");
 
     info!("Gnomef Rust backend listening on http://{bind_addr}");
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    trace_startup("listener bound");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
@@ -190,17 +286,264 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn index(State(state): State<AppState>) -> Result<Html<String>, AppError> {
-    let html = if state.paths.index_file.exists() {
+async fn index(State(state): State<AppState>) -> Result<Response, AppError> {
+    let mut html = if state.paths.index_file.exists() {
         fs::read_to_string(&state.paths.index_file)?
     } else {
         "<h1>Gnomef Rust backend</h1><p>Place index.html next to the project or set GNOMEF_RS_HOME.</p>".into()
     };
-    Ok(Html(html))
+    let bootstrap = format!(
+        "<script>window.__GNOMEF_TOKEN__={};</script>",
+        serde_json::to_string(state.api_token.as_ref())?
+    );
+    if let Some(position) = html.find("<head>") {
+        html.insert_str(position + "<head>".len(), &bootstrap);
+    } else {
+        html.insert_str(0, &bootstrap);
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; \
+             style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+             connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+        ),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok((headers, Html(html)).into_response())
 }
 
-async fn api_get_config(State(state): State<AppState>) -> Json<AppConfig> {
-    Json(state.config.read().await.clone())
+async fn protect_local_api(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let allow_remote = std::env::var("GNOMEF_ALLOW_REMOTE").as_deref() == Ok("1");
+    let host_allowed = request
+        .headers()
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|host| allow_remote || is_loopback_host(host));
+    if !host_allowed {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"ok": false, "error": "invalid Host header"})),
+        )
+            .into_response();
+    }
+
+    if request.uri().path() != "/" {
+        let supplied = request
+            .headers()
+            .get("x-gnomef-token")
+            .and_then(|value| value.to_str().ok())
+            .or_else(|| query_value(request.uri().query(), "token"));
+        if !supplied.is_some_and(|token| constant_time_eq(token, state.api_token.as_ref())) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"ok": false, "error": "missing or invalid WebTool token"})),
+            )
+                .into_response();
+        }
+        // Query tokens are necessary for EventSource and direct downloads,
+        // which cannot attach our custom header. Remove the secret before the
+        // trace layer and route extractors see the URI.
+        strip_query_key(&mut request, "token");
+    }
+    next.run(request).await
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    host == "localhost"
+        || host.starts_with("localhost:")
+        || host == "127.0.0.1"
+        || host.starts_with("127.0.0.1:")
+        || host == "[::1]"
+        || host.starts_with("[::1]:")
+}
+
+fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
+    query?.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == key).then_some(value)
+    })
+}
+
+fn strip_query_key(request: &mut Request, key: &str) {
+    let Some(query) = request.uri().query() else {
+        return;
+    };
+    let filtered = query
+        .split('&')
+        .filter(|pair| pair.split_once('=').is_none_or(|(name, _)| name != key))
+        .collect::<Vec<_>>()
+        .join("&");
+    let replacement = if filtered.is_empty() {
+        request.uri().path().to_string()
+    } else {
+        format!("{}?{filtered}", request.uri().path())
+    };
+    if let Ok(uri) = replacement.parse() {
+        *request.uri_mut() = uri;
+    }
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+async fn api_get_config(State(state): State<AppState>) -> Json<Value> {
+    let config = state.config.read().await.clone();
+    let mut value = serde_json::to_value(&config).unwrap_or_else(|_| json!({}));
+    value["llama_api_key"] = json!("");
+    value["firecrawl_api_key"] = json!("");
+    value["has_provider_api_key"] = json!(!config.llama_api_key.trim().is_empty());
+    value["has_firecrawl_api_key"] = json!(!config.firecrawl_api_key.trim().is_empty());
+    Json(value)
+}
+
+async fn api_get_providers(State(state): State<AppState>) -> Json<Value> {
+    let config = state.config.read().await.clone();
+    let providers = PROVIDERS
+        .iter()
+        .map(|provider| {
+            json!({
+                "id": provider.id,
+                "name": provider.name,
+                "auth": match provider.auth {
+                    AuthKind::ApiKey => "api_key",
+                    AuthKind::Account => "account",
+                    AuthKind::OptionalApiKey => "optional_api_key",
+                },
+                "protocol": match provider.protocol {
+                    WireProtocol::OpenAi => "openai",
+                    WireProtocol::Anthropic => "anthropic",
+                    WireProtocol::CodexAppServer => "codex",
+                    WireProtocol::ClaudeCli => "claude-cli",
+                },
+                "base_url": provider.base_url,
+                "default_model": provider.default_model,
+                "description": provider.description,
+                "web_supported": provider.auth != AuthKind::Account,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({
+        "providers": providers,
+        "current": {
+            "provider_id": config.provider_id,
+            "model": config.default_model,
+            "base_url": config.llama_base_url,
+            "has_api_key": !config.llama_api_key.trim().is_empty(),
+            "web_search_enabled": config.web_search_enabled,
+            "memory_enabled": config.memory_enabled,
+            "memory_max_age_days": config.memory_max_age_days,
+        }
+    }))
+}
+
+async fn api_set_provider(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Response, AppError> {
+    let provider_id = payload
+        .get("provider_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let Some(provider) = preset(provider_id) else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "Unknown provider"})),
+        )
+            .into_response());
+    };
+    if provider.auth == AuthKind::Account {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "Account login is available in the terminal agent. WebTool supports API providers."
+            })),
+        )
+            .into_response());
+    }
+
+    let settings = ProviderSettingsStore::new(state.paths.store_dir.join("providers.json"));
+    let existing = settings.load()?;
+    let supplied_key = payload
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let api_key = supplied_key.or_else(|| {
+        existing
+            .as_ref()
+            .filter(|selection| selection.provider_id == provider_id)
+            .and_then(|selection| selection.api_key().map(str::to_string))
+    });
+    let base_url = payload
+        .get("base_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let mut selection =
+        match ProviderSelection::from_choice(provider_id.to_string(), api_key, base_url) {
+            Ok(selection) => selection,
+            Err(error) => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"ok": false, "error": error.to_string()})),
+                )
+                    .into_response());
+            }
+        };
+    if let Some(model) = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        selection.model = model.to_string();
+    }
+    settings.save(&selection)?;
+    {
+        let mut config = state.config.write().await;
+        apply_provider_selection(&selection, &mut config);
+        if let Some(enabled) = payload.get("web_search_enabled").and_then(Value::as_bool) {
+            config.web_search_enabled = enabled;
+        }
+        if let Some(enabled) = payload.get("memory_enabled").and_then(Value::as_bool) {
+            config.memory_enabled = enabled;
+        }
+        if let Some(days) = payload.get("memory_max_age_days").and_then(Value::as_u64) {
+            config.memory_max_age_days = u32::try_from(days).unwrap_or(3_650);
+            config.normalize();
+        }
+        config.save(&state.paths.config_file)?;
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "provider_id": selection.provider_id,
+        "model": selection.model,
+    }))
+    .into_response())
 }
 
 async fn api_set_config(
@@ -270,6 +613,28 @@ async fn api_clear_chat(
 ) -> Result<Json<Value>, AppError> {
     clear_chat(&state.paths, &cid)?;
     Ok(Json(json!({"ok": true})))
+}
+
+async fn api_rename_chat(
+    State(state): State<AppState>,
+    AxumPath(cid): AxumPath<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let title = payload
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(80)
+        .collect::<String>();
+    if title.is_empty() {
+        return Ok(Json(json!({"ok": false, "error": "title required"})));
+    }
+    let mut chat = load_chat(&state.paths, &cid)?;
+    chat.title = title;
+    save_chat(&state.paths, &chat)?;
+    Ok(Json(json!({"ok": true, "title": chat.title})))
 }
 
 async fn api_add_message(
@@ -383,7 +748,8 @@ async fn api_upload(
 
     let dest = unique_upload_path(&state.paths.uploads_dir, &filename)?;
     tokio::fs::write(&dest, &data).await?;
-    let read = read_file(&dest)?;
+    tokio::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).await?;
+    let read = read_file(&dest).await?;
     let extracted = if read.content.is_empty() {
         read.ocr.clone()
     } else {
@@ -434,7 +800,7 @@ async fn api_serve_file(
     if !path.exists() {
         return Ok((StatusCode::NOT_FOUND, "File not found").into_response());
     }
-    Ok(tokio::fs::read(path).await?.into_response())
+    serve_download(path, false).await
 }
 
 async fn api_serve_generated(
@@ -448,7 +814,40 @@ async fn api_serve_generated(
     if !path.exists() {
         return Ok((StatusCode::NOT_FOUND, "File not found").into_response());
     }
-    Ok(tokio::fs::read(path).await?.into_response())
+    serve_download(path, true).await
+}
+
+async fn serve_download(
+    path: std::path::PathBuf,
+    force_attachment: bool,
+) -> Result<Response, AppError> {
+    let bytes = tokio::fs::read(&path).await?;
+    let mime = mime_guess::from_path(&path).first_or_octet_stream();
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    let safe_inline_image = matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    );
+    let disposition = if !force_attachment && safe_inline_image {
+        format!("inline; filename=\"{filename}\"")
+    } else {
+        format!("attachment; filename=\"{filename}\"")
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_str(mime.as_ref())?);
+    headers.insert(CONTENT_DISPOSITION, HeaderValue::from_str(&disposition)?);
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok((headers, bytes).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -634,10 +1033,9 @@ async fn api_whatsapp_inbound(
         .to_string();
     if !message_id.is_empty() {
         let mut seen = state.wa_seen.lock().await;
-        if seen.contains(&message_id) {
+        if seen.remember(message_id) {
             return Ok(Json(json!({"ok": true, "duplicate": true})));
         }
-        seen.insert(message_id);
     }
 
     let chat_jid = payload
@@ -687,7 +1085,8 @@ async fn api_whatsapp_inbound(
                     filename,
                     mimetype,
                     b64,
-                )?;
+                )
+                .await?;
                 let extracted = if read.content.is_empty() {
                     read.ocr
                 } else {
@@ -838,13 +1237,9 @@ fn should_process_whatsapp_message(cfg: &AppConfig, paths: &AppPaths, payload: &
             .any(|allowed| allowed.trim() == chat_jid);
     }
 
-    let own_jid = payload
-        .get("own_jid")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| self_whatsapp_jid(paths));
+    // Never trust identity fields supplied by the inbound payload. The only
+    // authoritative self JID is the credential state written by Baileys.
+    let own_jid = self_whatsapp_jid(paths);
     !own_jid.is_empty() && own_jid == chat_jid
 }
 
@@ -869,6 +1264,16 @@ fn is_assistant_role(role: &str) -> bool {
     matches!(role.trim().to_lowercase().as_str(), "assistant" | "gnome")
 }
 
+fn apply_provider_selection(selection: &ProviderSelection, config: &mut AppConfig) {
+    config.provider_id = selection.provider_id.clone();
+    config.provider_protocol = selection.protocol_name().to_string();
+    config.default_model = selection.model.clone();
+    config.llama_api_key = selection.api_key().unwrap_or_default().to_string();
+    if let Some(base_url) = selection.resolved_base_url() {
+        config.llama_base_url = base_url.to_string();
+    }
+}
+
 fn spawn_memory_refresh(state: AppState, chat: crate::storage::Chat, model: String) {
     tokio::spawn(async move {
         let cfg = state.config.read().await.clone();
@@ -885,4 +1290,52 @@ fn spawn_memory_refresh(state: AppState, chat: crate::storage::Chat, model: Stri
             warn!("Memory refresh failed for {}: {err}", chat.id);
         }
     });
+}
+
+#[cfg(test)]
+mod web_security_tests {
+    use super::*;
+
+    #[test]
+    fn only_loopback_host_headers_are_accepted_by_default() {
+        assert!(is_loopback_host("127.0.0.1:8787"));
+        assert!(is_loopback_host("localhost:8787"));
+        assert!(is_loopback_host("[::1]:8787"));
+        assert!(!is_loopback_host("attacker.example:8787"));
+        assert!(!is_loopback_host("127.0.0.1.attacker.example"));
+    }
+
+    #[test]
+    fn api_token_helpers_match_exact_values() {
+        assert_eq!(
+            query_value(Some("query=hello&token=secret&model=x"), "token"),
+            Some("secret")
+        );
+        assert!(constant_time_eq("same-token", "same-token"));
+        assert!(!constant_time_eq("same-token", "other-token"));
+        assert!(!constant_time_eq("short", "longer"));
+
+        let mut request = Request::builder()
+            .uri("/api/chat/stream/c/m?query=hello&token=secret&model=x")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        strip_query_key(&mut request, "token");
+        assert_eq!(
+            request.uri().path_and_query().unwrap().as_str(),
+            "/api/chat/stream/c/m?query=hello&model=x"
+        );
+    }
+
+    #[test]
+    fn whatsapp_deduplication_cache_is_bounded() {
+        let mut seen = SeenMessages::default();
+        assert!(!seen.remember("first".into()));
+        assert!(seen.remember("first".into()));
+        for index in 0..=WA_SEEN_LIMIT {
+            assert!(!seen.remember(format!("id-{index}")));
+        }
+        assert!(seen.ids.len() <= WA_SEEN_LIMIT);
+        assert!(seen.order.len() <= WA_SEEN_LIMIT);
+        assert!(!seen.remember("first".into()));
+    }
 }

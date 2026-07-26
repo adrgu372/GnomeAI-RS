@@ -1327,7 +1327,10 @@ async fn launch_remote_agent(
         "prompt": prompt,
         "model": model,
         "subagent_type": subagent_type,
-        "callback_url": format!("http://{}:{}/api/runtime/tasks/{}/update", cfg.host, cfg.port, task_id),
+        "callback_url": format!(
+            "http://{}:{}/api/runtime/tasks/{}/update?token={}",
+            cfg.host, cfg.port, task_id, cfg.web_api_token
+        ),
     });
 
     let http = reqwest::Client::new();
@@ -2209,6 +2212,7 @@ fn domain_list(value: Option<&Value>) -> Vec<String> {
 
 fn config_tool_settings() -> Vec<(&'static str, &'static str)> {
     vec![
+        ("provider_id", "Selected shared provider preset."),
         ("default_model", "Default model used for chat requests."),
         ("llama_base_url", "Base URL for llama-server."),
         ("llama_api_key", "API key used for llama-server requests."),
@@ -2226,6 +2230,10 @@ fn config_tool_settings() -> Vec<(&'static str, &'static str)> {
         ),
         ("firecrawl_api_url", "Base URL for Firecrawl."),
         ("firecrawl_api_key", "API key used for Firecrawl requests."),
+        (
+            "web_search_enabled",
+            "Enable or disable WebSearch/WebFetch and lazy local Firecrawl startup.",
+        ),
         (
             "firecrawl_count",
             "Number of search results to request from Firecrawl.",
@@ -2262,6 +2270,10 @@ fn config_tool_settings() -> Vec<(&'static str, &'static str)> {
         (
             "memory_enabled",
             "Enable or disable cross-conversation memory extraction and prompt injection.",
+        ),
+        (
+            "memory_max_age_days",
+            "Maximum memory age in days; zero disables the age limit.",
         ),
         (
             "memory_max_facts_in_prompt",

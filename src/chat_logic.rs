@@ -251,7 +251,7 @@ pub async fn generate_standard_chat_response(
     let decision = should_auto_search(query, history);
     let mut prompt = format!("Today's date: {today}\nConversation:\n{ctx}\n\n");
 
-    if decision.search {
+    if cfg.web_search_enabled && decision.search {
         let web_bundle = firecrawl_search(cfg, &decision.query).await;
         info!(
             "Auto-search[{}/{}]: '{}'",

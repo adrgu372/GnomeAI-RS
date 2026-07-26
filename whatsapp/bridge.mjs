@@ -20,6 +20,7 @@ const authDir =
   process.env.GNOME_WA_AUTH_DIR || path.resolve('store/whatsapp/auth');
 const bridgePort = Number(process.env.GNOME_WA_BRIDGE_PORT || 8788);
 const assistantName = process.env.GNOME_WA_ASSISTANT_NAME || 'Gnome AI';
+const webToken = process.env.GNOMEF_WEB_TOKEN || '';
 const hasOwnNumber = process.env.GNOME_WA_HAS_OWN_NUMBER === '1';
 const maxInboundMediaBytes = Number(
   process.env.GNOME_WA_MAX_MEDIA_BYTES || 15 * 1024 * 1024,
@@ -155,7 +156,10 @@ async function forwardInbound(payload) {
   try {
     const resp = await fetch(`${apiBase}/api/whatsapp/inbound`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Gnomef-Token': webToken,
+      },
       body: JSON.stringify(payload),
     });
     if (!resp.ok) {
@@ -355,6 +359,11 @@ async function gracefulShutdown() {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://127.0.0.1:${bridgePort}`);
+  const suppliedToken = String(req.headers['x-gnomef-token'] || '');
+  if (!webToken || suppliedToken !== webToken) {
+    writeJson(res, 401, { ok: false, error: 'invalid bridge token' });
+    return;
+  }
 
   if (req.method === 'GET' && url.pathname === '/status') {
     state.queue_size = outgoingQueue.length;

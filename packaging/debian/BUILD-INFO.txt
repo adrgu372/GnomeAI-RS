@@ -1,0 +1,19 @@
+Project: GnomeAI-RS
+Package version: 0.1.0-6
+Target: x86_64-unknown-linux-gnu
+Rust compiler: rustc 1.88.0
+Build profile: release
+Code generation units: 1
+Symbols: stripped
+Minimum detected glibc requirement: 2.39
+Build date: 2026-07-26
+Primary executable: gnomef-rs (coding-agent TUI)
+Compatibility alias: gnomef-agent
+Web interface: gnomef-web / gnomeai-webtool
+Verification: 147 Rust tests plus WebTool API and strict-sandbox smoke tests
+Bundled Codex app-server: 0.145.0
+Codex release commit: 25af12f7e61572b0bc18ddb1008be543b91519b0
+Codex executable SHA-256: 49dae43c3be16bc6fc0adb16859244f054a6382656738f1fc280ab3b390b1e49
+Bundled Firecrawl source: v2.11.134
+Firecrawl commit: 4f8c82f0762ccd9614ef45de80c74457b21b24f8
+Firecrawl source SHA-256: 62c3fd48e01c766b17eb437eb53c3edef4f17eba277c61c4f9984658aaaeeee5
