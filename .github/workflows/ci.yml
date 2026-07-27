@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Ubuntu: the GitHub runner already executes as an unprivileged user.
+  ubuntu:
+    name: Ubuntu build · test · smoke run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Install as unprivileged user
+        run: |
+          mkdir -p "$HOME/.local/bin" "$HOME/.local/share/gnomeai-rs"
+          install -m 0755 target/release/gnomef-rs "$HOME/.local/bin/"
+          install -m 0755 target/release/gnomef-agent "$HOME/.local/bin/"
+          install -m 0755 target/release/gnomef-web "$HOME/.local/bin/"
+          install -m 0644 index.html "$HOME/.local/share/gnomeai-rs/index.html"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Smoke run · terminal agent
+        run: |
+          gnomef-rs --help
+          gnomef-agent --help
+
+      - name: Smoke run · web backend
+        run: |
+          export GNOMEF_RS_HOME="$RUNNER_TEMP/gnomeai-state"
+          export GNOMEF_RS_ASSETS="$HOME/.local/share/gnomeai-rs"
+          export GNOMEF_WEB_TOKEN="ci-local-webtool-token"
+          mkdir -p "$GNOMEF_RS_HOME"
+          gnomef-web &
+          WEB_PID=$!
+          for i in $(seq 1 30); do
+            if curl -fs -H "X-Gnomef-Token: $GNOMEF_WEB_TOKEN" \
+              http://127.0.0.1:8787/api/config > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fs -H "X-Gnomef-Token: $GNOMEF_WEB_TOKEN" \
+            http://127.0.0.1:8787/api/config | head -c 400; echo
+          curl -fs http://127.0.0.1:8787/ | grep -qi "GnomeAI" || (echo "UI missing" && exit 1)
+          curl -fs -H "X-Gnomef-Token: $GNOMEF_WEB_TOKEN" -X POST \
+            http://127.0.0.1:8787/api/chats/new | grep -q '"id"'
+          kill "$WEB_PID"
+          wait "$WEB_PID" || true
+
+  # Debian: container starts as root, so create and switch to a regular user —
+  # the applications must build, install and run without any privileges.
+  debian:
+    name: Debian 12 unprivileged build · run
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates git pkg-config sudo
+          useradd -m -s /bin/bash builder
+
+      - uses: actions/checkout@v4
+
+      - name: Hand the checkout to the unprivileged user
+        run: |
+          cp -a "$GITHUB_WORKSPACE" /home/builder/src
+          chown -R builder:builder /home/builder/src
+
+      - name: Build, test, install and smoke-run as `builder`
+        run: |
+          sudo -iu builder bash -e <<'SCRIPT'
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          . "$HOME/.cargo/env"
+          cd "$HOME/src"
+          cargo build --release --locked
+          cargo test --release --locked
+          mkdir -p "$HOME/.local/bin" "$HOME/.local/share/gnomeai-rs"
+          install -m 0755 target/release/gnomef-rs "$HOME/.local/bin/"
+          install -m 0755 target/release/gnomef-web "$HOME/.local/bin/"
+          install -m 0644 index.html "$HOME/.local/share/gnomeai-rs/index.html"
+          export PATH="$HOME/.local/bin:$PATH"
+          gnomef-rs --help
+          export GNOMEF_RS_HOME="$HOME/gnomeai-state"
+          export GNOMEF_RS_ASSETS="$HOME/.local/share/gnomeai-rs"
+          export GNOMEF_WEB_TOKEN="ci-local-webtool-token"
+          mkdir -p "$GNOMEF_RS_HOME"
+          gnomef-web &
+          WEB_PID=$!
+          for i in $(seq 1 30); do
+            curl -fs -H "X-Gnomef-Token: $GNOMEF_WEB_TOKEN" \
+              http://127.0.0.1:8787/api/config > /dev/null && break
+            sleep 1
+          done
+          curl -fs -H "X-Gnomef-Token: $GNOMEF_WEB_TOKEN" \
+            http://127.0.0.1:8787/api/config > /dev/null
+          curl -fs http://127.0.0.1:8787/ | grep -qi "GnomeAI"
+          kill "$WEB_PID"
+          wait "$WEB_PID" || true
+          SCRIPT

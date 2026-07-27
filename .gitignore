@@ -1,0 +1,8 @@
+/target/
+/config.json
+/store/
+/chats/
+/uploads/
+/generated/
+/whatsapp/node_modules/
+descriere

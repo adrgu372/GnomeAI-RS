@@ -1,0 +1,14 @@
+69d7352afe66fb3c98ed8eda56bb3e785ff7bda136ba628482e021684bcf9848  codex-app-server-package-aarch64-apple-darwin.tar.gz
+ece937169d4c9e910d60826a6ea4ae7848a16c089403d122e70e7da4ac41ba34  codex-package-aarch64-apple-darwin.tar.gz
+f6bc8fdb196ace93f868a78fb4f924adcad2580bf83c3c3e458612cca280ac00  codex-app-server-package-aarch64-pc-windows-msvc.tar.gz
+753b97a27805e83a209492b5537c46dbf178eeffe1980f6c784924e3cc9b4184  codex-package-aarch64-pc-windows-msvc.tar.gz
+803e718bfc108a97f443a23d5203b42771c5afbeb5ff9bd534a755515ccfe3b3  codex-app-server-package-aarch64-unknown-linux-musl.tar.gz
+54f79a05aba6f9abf8ef988abcae8bf2fcefba20beb549b4ff2b3acdb2cb6f54  codex-package-aarch64-unknown-linux-musl.tar.gz
+de56c3d91d09c316352dd966f5acb71fdb0b802957219d839190dd12371f0031  codex-app-server-package-x86_64-apple-darwin.tar.gz
+9d402c9ca814655fddc07b548d7086491c0afcebe1f746cdeba1045fd6f62646  codex-package-x86_64-apple-darwin.tar.gz
+62d7c584e15ae393be84fcd62ef4b5d101a377f634f73bfba8794a06157268a7  codex-app-server-package-x86_64-pc-windows-msvc.tar.gz
+8d0d281346aedf63c4cc3922997df822fbb8881f7ffb2b57416f48e8c52a734e  codex-package-x86_64-pc-windows-msvc.tar.gz
+63c3568f800723421ec4a4dec591158dbb1a7e8f353d1f333b080203d96ffa85  codex-app-server-package-x86_64-unknown-linux-musl.tar.gz
+71a28d362c96ac9829bf8203a2c71be451aeb726adb843167fdaf0eae8fe7dd9  codex-package-x86_64-unknown-linux-musl.tar.gz
+11239480f8e3efd1430f23bbe91c1a397856b8bbe6185ccbaee2382d25e03df2  openai-codex-0.145.0-linux-x64.tgz
+a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14  codex-0.145.0-linux-x64

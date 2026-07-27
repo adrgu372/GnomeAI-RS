@@ -1,0 +1,5 @@
+ghcr.io/firecrawl/firecrawl@sha256:14baa3de4ed7636524359e21b01a86e5042997ab384eec5b1d77f5e1342d1222
+ghcr.io/firecrawl/playwright-service@sha256:bd504f4f1068bbba36599bea38f4971d4d2e6b09a030a8b19baf0021ddbaedbc
+ghcr.io/firecrawl/nuq-postgres@sha256:4ca6718b2cef40404b046db5cd37ae45db3e44d1a5750c80522f3587a5b193d5
+docker.io/library/redis:7-alpine
+docker.io/library/rabbitmq:3.13-management-alpine
