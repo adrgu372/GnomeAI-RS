@@ -180,6 +180,40 @@ impl WhatsAppBridge {
         }
     }
 
+    /// Start a fresh pairing flow. This is intentionally separate from a
+    /// normal restart: regenerating a QR invalidates stale credentials, while
+    /// restarting a connected bridge must preserve the current session.
+    pub async fn restart_for_pairing(
+        &self,
+        cfg: &AppConfig,
+        paths: &AppPaths,
+    ) -> anyhow::Result<String> {
+        let status = self.status(cfg, paths).await;
+        if status
+            .get("connected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(anyhow!(
+                "WhatsApp is already connected; stop it before starting a new pairing"
+            ));
+        }
+
+        self.stop(cfg).await;
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while self.bridge_status(cfg).await.is_some() {
+            if Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "WhatsApp bridge did not stop before the pairing reset"
+                ));
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        clear_whatsapp_auth(paths)?;
+        self.start(cfg, paths, false).await?;
+        Ok("Bridge restarted with a fresh pairing session".into())
+    }
+
     pub async fn stop(&self, cfg: &AppConfig) {
         let mut child = {
             let mut guard = self.child.lock().await;

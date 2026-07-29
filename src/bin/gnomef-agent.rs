@@ -1071,7 +1071,7 @@ fn session_history_turns(agent: &Agent) -> Result<Vec<HistoryTurn>> {
                 }
                 out.push(HistoryTurn {
                     role: "user".into(),
-                    text: turn.content,
+                    text: provider::user_content_for_display(&turn.content),
                 });
             }
             "assistant" => {

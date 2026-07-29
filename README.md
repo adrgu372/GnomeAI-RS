@@ -4,12 +4,12 @@ Open-source personal AI agent in Rust: coding-agent TUI, self-hosted WebTool,
 optional WhatsApp assistant, multiple model providers, persistent memory,
 installable skills, and explicit execution permissions.
 
-Current release: **0.1.0-8**. See the release notes below for the complete
+Current release: **1.0**. See the release notes below for the complete
 list of changes.
 
-## Release Notes — 0.1.0-8
+## Release Notes - 1.0
 
-Version **0.1.0-8** represents a major update to GnomeAI-RS, extending the agent with a native skill system, advanced persistent memory, provider management, improved WhatsApp integration, clearly defined access modes, and a more complete and reliable Debian package.
+Version **1.0** represents a major update to GnomeAI-RS, extending the agent with a native skill system, advanced persistent memory, provider management, improved WhatsApp integration, clearly defined access modes, and a more complete and reliable Debian package.
 
 Issues identified in previous versions have been remediated, including WebTool startup, OpenAI and Claude authentication, WhatsApp QR code generation, loading installed resources under `/usr/share`, interface navigation, and dependency distribution in the `.deb` package.
 
@@ -719,14 +719,14 @@ The following have been tested:
 The following version has been generated as a result of these fixes:
 
 ```text
-GnomeAI-RS 0.1.0-8
+GnomeAI-RS 1.0
 ```
 
 ---
 
 ## Summary
 
-GnomeAI-RS 0.1.0-8 brings:
+GnomeAI-RS 1.0 brings:
 
 * native Rust skills compatible with `SKILL.md`;
 * skill installation from local folders and Git;
@@ -875,6 +875,14 @@ Useful TUI commands:
 - `/copy` (or `Ctrl+Y`/`Ctrl+Shift+C`) copies the active selection, or the last
   assistant reply when nothing is selected. The TUI uses `wl-copy`, `xclip`,
   or `xsel` when available and falls back to OSC 52.
+- `Ctrl+V` attaches a PNG, JPEG, WebP, or GIF from the desktop clipboard.
+  Clipboard bytes are sent as real multimodal content to compatible OpenAI or
+  Anthropic API providers; account-backed text-only CLI providers receive a
+  compact attachment notice instead of raw base64 data. The attachment is
+  limited to 20 MiB and its temporary file is removed after submission.
+- `/contrast`, `/notify`, `/tokens`, and `/export` respectively toggle the
+  high-contrast palette, control desktop completion notifications, display
+  session token usage, and export the transcript as Markdown.
 - `/doctor` checks permissions, configuration, the provider endpoint,
   Firecrawl, the session database, and the working directories.
 - Provider, workspace, sandbox, and web-search changes issued while the model
@@ -1243,14 +1251,19 @@ Then enable the feature in `config.json` /web interface :
 The backend exposes:
 
 - `GET /api/whatsapp/status`
+- `GET /api/whatsapp/events` (live status updates over SSE)
 - `POST /api/whatsapp/start`
 - `POST /api/whatsapp/stop`
 - `GET /api/whatsapp/qr`
+- `POST /api/whatsapp/qr/refresh`
 
 Starting WhatsApp from WebTool waits for the local bridge, then waits up to
 30 seconds for Baileys to publish a QR code and displays it automatically.
 Bridge import, Node-version, port, and network failures are surfaced in the
 settings panel instead of being reported as a running bridge.
+Regenerating the QR code is a separate, confirmed action: it stops the bridge,
+removes the stale local pairing state, and starts a fresh pairing session. It
+is refused while WhatsApp is already connected.
 
 Once connected, the assistant also accepts `/skills`,
 `/skill inspect NAME`, and `/skill use NAME`. Skills activated from WhatsApp

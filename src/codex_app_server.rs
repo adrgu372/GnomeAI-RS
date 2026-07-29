@@ -625,7 +625,7 @@ fn codex_prompt(messages: &[Message]) -> String {
             Message::System { .. } => {}
             Message::User { content } => {
                 prompt.push_str("USER:\n");
-                prompt.push_str(content);
+                prompt.push_str(&crate::provider::user_content_for_display(content));
                 prompt.push_str("\n\n");
             }
             Message::Assistant { content, .. } if !content.is_empty() => {

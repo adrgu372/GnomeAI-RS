@@ -411,6 +411,7 @@
         <button type="button" class="ghost" id="waStart">Pornește</button>
         <button type="button" class="ghost" id="waStop">Oprește</button>
         <button type="button" class="ghost" id="waShowQr">Cod QR</button>
+        <button type="button" class="ghost" id="waRefreshQr">Regenerează QR</button>
       </div>
       <div class="wa-qr" id="waQr" hidden><img id="waQrImg" alt="Cod QR WhatsApp"></div>
 
@@ -433,6 +434,7 @@
       activeChat: null,
       sending: false,
       stream: null,
+      whatsappStream: null,
       questionTimer: null,
       renderedQuestionId: null,
       uploadsInFlight: 0,
@@ -1403,31 +1405,50 @@
     /* WhatsApp                                                            */
     /* ------------------------------------------------------------------ */
 
+    function renderWhatsAppStatus(status) {
+      const running = Boolean(status?.bridge_running || status?.connected);
+      const connected = Boolean(status?.connected);
+      const error = String(status?.last_error || "").trim();
+      $("#waStatus").textContent = connected
+        ? "Conectat ✓"
+        : error
+          ? `Eroare bridge: ${error}`
+          : running && status?.qr_available
+            ? "Codul QR este pregătit pentru scanare"
+            : running
+              ? "Pornit — se așteaptă codul QR"
+              : "Oprit";
+      $("#waStatus").style.color = connected
+        ? "var(--green)"
+        : error
+          ? "var(--red)"
+          : "var(--muted)";
+      return status;
+    }
+
     async function refreshWhatsApp() {
       try {
-        const status = await api("/api/whatsapp/status");
-        const running = Boolean(status.bridge_running || status.connected);
-        const connected = Boolean(status.connected);
-        const error = String(status.last_error || "").trim();
-        $("#waStatus").textContent = connected
-          ? "Conectat ✓"
-          : error
-            ? `Eroare bridge: ${error}`
-            : running && status.qr_available
-              ? "Codul QR este pregătit pentru scanare"
-              : running
-                ? "Pornit — se așteaptă codul QR"
-                : "Oprit";
-        $("#waStatus").style.color = connected
-          ? "var(--green)"
-          : error
-            ? "var(--red)"
-            : "var(--muted)";
-        return status;
+        return renderWhatsAppStatus(await api("/api/whatsapp/status"));
       } catch {
         $("#waStatus").textContent = "Indisponibil";
         return null;
       }
+    }
+
+    function startWhatsAppEvents() {
+      if (state.whatsappStream) return;
+      const source = new EventSource(authenticatedUrl("/api/whatsapp/events"));
+      state.whatsappStream = source;
+      source.onmessage = (event) => {
+        try {
+          renderWhatsAppStatus(JSON.parse(event.data));
+        } catch {
+          // A malformed status update must not stop EventSource reconnection.
+        }
+      };
+      source.onerror = () => {
+        $("#waStatus").textContent = "Se reconectează…";
+      };
     }
 
     async function whatsappAction(path) {
@@ -1467,7 +1488,7 @@
         }
         if (!status?.qr_available) {
           throw new Error(
-            "WhatsApp nu a furnizat codul QR în 30 de secunde. Verifică rețeaua și încearcă din nou.",
+            "WhatsApp nu a furnizat codul QR în 30 de secunde. Folosește „Regenerează QR” pentru o sesiune nouă.",
           );
         }
         const svg = await api(`/api/whatsapp/qr?ts=${Date.now()}`);
@@ -1476,6 +1497,27 @@
         await refreshWhatsApp();
       } catch (error) {
         container.hidden = true;
+        await refreshWhatsApp();
+        toast(error.message);
+      }
+    }
+
+    async function regenerateWhatsAppQr() {
+      const status = await refreshWhatsApp();
+      if (status?.connected) {
+        toast("WhatsApp este deja conectat.");
+        return;
+      }
+      if (!window.confirm(
+        "Regenerarea șterge autentificarea WhatsApp veche și pornește o asociere nouă. Continui?",
+      )) return;
+
+      $("#waQr").hidden = true;
+      $("#waStatus").textContent = "Resetez asocierea WhatsApp…";
+      try {
+        await api("/api/whatsapp/qr/refresh", { method: "POST" });
+        await showWhatsAppQr();
+      } catch (error) {
         await refreshWhatsApp();
         toast(error.message);
       }
@@ -1545,6 +1587,7 @@
     $("#waStart").addEventListener("click", () => whatsappAction("/api/whatsapp/start"));
     $("#waStop").addEventListener("click", () => whatsappAction("/api/whatsapp/stop"));
     $("#waShowQr").addEventListener("click", showWhatsAppQr);
+    $("#waRefreshQr").addEventListener("click", regenerateWhatsAppQr);
     $("#prompt").addEventListener("input", resizePrompt);
     $("#prompt").addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey) {
@@ -1559,6 +1602,7 @@
       try {
         await loadProviders();
         await loadChats();
+        startWhatsAppEvents();
         $("#connectionState").textContent = `${$("#connectionState").textContent} · conectat`;
         $("#prompt").focus();
       } catch (error) {

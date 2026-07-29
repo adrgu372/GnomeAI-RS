@@ -173,7 +173,7 @@ impl Agent {
             &self.session_id,
             "user",
             &user_text,
-            estimate(&user_text),
+            estimate(&crate::provider::user_content_for_display(&user_text)),
             first_user_turn,
         )?;
 
@@ -607,7 +607,12 @@ impl Agent {
     async fn commit_compaction(&self, plan: crate::store::CompactionPlan) -> Result<()> {
         let mut source = String::new();
         for turn in &plan.victims {
-            let content: String = turn.content.chars().take(4_000).collect();
+            let compact_content = if turn.role == "user" {
+                crate::provider::user_content_for_display(&turn.content)
+            } else {
+                turn.content.clone()
+            };
+            let content: String = compact_content.chars().take(4_000).collect();
             source.push_str(&format!("{}: {}\n\n", turn.role, content));
             if source.len() >= 32_000 {
                 source = source.chars().take(32_000).collect();

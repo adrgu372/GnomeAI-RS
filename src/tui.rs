@@ -27,7 +27,7 @@ use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState, Wrap,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -62,6 +62,12 @@ enum Block_ {
     Note(String),
 }
 
+#[derive(Debug, Clone)]
+struct PendingImage {
+    path: PathBuf,
+    media_type: String,
+}
+
 /// Slash commands the TUI owns. Anything unrecognised is sent to the core, so
 /// the agent side can add commands without a TUI release.
 const COMMANDS: &[(&str, &str)] = &[
@@ -89,8 +95,16 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/mouse", "toggle app mouse support: /mouse on|off"),
     ("/copy", "copy the selection or last assistant reply"),
+    (
+        "/contrast",
+        "toggle high-contrast colors (light terminal backgrounds)",
+    ),
+    ("/tokens", "show per-turn token usage and session totals"),
+    ("/notify", "toggle desktop notifications: /notify on|off"),
     ("/doctor", "diagnose configuration and environment"),
     ("/diff", "show the accumulated diff"),
+    ("/export", "export conversation to markdown file"),
+    ("/clear", "clear the transcript (history is preserved)"),
     ("/quit", "exit"),
 ];
 
@@ -229,8 +243,28 @@ pub struct App {
     /// be appended to the transcript because doing so would move the selected
     /// rows immediately after mouse-up.
     clipboard_notice: Option<(String, Instant)>,
+    /// Images captured by Ctrl+V and therefore trusted for outbound upload.
+    /// User-typed `[image: ...]` markers never grant arbitrary file access.
+    pending_images: HashMap<String, PendingImage>,
 
     should_quit: bool,
+
+    // -----------------------------------------------------------------------
+    // New features
+    // -----------------------------------------------------------------------
+    /// Search mode state
+    search_mode: bool,
+    search_query: String,
+    search_matches: Vec<usize>, // indices into blocks
+    search_idx: usize,
+    /// Multi-line composer: true = newline inserted, false = submit
+    composer_multiline: bool,
+    /// High contrast mode for light terminal backgrounds
+    high_contrast: bool,
+    /// Per-turn token usage history: (input_tokens, output_tokens, duration_ms)
+    token_history: Vec<(i64, i64, u64)>,
+    /// Desktop notifications on turn completion and errors.
+    notifications_enabled: bool,
 }
 
 impl App {
@@ -267,7 +301,24 @@ impl App {
             transcript_area: Rect::default(),
             selection: None,
             clipboard_notice: None,
+            pending_images: HashMap::new(),
             should_quit: false,
+            search_mode: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_idx: 0,
+            composer_multiline: false,
+            high_contrast: false,
+            token_history: Vec::new(),
+            notifications_enabled: true,
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        for image in self.pending_images.values() {
+            let _ = std::fs::remove_file(&image.path);
         }
     }
 }
@@ -346,6 +397,15 @@ pub async fn run(ops: mpsc::Sender<Op>, mut events: mpsc::Receiver<Event>) -> Re
             }
             _ = tick.tick() => {}
             else => break Ok(()),
+        }
+
+        // Auto-dismiss clipboard notice after 3 seconds (frees the Option)
+        if app
+            .clipboard_notice
+            .as_ref()
+            .is_some_and(|(_, created)| created.elapsed() >= Duration::from_secs(3))
+        {
+            app.clipboard_notice = None;
         }
 
         // `/mouse` toggles capture. Only the run loop touches the terminal, so
@@ -468,6 +528,7 @@ fn apply_event(app: &mut App, ev: Event) {
             app.selection = None;
             app.tokens_in = 0;
             app.tokens_out = 0;
+            app.token_history.clear();
         }
 
         Event::ProviderChanged { provider, model } => {
@@ -540,6 +601,10 @@ fn apply_event(app: &mut App, ev: Event) {
             reason,
             ..
         } => {
+            if app.notifications_enabled {
+                let short: String = command.chars().take(120).collect();
+                desktop_notify("GnomeAI — approval needed", &format!("{short}\n{reason}"));
+            }
             app.pending_approval = Some((call_id, format!("{command}\n\n{reason}")));
         }
 
@@ -562,12 +627,26 @@ fn apply_event(app: &mut App, ev: Event) {
         Event::TurnCompleted {
             input_tokens,
             output_tokens,
+            duration_ms,
             ..
         } => {
             app.busy = false;
             app.turn_started = None;
             app.tokens_in += input_tokens;
             app.tokens_out += output_tokens;
+            app.token_history
+                .push((input_tokens, output_tokens, duration_ms));
+            if app.notifications_enabled {
+                desktop_notify(
+                    "GnomeAI — turn complete",
+                    &format!(
+                        "{} tokens out · {:.1}s · {}",
+                        output_tokens,
+                        duration_ms as f64 / 1000.0,
+                        app.model,
+                    ),
+                );
+            }
         }
 
         Event::Interrupted => {
@@ -580,10 +659,13 @@ fn apply_event(app: &mut App, ev: Event) {
 
         Event::Error { message, fatal } => {
             app.busy = false;
-            app.blocks.push(Block_::Error(message));
             if fatal {
+                if app.notifications_enabled {
+                    desktop_notify("GnomeAI — fatal error", &message);
+                }
                 app.should_quit = true;
             }
+            app.blocks.push(Block_::Error(message));
         }
     }
 }
@@ -622,6 +704,45 @@ async fn handle_key(app: &mut App, key: KeyEvent, ops: &mpsc::Sender<Op>) -> UiA
         return UiAction::None;
     }
 
+    // Search mode handling
+    if app.search_mode {
+        match key.code {
+            KeyCode::Esc => {
+                app.search_mode = false;
+                app.search_query.clear();
+                app.search_matches.clear();
+            }
+            KeyCode::Enter => {
+                // Jump to next match
+                if !app.search_matches.is_empty() {
+                    app.search_idx = (app.search_idx + 1) % app.search_matches.len();
+                    scroll_to_match(app);
+                }
+            }
+            KeyCode::BackTab => {
+                // Jump to previous match (Shift+Tab)
+                if !app.search_matches.is_empty() {
+                    app.search_idx = if app.search_idx == 0 {
+                        app.search_matches.len() - 1
+                    } else {
+                        app.search_idx - 1
+                    };
+                    scroll_to_match(app);
+                }
+            }
+            KeyCode::Backspace => {
+                app.search_query.pop();
+                update_search_matches(app);
+            }
+            KeyCode::Char(c) => {
+                app.search_query.push(c);
+                update_search_matches(app);
+            }
+            _ => {}
+        }
+        return UiAction::None;
+    }
+
     // Some terminals forward Ctrl+Shift+C to alternate-screen applications
     // instead of handling it themselves. Never interpret that familiar copy
     // shortcut as Ctrl+C (interrupt/quit).
@@ -644,6 +765,38 @@ async fn handle_key(app: &mut App, key: KeyEvent, ops: &mpsc::Sender<Op>) -> UiA
                 app.should_quit = true;
             }
         }
+
+        // Ctrl+F: enter search mode
+        (KeyCode::Char('f'), true, _) => {
+            app.search_mode = true;
+            app.search_query.clear();
+            app.search_matches.clear();
+            app.search_idx = 0;
+        }
+
+        // Ctrl+V: paste an image from the system clipboard into the composer
+        // as an [image: PATH] marker. Text paste already arrives via the
+        // terminal's bracketed-paste, so this only handles the image case.
+        (KeyCode::Char('v'), true, _) => match clipboard_image().await {
+            Ok(Some(image)) => {
+                let key = image.path.display().to_string();
+                let marker = format!("[image: {key}]");
+                for ch in marker.chars() {
+                    insert(app, ch);
+                }
+                app.pending_images.insert(key, image);
+                app.clipboard_notice = Some(("image pasted from clipboard".into(), Instant::now()));
+            }
+            Ok(None) => {
+                app.clipboard_notice = Some((
+                    "no image in clipboard (text pastes via Ctrl+Shift+V)".into(),
+                    Instant::now(),
+                ));
+            }
+            Err(error) => {
+                app.blocks.push(Block_::Error(error));
+            }
+        },
 
         (KeyCode::Enter, false, false) => {
             let selected_completion = app.completions.get(app.completion_idx).copied();
@@ -668,6 +821,11 @@ async fn handle_key(app: &mut App, key: KeyEvent, ops: &mpsc::Sender<Op>) -> UiA
             } else {
                 accept_completion(app);
             }
+        }
+
+        // Shift+Enter: insert newline for multi-line composer
+        (KeyCode::Enter, false, true) => {
+            insert(app, '\n');
         }
 
         // Shift+Enter is not distinguishable on many terminals, so Alt+Enter
@@ -701,6 +859,11 @@ async fn handle_key(app: &mut App, key: KeyEvent, ops: &mpsc::Sender<Op>) -> UiA
                 app.composer.replace_range(prev..app.cursor, "");
                 app.cursor = prev;
                 recompute_completions(app);
+
+                // Clear completions if composer is now empty
+                if app.composer.is_empty() {
+                    app.completions.clear();
+                }
             }
         }
 
@@ -1400,8 +1563,46 @@ async fn submit(app: &mut App, text: String, ops: &mpsc::Sender<Op>) {
             app.mouse_toggle = Some(!app.mouse_enabled);
             return;
         }
+        "/contrast" => {
+            app.high_contrast = !app.high_contrast;
+            let state = if app.high_contrast { "on" } else { "off" };
+            app.blocks.push(Block_::Note(format!(
+                "high contrast {state} — borders and accents now use brighter colors"
+            )));
+            return;
+        }
+        "/tokens" => {
+            show_token_usage(app);
+            return;
+        }
+        "/notify" => {
+            app.notifications_enabled = !app.notifications_enabled;
+            let state = if app.notifications_enabled {
+                "on"
+            } else {
+                "off"
+            };
+            app.blocks
+                .push(Block_::Note(format!("desktop notifications {state}")));
+            return;
+        }
         "/diff" => {
             let _ = ops.send(Op::ShowDiff).await;
+            return;
+        }
+        "/export" => {
+            export_conversation(app);
+            return;
+        }
+        "/clear" => {
+            app.blocks.clear();
+            app.scroll = 0;
+            app.max_scroll = 0;
+            app.detached = false;
+            app.selection = None;
+            app.blocks.push(Block_::Note(
+                "transcript cleared — session history preserved".into(),
+            ));
             return;
         }
         "/provider" => {
@@ -1523,6 +1724,16 @@ async fn submit(app: &mut App, text: String, ops: &mpsc::Sender<Op>) {
         }
         return;
     }
+    if let Some(argument) = trimmed.strip_prefix("/notify ") {
+        match argument.trim().to_ascii_lowercase().as_str() {
+            "on" | "true" | "1" => app.notifications_enabled = true,
+            "off" | "false" | "0" => app.notifications_enabled = false,
+            _ => app
+                .blocks
+                .push(Block_::Error("usage: /notify [on|off]".into())),
+        }
+        return;
+    }
     if let Some(model) = trimmed.strip_prefix("/model ") {
         let model = model.trim();
         if model.is_empty() {
@@ -1612,8 +1823,70 @@ async fn submit(app: &mut App, text: String, ops: &mpsc::Sender<Op>) {
         return;
     }
 
-    app.blocks.push(Block_::User(text.clone()));
-    let _ = ops.send(Op::Submit { text }).await;
+    // Expand only markers registered by Ctrl+V. The transcript keeps a compact
+    // attachment line, while the provider receives the actual image bytes as
+    // an OpenAI-style multipart user turn.
+    let mut display_text = text.clone();
+    let mut model_text = text.clone();
+    let mut image_parts = Vec::new();
+    for path in image_marker_paths(&text) {
+        let marker = format!("[image: {path}]");
+        if !model_text.contains(&marker) {
+            continue;
+        }
+        let Some(image) = app.pending_images.remove(&path) else {
+            app.blocks.push(Block_::Error(
+                "ignored an image marker that was not created by Ctrl+V".into(),
+            ));
+            continue;
+        };
+
+        display_text = display_text.replace(&marker, &format!("📎 {}", image.path.display()));
+        model_text = model_text.replace(&marker, "");
+        let bytes = tokio::fs::read(&image.path).await;
+        let _ = tokio::fs::remove_file(&image.path).await;
+        match bytes {
+            Ok(bytes) if bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES => {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                image_parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:{};base64,{encoded}", image.media_type),
+                    }
+                }));
+                app.blocks.push(Block_::Note(format!(
+                    "image attached: {}",
+                    image.path.display()
+                )));
+            }
+            Ok(bytes) => app.blocks.push(Block_::Error(format!(
+                "clipboard image is too large ({} MiB; limit {} MiB)",
+                bytes.len() / (1024 * 1024),
+                MAX_CLIPBOARD_IMAGE_BYTES / (1024 * 1024),
+            ))),
+            Err(error) => app.blocks.push(Block_::Error(format!(
+                "cannot read pasted image {}: {error}",
+                image.path.display()
+            ))),
+        }
+    }
+
+    if !image_parts.is_empty() {
+        let prompt = if model_text.trim().is_empty() {
+            "Analyze the attached image.".to_string()
+        } else {
+            model_text.trim().to_string()
+        };
+        let mut parts = vec![serde_json::json!({
+            "type": "text",
+            "text": prompt,
+        })];
+        parts.extend(image_parts);
+        model_text = serde_json::to_string(&parts).expect("multipart user content is serializable");
+    }
+
+    app.blocks.push(Block_::User(display_text));
+    let _ = ops.send(Op::Submit { text: model_text }).await;
 }
 
 fn workspace_command_path(text: &str) -> Option<PathBuf> {
@@ -1967,6 +2240,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     f.render_widget(paragraph.scroll((app.scroll, 0)), area);
+
     if let Some(selection) = app.selection {
         f.render_widget(
             SelectionHighlight {
@@ -2110,6 +2384,23 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         String::new()
     };
     let mouse = if app.mouse_enabled { "" } else { "  mouse:off" };
+
+    // Search mode indicator
+    let search = if app.search_mode {
+        if app.search_matches.is_empty() {
+            format!("  [search: {} (no matches)]", app.search_query)
+        } else {
+            format!(
+                "  [search: {} ({}/{})]",
+                app.search_query,
+                app.search_idx + 1,
+                app.search_matches.len()
+            )
+        }
+    } else {
+        String::new()
+    };
+
     let left = app
         .clipboard_notice
         .as_ref()
@@ -2117,7 +2408,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         .map(|(message, _)| format!("✓ {message}"))
         .unwrap_or_else(|| {
             format!(
-                "{spinner}{elapsed}  {} · {}  {} · {web}{branch}{queued}{mouse}{scroll_pos}",
+                "{spinner}{elapsed}  {} · {}  {} · {web}{branch}{queued}{mouse}{search}{scroll_pos}",
                 app.provider, app.model, app.sandbox
             )
         });
@@ -2127,10 +2418,15 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         .saturating_sub(left.len() + right.len())
         .max(1);
 
+    let status_fg = if app.high_contrast {
+        Color::Gray
+    } else {
+        Color::DarkGray
+    };
     f.render_widget(
         Paragraph::new(Line::styled(
             format!("{left}{}{right}", " ".repeat(pad)),
-            Style::new().fg(Color::DarkGray),
+            Style::new().fg(status_fg),
         )),
         area,
     );
@@ -2139,6 +2435,8 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 fn draw_composer(f: &mut Frame, app: &App, area: Rect) {
     let border = if app.busy {
         Color::DarkGray
+    } else if app.high_contrast {
+        Color::LightCyan
     } else {
         Color::Cyan
     };
@@ -2358,6 +2656,348 @@ fn draw_provider_dialog(f: &mut Frame, dialog: &ProviderDialog, screen: Rect) {
                 }),
                 inner,
             );
+        }
+    }
+}
+
+/// Update search matches based on current query
+fn update_search_matches(app: &mut App) {
+    app.search_matches.clear();
+    app.search_idx = 0;
+
+    if app.search_query.is_empty() {
+        return;
+    }
+
+    let query = app.search_query.to_lowercase();
+
+    for (idx, block) in app.blocks.iter().enumerate() {
+        let text = match block {
+            Block_::User(t) | Block_::Assistant(t) | Block_::Reasoning(t) => t,
+            Block_::Tool {
+                name,
+                summary,
+                output,
+                ..
+            } => &format!("{} {} {}", name, summary, output),
+            Block_::Diff(t) => t,
+            Block_::Verify { stage, summary, .. } => &format!("{} {}", stage, summary),
+            Block_::Error(t) | Block_::Note(t) => t,
+        };
+
+        if text.to_lowercase().contains(&query) {
+            app.search_matches.push(idx);
+        }
+    }
+}
+
+/// Scroll the transcript so the current search match is visible.
+fn scroll_to_match(app: &mut App) {
+    let Some(&block_idx) = app.search_matches.get(app.search_idx) else {
+        return;
+    };
+
+    // Rebuild the transcript lines to find the row offset for this block
+    let lines = transcript_lines(app);
+    let mut target_row = 0usize;
+    let mut current_block = 0usize;
+
+    for line in &lines {
+        if current_block == block_idx {
+            break;
+        }
+        // Count rows consumed by this line (accounting for wrapping)
+        let line_width = line.width();
+        let area_width = app.transcript_area.width.max(1) as usize;
+        let rows = if line_width == 0 {
+            1
+        } else {
+            (line_width + area_width - 1) / area_width
+        };
+        target_row += rows;
+
+        // Detect block boundaries by empty lines (blocks are separated by blank lines)
+        if line_width == 0 {
+            current_block += 1;
+        }
+    }
+
+    // Set scroll to show the match (with some context above)
+    let context_rows = 3usize;
+    let scroll_target = target_row.saturating_sub(context_rows);
+    app.scroll = scroll_target.min(usize::from(u16::MAX)) as u16;
+    app.detached = true; // Prevent auto-scroll from overriding our position
+}
+
+const MAX_CLIPBOARD_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn image_marker_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("[image: ") {
+        let after = &rest[start + 8..];
+        let Some(end) = after.find(']') else {
+            break;
+        };
+        let path = after[..end].trim();
+        if !path.is_empty() && !paths.iter().any(|known| known == path) {
+            paths.push(path.to_string());
+        }
+        rest = &after[end + 1..];
+    }
+    paths
+}
+
+fn advertised_image_type(types: &[u8]) -> Option<(&'static str, &'static str)> {
+    let types = String::from_utf8_lossy(types);
+    [
+        ("image/png", "png"),
+        ("image/jpeg", "jpg"),
+        ("image/webp", "webp"),
+        ("image/gif", "gif"),
+    ]
+    .into_iter()
+    .find(|(media_type, _)| types.lines().any(|line| line.trim() == *media_type))
+}
+
+async fn clipboard_command(program: &str, args: &[&str]) -> Option<Vec<u8>> {
+    let output = tokio::time::timeout(
+        CLIPBOARD_COMMAND_TIMEOUT,
+        tokio::process::Command::new(program).args(args).output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+/// Read an image from Wayland or X11 without blocking Tokio's worker thread.
+/// The temporary file is registered in `App` and removed after submit or exit.
+async fn clipboard_image() -> std::result::Result<Option<PendingImage>, String> {
+    let candidates = [
+        ("wl-paste", vec!["--list-types"], vec!["--type"]),
+        (
+            "xclip",
+            vec!["-selection", "clipboard", "-t", "TARGETS", "-o"],
+            vec!["-selection", "clipboard", "-t"],
+        ),
+    ];
+
+    for (program, list_args, mut read_args) in candidates {
+        let Some(types) = clipboard_command(program, &list_args).await else {
+            continue;
+        };
+        let Some((media_type, extension)) = advertised_image_type(&types) else {
+            continue;
+        };
+        read_args.push(media_type);
+        if program == "xclip" {
+            read_args.push("-o");
+        }
+        let bytes = clipboard_command(program, &read_args)
+            .await
+            .ok_or_else(|| format!("{program} could not read the clipboard image"))?;
+        if bytes.is_empty() {
+            return Err(format!("{program} returned an empty clipboard image"));
+        }
+        if bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+            return Err(format!(
+                "clipboard image is too large ({} MiB; limit {} MiB)",
+                bytes.len() / (1024 * 1024),
+                MAX_CLIPBOARD_IMAGE_BYTES / (1024 * 1024),
+            ));
+        }
+
+        let dir = std::env::temp_dir().join("gnomef-paste");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+        let path = dir.join(format!("paste-{}.{}", uuid::Uuid::new_v4(), extension));
+        tokio::fs::write(&path, bytes)
+            .await
+            .map_err(|error| format!("cannot save clipboard image: {error}"))?;
+        return Ok(Some(PendingImage {
+            path,
+            media_type: media_type.to_string(),
+        }));
+    }
+
+    Ok(None)
+}
+
+/// Send a desktop notification via `notify-send` (libnotify). Fire-and-forget:
+/// a missing binary or a session without D-Bus just means no popup appears.
+/// Falls back to the terminal bell so headless terminals still get a ping.
+fn desktop_notify(title: &str, body: &str) {
+    let ok = std::process::Command::new("notify-send")
+        .arg("--app-name=GnomeAI")
+        .arg("--expire-time=5000")
+        .arg(title)
+        .arg(body)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok();
+    if !ok {
+        // OSC 9 would be nicer, but the plain BEL works everywhere.
+        print!("\x07");
+    }
+}
+
+/// Render a per-turn token usage table plus session totals into the
+/// transcript. Turns are listed most-recent-last so the table reads
+/// chronologically top to bottom.
+fn show_token_usage(app: &mut App) {
+    if app.token_history.is_empty() {
+        app.blocks.push(Block_::Note(
+            "no completed turns yet this session — token counters are all zero".into(),
+        ));
+        return;
+    }
+
+    let mut lines = String::new();
+    lines.push_str(" turn │      in │     out │   total │ duration\n");
+    lines.push_str("──────┼─────────┼─────────┼─────────┼─────────\n");
+
+    for (index, (input, output, ms)) in app.token_history.iter().enumerate() {
+        lines.push_str(&format!(
+            " {:>4} │ {:>7} │ {:>7} │ {:>7} │ {:>6.1}s\n",
+            index + 1,
+            input,
+            output,
+            input + output,
+            *ms as f64 / 1000.0,
+        ));
+    }
+
+    lines.push_str("──────┼─────────┼─────────┼─────────┼─────────\n");
+    let turns = app.token_history.len();
+    let total_ms: u64 = app.token_history.iter().map(|t| t.2).sum();
+    let avg_in = app.tokens_in / turns.max(1) as i64;
+    let avg_out = app.tokens_out / turns.max(1) as i64;
+    lines.push_str(&format!(
+        " total │ {:>7} │ {:>7} │ {:>7} │ {:>6.1}s\n",
+        app.tokens_in,
+        app.tokens_out,
+        app.tokens_in + app.tokens_out,
+        total_ms as f64 / 1000.0,
+    ));
+    lines.push_str(&format!(
+        "\n{turns} turns · average {avg_in} in / {avg_out} out per turn · model: {}",
+        app.model
+    ));
+
+    app.blocks.push(Block_::Note(lines));
+}
+
+fn export_conversation(app: &mut App) {
+    use std::io::Write;
+
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let filename = format!("gnomeai_export_{}.md", timestamp);
+
+    let mut content = String::new();
+    content.push_str("# GnomeAI Conversation Export\n\n");
+    content.push_str(&format!(
+        "**Date:** {}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    ));
+    content.push_str(&format!("**Provider:** {}\n", app.provider));
+    content.push_str(&format!("**Model:** {}\n", app.model));
+    content.push_str(&format!("**Workspace:** {}\n\n", app.workspace));
+    content.push_str("---\n\n");
+
+    for block in &app.blocks {
+        match block {
+            Block_::User(text) => {
+                content.push_str("## User\n\n");
+                content.push_str(text);
+                content.push_str("\n\n");
+            }
+            Block_::Assistant(text) => {
+                content.push_str("## Assistant\n\n");
+                content.push_str(text);
+                content.push_str("\n\n");
+            }
+            Block_::Reasoning(text) => {
+                content.push_str("### Reasoning\n\n```\n");
+                content.push_str(text);
+                content.push_str("\n```\n\n");
+            }
+            Block_::Tool {
+                name,
+                summary,
+                output,
+                done,
+                ok,
+                ms,
+            } => {
+                content.push_str(&format!("### Tool: {}\n\n", name));
+                content.push_str(&format!("**Summary:** {}\n\n", summary));
+                content.push_str(&format!(
+                    "**Status:** {} ({} ms)\n\n",
+                    if *done {
+                        if *ok { "✓ Success" } else { "✗ Failed" }
+                    } else {
+                        "⏳ Running"
+                    },
+                    ms
+                ));
+                content.push_str("```\n");
+                content.push_str(output);
+                content.push_str("\n```\n\n");
+            }
+            Block_::Diff(text) => {
+                content.push_str("### Diff\n\n```diff\n");
+                content.push_str(text);
+                content.push_str("\n```\n\n");
+            }
+            Block_::Verify {
+                stage,
+                passed,
+                summary,
+            } => {
+                content.push_str(&format!("### Verify: {}\n\n", stage));
+                content.push_str(&format!(
+                    "**Result:** {}\n\n",
+                    if *passed { "✓ Passed" } else { "✗ Failed" }
+                ));
+                content.push_str(summary);
+                content.push_str("\n\n");
+            }
+            Block_::Error(text) => {
+                content.push_str("### Error\n\n```\n");
+                content.push_str(text);
+                content.push_str("\n```\n\n");
+            }
+            Block_::Note(text) => {
+                content.push_str("> **Note:** ");
+                content.push_str(text);
+                content.push_str("\n\n");
+            }
+        }
+    }
+
+    match std::fs::File::create(&filename) {
+        Ok(mut file) => match file.write_all(content.as_bytes()) {
+            Ok(_) => {
+                app.blocks.push(Block_::Note(format!(
+                    "Conversation exported to: {}",
+                    filename
+                )));
+            }
+            Err(e) => {
+                app.blocks
+                    .push(Block_::Error(format!("Failed to write export file: {}", e)));
+            }
+        },
+        Err(e) => {
+            app.blocks.push(Block_::Error(format!(
+                "Failed to create export file: {}",
+                e
+            )));
         }
     }
 }
@@ -2633,6 +3273,74 @@ mod tests {
     }
 
     #[test]
+    fn image_markers_are_parsed_once_in_message_order() {
+        assert_eq!(
+            image_marker_paths(
+                "first [image: /tmp/a.png] second [image: /tmp/b.jpg] [image: /tmp/a.png]"
+            ),
+            vec!["/tmp/a.png", "/tmp/b.jpg"]
+        );
+    }
+
+    #[test]
+    fn clipboard_prefers_png_and_accepts_common_image_types() {
+        assert_eq!(
+            advertised_image_type(b"text/plain\nimage/jpeg\nimage/png\n"),
+            Some(("image/png", "png"))
+        );
+        assert_eq!(
+            advertised_image_type(b"image/webp\n"),
+            Some(("image/webp", "webp"))
+        );
+        assert_eq!(advertised_image_type(b"text/plain\n"), None);
+    }
+
+    #[tokio::test]
+    async fn submit_sends_registered_clipboard_image_as_multipart() {
+        let (ops, mut receiver) = mpsc::channel(1);
+        let mut app = App::new();
+        let root =
+            std::env::temp_dir().join(format!("gnomeai-tui-image-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("paste.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let key = path.display().to_string();
+        app.pending_images.insert(
+            key.clone(),
+            PendingImage {
+                path: path.clone(),
+                media_type: "image/png".into(),
+            },
+        );
+
+        submit(&mut app, format!("describe this [image: {key}]"), &ops).await;
+
+        let Some(Op::Submit { text }) = receiver.recv().await else {
+            panic!("multipart submit was not emitted");
+        };
+        let parts: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "describe this");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert!(
+            parts[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+        assert!(
+            !path.exists(),
+            "temporary image must be removed after submit"
+        );
+        assert!(
+            app.blocks
+                .iter()
+                .any(|block| matches!(block, Block_::User(text) if text.contains("📎")))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn mouse_wheel_detaches_and_returns_to_the_transcript_tail() {
         let mut app = App::new();
         app.max_scroll = 6;
@@ -2824,6 +3532,83 @@ mod tests {
         submit(&mut app, "/mouse sideways".into(), &ops).await;
         assert!(app.mouse_toggle.is_none());
         assert!(matches!(app.blocks.last(), Some(Block_::Error(_))));
+    }
+
+    #[tokio::test]
+    async fn contrast_command_toggles_high_contrast_mode() {
+        let (ops, _receiver) = mpsc::channel(1);
+        let mut app = App::new();
+        assert!(!app.high_contrast);
+
+        submit(&mut app, "/contrast".into(), &ops).await;
+        assert!(app.high_contrast);
+        assert!(matches!(app.blocks.last(), Some(Block_::Note(_))));
+
+        submit(&mut app, "/contrast".into(), &ops).await;
+        assert!(!app.high_contrast);
+    }
+
+    #[tokio::test]
+    async fn notify_command_toggles_notifications() {
+        let (ops, _receiver) = mpsc::channel(1);
+        let mut app = App::new();
+        assert!(app.notifications_enabled, "default should be on");
+
+        submit(&mut app, "/notify".into(), &ops).await;
+        assert!(!app.notifications_enabled);
+        assert!(matches!(app.blocks.last(), Some(Block_::Note(_))));
+
+        submit(&mut app, "/notify on".into(), &ops).await;
+        assert!(app.notifications_enabled);
+
+        submit(&mut app, "/notify sideways".into(), &ops).await;
+        assert!(matches!(app.blocks.last(), Some(Block_::Error(_))));
+        assert!(app.notifications_enabled, "bad arg must not flip the flag");
+    }
+
+    #[tokio::test]
+    async fn tokens_command_reports_usage_table() {
+        let (ops, _receiver) = mpsc::channel(1);
+        let mut app = App::new();
+
+        // Empty session: explanatory note, no table.
+        submit(&mut app, "/tokens".into(), &ops).await;
+        match app.blocks.last() {
+            Some(Block_::Note(text)) => assert!(text.contains("no completed turns")),
+            other => panic!("expected Note, got {other:?}"),
+        }
+
+        // Simulate two completed turns.
+        for (input, output, ms) in [(100_i64, 20_i64, 1500_u64), (300, 80, 2500)] {
+            apply_event(
+                &mut app,
+                Event::TurnCompleted {
+                    turn_id: 1,
+                    input_tokens: input,
+                    output_tokens: output,
+                    duration_ms: ms,
+                },
+            );
+        }
+        assert_eq!(app.tokens_in, 400);
+        assert_eq!(app.tokens_out, 100);
+        assert_eq!(app.token_history.len(), 2);
+
+        submit(&mut app, "/tokens".into(), &ops).await;
+        match app.blocks.last() {
+            Some(Block_::Note(text)) => {
+                assert!(
+                    text.contains("  400"),
+                    "totals row must show 400 in: {text}"
+                );
+                assert!(
+                    text.contains("  100"),
+                    "totals row must show 100 out: {text}"
+                );
+                assert!(text.contains("2 turns"), "summary line: {text}");
+            }
+            other => panic!("expected Note, got {other:?}"),
+        }
     }
 
     #[test]

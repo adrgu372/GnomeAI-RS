@@ -69,6 +69,92 @@ pub enum Message {
     },
 }
 
+fn image_url_from_part(part: &Value) -> Option<&str> {
+    part.pointer("/image_url/url")
+        .or_else(|| part.get("image_url"))
+        .or_else(|| part.get("url"))
+        .and_then(Value::as_str)
+}
+
+/// Convert any supported image-part spelling to the canonical OpenAI chat
+/// completions form. GnomeAI stores multipart user turns as JSON because the
+/// core protocol transports text; providers decode that representation here.
+fn openai_user_content(content: &str) -> Option<Value> {
+    let parsed = serde_json::from_str::<Value>(content).ok()?;
+    let parts = parsed.as_array()?;
+    let mut normalized = Vec::with_capacity(parts.len());
+    let mut images = 0usize;
+
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text" | "input_text") => normalized.push(json!({
+                "type": "text",
+                "text": part.get("text").and_then(Value::as_str).unwrap_or(""),
+            })),
+            Some("image_url" | "input_image" | "image") => {
+                let Some(url) = image_url_from_part(part) else {
+                    continue;
+                };
+                let mut image_url = json!({ "url": url });
+                if let Some(detail) = part
+                    .pointer("/image_url/detail")
+                    .or_else(|| part.get("detail"))
+                    .and_then(Value::as_str)
+                {
+                    image_url["detail"] = json!(detail);
+                }
+                normalized.push(json!({
+                    "type": "image_url",
+                    "image_url": image_url,
+                }));
+                images += 1;
+            }
+            _ => {}
+        }
+    }
+
+    (images > 0).then_some(Value::Array(normalized))
+}
+
+/// Return a safe, compact representation of a persisted user turn for the TUI,
+/// delegated CLI prompts, and compaction. In particular, never replay a base64
+/// data URL into the terminal or a text-only account provider.
+pub fn user_content_for_display(content: &str) -> String {
+    let Some(parts) = openai_user_content(content).and_then(|value| value.as_array().cloned())
+    else {
+        return content.to_string();
+    };
+
+    let mut text = parts
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .map(|part| {
+            part.get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let images = parts
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("image_url"))
+        .count();
+
+    if images > 0 {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        if images == 1 {
+            text.push_str("📎 image attached");
+        } else {
+            text.push_str(&format!("📎 {images} images attached"));
+        }
+    }
+    text
+}
+
 /// Account-backed providers own their execution loop and do not receive the
 /// GnomeAI tool registry. Forward only explicit host context that they still
 /// need (skills and shared memory), while keeping unrelated internal system
@@ -220,7 +306,13 @@ impl OpenAiCompatible {
 fn encode_message(m: &Message) -> Value {
     match m {
         Message::System { content } => json!({ "role": "system", "content": content }),
-        Message::User { content } => json!({ "role": "user", "content": content }),
+        Message::User { content } => {
+            if let Some(parts) = openai_user_content(content) {
+                json!({ "role": "user", "content": parts })
+            } else {
+                json!({ "role": "user", "content": content })
+            }
+        }
         Message::Assistant {
             content,
             tool_calls,
@@ -405,7 +497,50 @@ fn encode_anthropic_messages(messages: &[Message]) -> Vec<Value> {
     for message in messages {
         let (role, blocks) = match message {
             Message::System { .. } => continue,
-            Message::User { content } => ("user", vec![json!({ "type": "text", "text": content })]),
+            Message::User { content } => {
+                let multipart = openai_user_content(content);
+                let blocks = match multipart.as_ref().and_then(Value::as_array) {
+                    Some(parts) => parts
+                        .iter()
+                        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                            Some("text") => Some(json!({
+                                "type": "text",
+                                "text": part.get("text").and_then(Value::as_str).unwrap_or(""),
+                            })),
+                            Some("image_url") => {
+                                let url = image_url_from_part(part)?;
+                                if let Some(data) = url.strip_prefix("data:") {
+                                    let (media_type, encoded) = data.split_once(";base64,")?;
+                                    (!encoded.is_empty()).then(|| {
+                                        json!({
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": media_type,
+                                                "data": encoded,
+                                            }
+                                        })
+                                    })
+                                } else if url.starts_with("https://") || url.starts_with("http://")
+                                {
+                                    Some(json!({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "url",
+                                            "url": url,
+                                        }
+                                    }))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                    None => vec![json!({ "type": "text", "text": content })],
+                };
+                ("user", blocks)
+            }
             Message::Assistant {
                 content,
                 tool_calls,
@@ -799,7 +934,7 @@ fn cli_prompt(messages: &[Message]) -> String {
             Message::System { .. } => {}
             Message::User { content } => {
                 prompt.push_str("USER:\n");
-                prompt.push_str(content);
+                prompt.push_str(&user_content_for_display(content));
                 prompt.push_str("\n\n");
             }
             Message::Assistant { content, .. } if !content.is_empty() => {
@@ -1077,6 +1212,77 @@ mod tests {
         assert_eq!(body["max_completion_tokens"], 123);
         assert!(body.get("max_tokens").is_none());
         assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn openai_encoding_normalizes_pasted_image_parts() {
+        let encoded = encode_message(&Message::User {
+            content: serde_json::to_string(&json!([
+                {"type": "input_text", "text": "describe this"},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,cG5n"
+                }
+            ]))
+            .unwrap(),
+        });
+
+        assert_eq!(encoded["content"][0]["type"], "text");
+        assert_eq!(encoded["content"][0]["text"], "describe this");
+        assert_eq!(encoded["content"][1]["type"], "image_url");
+        assert_eq!(
+            encoded["content"][1]["image_url"]["url"],
+            "data:image/png;base64,cG5n"
+        );
+    }
+
+    #[test]
+    fn anthropic_encoding_translates_base64_and_remote_images() {
+        let messages = vec![Message::User {
+            content: serde_json::to_string(&json!([
+                {"type": "text", "text": "compare"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,cG5n"}
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/image.webp"}
+                }
+            ]))
+            .unwrap(),
+        }];
+        let encoded = encode_anthropic_messages(&messages);
+
+        assert_eq!(encoded[0]["content"][1]["type"], "image");
+        assert_eq!(encoded[0]["content"][1]["source"]["type"], "base64");
+        assert_eq!(
+            encoded[0]["content"][1]["source"]["media_type"],
+            "image/png"
+        );
+        assert_eq!(encoded[0]["content"][1]["source"]["data"], "cG5n");
+        assert_eq!(encoded[0]["content"][2]["source"]["type"], "url");
+        assert_eq!(
+            encoded[0]["content"][2]["source"]["url"],
+            "https://example.com/image.webp"
+        );
+    }
+
+    #[test]
+    fn multipart_display_never_exposes_base64() {
+        let content = serde_json::to_string(&json!([
+            {"type": "text", "text": "what is shown?"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,very-secret-pixels"}
+            }
+        ]))
+        .unwrap();
+        let display = user_content_for_display(&content);
+
+        assert!(display.contains("what is shown?"));
+        assert!(display.contains("image attached"));
+        assert!(!display.contains("very-secret-pixels"));
     }
 
     #[test]

@@ -1,6 +1,22 @@
-# GnomeAI-RS 0.1.0-8 — complete description of the changes
+# Unreleased — clipboard images and WhatsApp status
 
-Version **0.1.0-8** is a major update to GnomeAI-RS. It extends the agent with a
+- Terminal `Ctrl+V` now sends clipboard images as real multimodal request
+  parts to compatible OpenAI and Anthropic API providers. Only images captured
+  by the clipboard handler are trusted, uploads are limited to 20 MiB, and
+  temporary files are removed after submission.
+- Persisted image turns are rendered compactly in the terminal, delegated CLI
+  prompts, token estimates, and compaction; base64 payloads are never printed.
+- WhatsApp status changes are delivered to WebTool over SSE. QR regeneration
+  is explicit, confirmed in the UI, clears stale pairing state, and reports
+  conflicts and startup failures with the correct HTTP status.
+- The terminal commands `/contrast`, `/notify`, `/tokens`, and `/export` are
+  documented and covered by tests.
+
+---
+
+# GnomeAI-RS 1.0 - complete description of the changes
+
+Version **1.0** is a major update to GnomeAI-RS. It extends the agent with a
 native skills system, advanced persistent memory, provider administration,
 improved WhatsApp integration, clearly defined access modes, and a more complete
 and reliable Debian package.
@@ -770,14 +786,14 @@ The following were tested:
 These fixes produced version:
 
 ```text
-GnomeAI-RS 0.1.0-8
+GnomeAI-RS 1.0
 ```
 
 ---
 
 ## Summary
 
-GnomeAI-RS 0.1.0-8 brings:
+GnomeAI-RS 1.0 brings:
 
 * native Rust skills compatible with `SKILL.md`;
 * skill installation from local folders and from Git;

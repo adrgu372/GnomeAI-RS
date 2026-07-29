@@ -101,6 +101,8 @@ struct AppState {
     upload_lock: Arc<Mutex<()>>,
     api_token: Arc<str>,
     skill_workspace: Arc<std::path::PathBuf>,
+    /// Broadcasts complete WhatsApp status snapshots to browser SSE clients.
+    whatsapp_events: tokio::sync::broadcast::Sender<Value>,
 }
 
 const WA_SEEN_LIMIT: usize = 10_000;
@@ -224,6 +226,7 @@ async fn web_main() -> anyhow::Result<()> {
         upload_lock: Arc::new(Mutex::new(())),
         api_token: Arc::from(api_token),
         skill_workspace: Arc::new(launch_dir),
+        whatsapp_events: tokio::sync::broadcast::channel(16).0,
     };
     trace_startup("application state ready");
 
@@ -235,6 +238,27 @@ async fn web_main() -> anyhow::Result<()> {
                 Err(err) => warn!("WhatsApp bridge failed to start: {err}"),
             }
         }
+    }
+
+    // Poll the local bridge and publish only meaningful status changes. This
+    // lives in WebTool because the TUI and WebTool are separate processes.
+    {
+        let monitor_state = state.clone();
+        tokio::spawn(async move {
+            let mut previous = None::<Value>;
+            loop {
+                let cfg = monitor_state.config.read().await.clone();
+                let status = monitor_state
+                    .whatsapp
+                    .status(&cfg, &monitor_state.paths)
+                    .await;
+                if previous.as_ref() != Some(&status) {
+                    let _ = monitor_state.whatsapp_events.send(status.clone());
+                    previous = Some(status);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            }
+        });
     }
 
     let shutdown_state = state.clone();
@@ -294,9 +318,11 @@ async fn web_main() -> anyhow::Result<()> {
         .route("/api/chat/stream/{cid}/{mid}", get(api_stream))
         .route("/api/log", post(api_log))
         .route("/api/whatsapp/status", get(api_whatsapp_status))
+        .route("/api/whatsapp/events", get(api_whatsapp_events))
         .route("/api/whatsapp/start", post(api_whatsapp_start))
         .route("/api/whatsapp/stop", post(api_whatsapp_stop))
         .route("/api/whatsapp/qr", get(api_whatsapp_qr))
+        .route("/api/whatsapp/qr/refresh", post(api_whatsapp_qr_refresh))
         .route("/api/whatsapp/inbound", post(api_whatsapp_inbound))
         .layer(DefaultBodyLimit::max(51 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
@@ -1224,6 +1250,24 @@ async fn api_whatsapp_status(State(state): State<AppState>) -> Json<Value> {
     Json(state.whatsapp.status(&cfg, &state.paths).await)
 }
 
+async fn api_whatsapp_events(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let mut receiver = state.whatsapp_events.subscribe();
+    let cfg = state.config.read().await.clone();
+    let initial = state.whatsapp.status(&cfg, &state.paths).await;
+    Sse::new(stream! {
+        yield Ok(Event::default().data(initial.to_string()));
+        loop {
+            match receiver.recv().await {
+                Ok(status) => yield Ok(Event::default().data(status.to_string())),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
 async fn api_whatsapp_start(State(state): State<AppState>) -> Result<Response, AppError> {
     let cfg = state.config.read().await.clone();
     match state.whatsapp.start(&cfg, &state.paths, false).await {
@@ -1256,6 +1300,26 @@ async fn api_whatsapp_qr(State(state): State<AppState>) -> Result<Response, AppE
         svg,
     )
         .into_response())
+}
+
+async fn api_whatsapp_qr_refresh(State(state): State<AppState>) -> Result<Response, AppError> {
+    let cfg = state.config.read().await.clone();
+    match state.whatsapp.restart_for_pairing(&cfg, &state.paths).await {
+        Ok(message) => Ok(Json(json!({
+            "ok": true,
+            "message": message,
+            "qr_regenerating": true
+        }))
+        .into_response()),
+        Err(error) => Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "error": error.to_string()
+            })),
+        )
+            .into_response()),
+    }
 }
 
 async fn api_whatsapp_inbound(
@@ -1304,6 +1368,15 @@ async fn api_whatsapp_inbound(
         .trim()
         .to_string();
     let extra = whatsapp_extra(&payload, chat_jid);
+
+    // Handle quick commands from WhatsApp
+    if content.starts_with('/') {
+        let reply = handle_whatsapp_command(&state, &cid, &content).await;
+        if let Some(reply_text) = reply {
+            send_whatsapp_message(&cfg, chat_jid, &reply_text).await;
+            return Ok(Json(json!({"ok": true, "command_handled": true})));
+        }
+    }
 
     // Any attachment kind the bridge forwards — images go through OCR, every
     // other type through the document text extractors.
@@ -1635,6 +1708,110 @@ fn spawn_memory_refresh(state: AppState, chat: crate::storage::Chat, model: Stri
             warn!("Memory refresh failed for {}: {err}", chat.id);
         }
     });
+}
+
+/// Handle quick commands from WhatsApp
+async fn handle_whatsapp_command(state: &AppState, chat_id: &str, command: &str) -> Option<String> {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    let cmd = parts.first()?;
+
+    match *cmd {
+        "/remember" => {
+            let fact = parts.get(1..)?.join(" ");
+            if fact.is_empty() {
+                return Some("Usage: /remember <fact to remember>".to_string());
+            }
+
+            let new_fact = crate::memory_engine::NewFact {
+                text: fact.clone(),
+                category: crate::memory::MemoryCategory::UserPreference,
+                confidence: 0.9,
+                importance: 0.8,
+                source_chat_id: chat_id.to_string(),
+                source_channel: "whatsapp".to_string(),
+                sources: vec!["whatsapp_command".to_string()],
+            };
+
+            match state
+                .memory
+                .apply_ops(&[crate::memory_engine::MemOp::Add(new_fact)])
+            {
+                Ok((_, changed)) => {
+                    if let Some(id) = changed.first() {
+                        Some(format!("✓ Remembered: {} (ID: {})", fact, id))
+                    } else {
+                        Some(format!("✓ Remembered: {}", fact))
+                    }
+                }
+                Err(e) => Some(format!("✗ Failed to remember: {}", e)),
+            }
+        }
+
+        "/forget" => {
+            let Some(id) = parts.get(1) else {
+                return Some("Usage: /forget <memory id>".to_string());
+            };
+            match state.memory.forget(id) {
+                Ok(true) => Some(format!("✓ Forgot: {}", id)),
+                Ok(false) => Some(format!("✗ Memory not found: {}", id)),
+                Err(e) => Some(format!("✗ Failed to forget: {}", e)),
+            }
+        }
+
+        "/memories" => match state.memory.list_facts(50, false) {
+            Ok(facts) => {
+                if facts.is_empty() {
+                    return Some("No memories stored.".to_string());
+                }
+                let mut reply = String::from("📝 Stored memories:\n\n");
+                for (i, fact) in facts.iter().take(10).enumerate() {
+                    reply.push_str(&format!("{}. {} ({})\n", i + 1, fact.text, fact.id));
+                }
+                if facts.len() > 10 {
+                    reply.push_str(&format!("\n... and {} more", facts.len() - 10));
+                }
+                Some(reply)
+            }
+            Err(e) => Some(format!("✗ Failed to list memories: {}", e)),
+        },
+
+        "/status" => {
+            let cfg = state.config.read().await;
+            let bridge_running = state.whatsapp.is_running().await;
+            let status_text = if bridge_running {
+                "🟢 Bridge running"
+            } else {
+                "🔴 Bridge stopped"
+            };
+            Some(format!(
+                "WhatsApp Status: {}\nAssistant: {}\nProvider: {}\nModel: {}",
+                status_text, cfg.whatsapp_assistant_name, cfg.provider_id, cfg.default_model
+            ))
+        }
+
+        "/restart" => {
+            let cfg = state.config.read().await.clone();
+            state.whatsapp.stop(&cfg).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            match state.whatsapp.start(&cfg, &state.paths, true).await {
+                Ok(msg) => Some(format!("🔄 Bridge restarted: {}", msg)),
+                Err(e) => Some(format!("✗ Restart failed: {}", e)),
+            }
+        }
+
+        "/help" => Some(
+            "🤖 Available commands:\n\n\
+                /remember <fact> - Store a fact in memory\n\
+                /forget <id> - Remove a memory\n\
+                /memories - List all memories\n\
+                /status - Show WhatsApp and AI status\n\
+                /restart - Restart the WhatsApp bridge\n\
+                /help - Show this help message"
+                .to_string(),
+        ),
+
+        _ => None, // Not a recognized command, let normal processing continue
+    }
 }
 
 #[cfg(test)]
