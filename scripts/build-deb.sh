@@ -136,7 +136,7 @@ install -m 0644 packaging/icons/gnomeai-rs-agent.svg \
 install -m 0644 packaging/icons/gnomeai-rs-webtool.svg \
     "$package_root/usr/share/icons/hicolor/scalable/apps/gnomeai-rs-webtool.svg"
 
-install -m 0644 LICENSE "$package_root/usr/share/doc/gnomeai-rs/LICENSE"
+install -m 0644 COPYING "$package_root/usr/share/doc/gnomeai-rs/LICENSE"
 install -m 0644 README.md "$package_root/usr/share/doc/gnomeai-rs/README.md"
 install -m 0644 SECURITY-AUDIT-REMEDIATION.md \
     "$package_root/usr/share/doc/gnomeai-rs/SECURITY-AUDIT-REMEDIATION.md"
