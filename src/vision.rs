@@ -78,7 +78,7 @@ pub fn is_image_intent(query: &str) -> bool {
 
 pub fn supports_images(model: &str, known_models: &[ModelInfo]) -> bool {
     let re = Regex::new(
-        r"(?i)(vision|vl|vila|llava|bakllava|minicpm|moondream|internvl|qwen.*(?:vl|vision)|pixtral|gemma[-_.: ]?3|gemma3|llama[-_.: ]?3\.2.*vision|mistral.*vision|ministral)",
+        r"(?i)(vision|omni|vl|vila|llava|bakllava|minicpm|moondream|internvl|qwen.*(?:vl|vision)|pixtral|gemma[-_.: ]?3|gemma3|llama[-_.: ]?3\.2.*vision|mistral.*vision|ministral)",
     )
     .unwrap();
     if re.is_match(model) {
@@ -323,5 +323,31 @@ async fn answer_from_ocr(
         }
         Ok(_) => "[Empty response]".into(),
         Err(_) => prompt,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_omni_models_as_image_capable() {
+        assert!(supports_images(
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            &[],
+        ));
+    }
+
+    #[test]
+    fn uses_provider_image_modality_metadata() {
+        let known_models = vec![ModelInfo {
+            id: "provider/model-with-an-uninformative-name".into(),
+            capabilities: vec!["text".into(), "image".into()],
+        }];
+        assert!(supports_images(
+            "provider/model-with-an-uninformative-name",
+            &known_models,
+        ));
+        assert!(!supports_images("provider/text-only-model", &[]));
     }
 }

@@ -777,7 +777,7 @@ fn parse_model_item(item: &Value) -> Option<ModelInfo> {
     if id.is_empty() {
         return None;
     }
-    let capabilities = obj
+    let mut capabilities = obj
         .get("capabilities")
         .and_then(Value::as_array)
         .map(|items| {
@@ -788,6 +788,21 @@ fn parse_model_item(item: &Value) -> Option<ModelInfo> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    for path in [
+        "/architecture/input_modalities",
+        "/input_modalities",
+        "/modalities",
+    ] {
+        let Some(modalities) = item.pointer(path).and_then(Value::as_array) else {
+            continue;
+        };
+        for modality in modalities.iter().filter_map(Value::as_str) {
+            let modality = modality.to_lowercase();
+            if !capabilities.contains(&modality) {
+                capabilities.push(modality);
+            }
+        }
+    }
     Some(ModelInfo { id, capabilities })
 }
 
@@ -970,6 +985,22 @@ mod tests {
         let line = r#"data: {"content":"lo"}"#;
         let tokens = stream_tokens_from_line(line).unwrap();
         assert_eq!(tokens, vec!["lo"]);
+    }
+
+    #[test]
+    fn parses_openrouter_input_modalities_as_capabilities() {
+        let models = parse_models(&json!({
+            "data": [{
+                "id": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+                "architecture": {
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["text"]
+                }
+            }]
+        }));
+
+        assert_eq!(models.len(), 1);
+        assert!(models[0].capabilities.iter().any(|item| item == "image"));
     }
 }
 
