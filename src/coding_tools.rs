@@ -2,11 +2,11 @@
 //! how to use them.
 //!
 //! Tool descriptions are prompt engineering, not documentation. The model
-//! learns the patch format from `ApplyPatchTool::spec()` and nowhere else, so
+//! learns the patch format from `ApplyPatchTool::definition()` and nowhere else, so
 //! that string is load-bearing — treat a change to it like a change to code.
 //!
-//! Every tool caps its output. An agent drowns in a 40 MB `cargo build` log
-//! long before it runs out of context for anything useful.
+//! Output sizing is centralised: the model sees a bounded head/tail preview and
+//! can retrieve the complete stored result with `read_tool_output`.
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -15,13 +15,14 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{FilePatch, Registry, Tool, ToolOutcome};
 use crate::apply_patch;
 use crate::config::AppConfig;
 use crate::firecrawl::{firecrawl_fetch, firecrawl_search};
+use crate::privilege::{PrivilegeBroker, command_requests_privilege};
 use crate::provider::ToolSpec;
 use crate::sandbox::{SandboxMode, SandboxPolicy, spawn_sandboxed_with_cancel};
 use crate::skills;
+use crate::tooling::{FilePatch, Registry, Tool, ToolDefinition, ToolOutcome, ToolOutputStore};
 
 const MAX_TOOL_OUTPUT: usize = 16 * 1024;
 const MAX_READ_LINES: usize = 800;
@@ -55,6 +56,10 @@ pub fn build_system_prompt(root: &Path) -> String {
          is isolated; `normal` has ordinary OS access after approval; and\n\
          `full-access` has ordinary OS access without approval. Never claim a\n\
          command is sandboxed unless the active mode actually says so.\n\
+         Root access is separate from full-access. Use the `sudo` tool for a\n\
+         command that genuinely needs root; never put `sudo` inside `shell`.\n\
+         The interface collects authentication locally and the model never\n\
+         receives or sees the password.\n\
          In `read-only`, `web_search` and `web_fetch` are the only\n\
          network-capable tools; they work only while the user-visible Web\n\
          Search switch is enabled.\n",
@@ -109,7 +114,7 @@ pub struct ShellTool {
 
 #[async_trait::async_trait]
 impl Tool for ShellTool {
-    fn spec(&self) -> ToolSpec {
+    fn definition(&self) -> ToolDefinition {
         let access = match self.policy.mode {
             SandboxMode::ReadOnly | SandboxMode::IsolatedWorkspaceWrite => {
                 "The command is isolated: no network and no writes outside approved scratch paths."
@@ -121,7 +126,7 @@ impl Tool for ShellTool {
                 "The command has unrestricted user-level OS, filesystem and network access without approval."
             }
         };
-        ToolSpec {
+        ToolDefinition::user_process(ToolSpec {
             name: "shell".into(),
             description: format!(
                 "Run a shell command with the current workspace as its initial directory. \
@@ -142,7 +147,7 @@ impl Tool for ShellTool {
                 },
                 "required": ["command"]
             }),
-        }
+        })
     }
 
     async fn call(&self, args: Value, cancel: &CancellationToken) -> Result<ToolOutcome> {
@@ -154,6 +159,11 @@ impl Tool for ShellTool {
                 patches: vec![],
             });
         };
+        if command_requests_privilege(command) {
+            return Ok(failed_outcome(
+                "sudo is blocked inside `shell`; call the dedicated `sudo` tool so the local interface can authenticate without exposing the password",
+            ));
+        }
 
         let mut policy = self.policy.clone();
         if let Some(t) = args["timeout_ms"].as_u64() {
@@ -190,7 +200,7 @@ impl Tool for ShellTool {
 
         let code = out.exit_code.unwrap_or(-1);
         Ok(ToolOutcome {
-            content: format!("exit {code}\n\n{}", cap(&body, MAX_TOOL_OUTPUT)),
+            content: format!("exit {code}\n\n{body}"),
             ok: code == 0 && !out.timed_out && !out.cancelled,
             // Conservative: assume any command may have written something, so
             // verification runs. Cheaper than missing a `sed -i`.
@@ -215,8 +225,8 @@ pub struct ApplyPatchTool {
 
 #[async_trait::async_trait]
 impl Tool for ApplyPatchTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::workspace_write(ToolSpec {
             name: "apply_patch".into(),
             // This description IS the format specification. The model has no
             // other source for it.
@@ -248,7 +258,7 @@ impl Tool for ApplyPatchTool {
                 },
                 "required": ["patch"]
             }),
-        }
+        })
     }
 
     async fn call(&self, args: Value, _cancel: &CancellationToken) -> Result<ToolOutcome> {
@@ -326,8 +336,8 @@ pub struct ReadFileTool {
 
 #[async_trait::async_trait]
 impl Tool for ReadFileTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::workspace_read(ToolSpec {
             name: "read_file".into(),
             description: "Read a file from the workspace. Returns numbered lines. \
                  Use offset and limit for large files rather than reading everything."
@@ -341,11 +351,7 @@ impl Tool for ReadFileTool {
                 },
                 "required": ["path"]
             }),
-        }
-    }
-
-    fn read_only(&self) -> bool {
-        true
+        })
     }
 
     async fn call(&self, args: Value, _cancel: &CancellationToken) -> Result<ToolOutcome> {
@@ -421,8 +427,8 @@ pub struct SearchTool {
 
 #[async_trait::async_trait]
 impl Tool for SearchTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::workspace_read(ToolSpec {
             name: "search".into(),
             description: "Regex search across the workspace, respecting .gitignore. \
                  This is how you find code — prefer it over guessing at file paths."
@@ -435,11 +441,7 @@ impl Tool for SearchTool {
                 },
                 "required": ["pattern"]
             }),
-        }
-    }
-
-    fn read_only(&self) -> bool {
-        true
+        })
     }
 
     async fn call(&self, args: Value, _cancel: &CancellationToken) -> Result<ToolOutcome> {
@@ -541,8 +543,8 @@ pub struct ListFilesTool {
 
 #[async_trait::async_trait]
 impl Tool for ListFilesTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::workspace_read(ToolSpec {
             name: "list_files".into(),
             description: "List files and directories in the workspace while respecting \
                           .gitignore. Use this before guessing repository structure."
@@ -560,11 +562,7 @@ impl Tool for ListFilesTool {
                     }
                 }
             }),
-        }
-    }
-
-    fn read_only(&self) -> bool {
-        true
+        })
     }
 
     async fn call(&self, args: Value, _cancel: &CancellationToken) -> Result<ToolOutcome> {
@@ -634,8 +632,8 @@ pub struct WebSearchTool {
 
 #[async_trait::async_trait]
 impl Tool for WebSearchTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::network_read(ToolSpec {
             name: "web_search".into(),
             description: "Search the public web through Firecrawl. Use it for current, \
                           unstable, or externally sourced information."
@@ -650,11 +648,7 @@ impl Tool for WebSearchTool {
                 },
                 "required": ["query"]
             }),
-        }
-    }
-
-    fn read_only(&self) -> bool {
-        true
+        })
     }
 
     async fn call(&self, args: Value, cancel: &CancellationToken) -> Result<ToolOutcome> {
@@ -688,8 +682,8 @@ pub struct WebFetchTool {
 
 #[async_trait::async_trait]
 impl Tool for WebFetchTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::network_read(ToolSpec {
             name: "web_fetch".into(),
             description: "Fetch and extract one public webpage through Firecrawl.".into(),
             parameters: json!({
@@ -702,11 +696,7 @@ impl Tool for WebFetchTool {
                 },
                 "required": ["url"]
             }),
-        }
-    }
-
-    fn read_only(&self) -> bool {
-        true
+        })
     }
 
     async fn call(&self, args: Value, cancel: &CancellationToken) -> Result<ToolOutcome> {
@@ -752,6 +742,145 @@ fn cancelled_outcome() -> ToolOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// sudo / stored output
+// ---------------------------------------------------------------------------
+
+pub struct SudoTool {
+    pub policy: SandboxPolicy,
+    pub broker: Arc<PrivilegeBroker>,
+}
+
+#[async_trait::async_trait]
+impl Tool for SudoTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::privileged(ToolSpec {
+            name: "sudo".into(),
+            description: "Run one command as root after an explicit approval and local masked authentication. The password is handled only by the interface and is never visible to the model. Pass the command without a sudo prefix. Disabled in read-only mode.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Command to run as root, without a sudo prefix."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Optional. Defaults to 120000 and is capped at 600000."
+                    }
+                },
+                "required": ["command"]
+            }),
+        })
+    }
+
+    async fn call(&self, args: Value, cancel: &CancellationToken) -> Result<ToolOutcome> {
+        if matches!(
+            self.policy.mode,
+            SandboxMode::ReadOnly | SandboxMode::IsolatedWorkspaceWrite
+        ) {
+            return Ok(failed_outcome(
+                "sudo is disabled by the active isolated/read-only execution mode",
+            ));
+        }
+        let command = args["command"].as_str().unwrap_or_default().trim();
+        if command.is_empty() {
+            return Ok(failed_outcome("missing `command`"));
+        }
+        if command.contains('\0') {
+            return Ok(failed_outcome("command contains a NUL byte"));
+        }
+        if command_requests_privilege(command) {
+            return Ok(failed_outcome(
+                "pass the root command without a nested sudo prefix",
+            ));
+        }
+
+        self.broker.ensure_authenticated(command, cancel).await?;
+        let mut policy = self.policy.clone();
+        policy.allow_privilege_escalation = true;
+        if let Some(timeout_ms) = args["timeout_ms"].as_u64() {
+            policy.timeout_ms = timeout_ms.clamp(1_000, 600_000);
+        }
+        let output = spawn_sandboxed_with_cancel(
+            &policy,
+            "sudo",
+            &[
+                "-n".into(),
+                "--".into(),
+                "/bin/sh".into(),
+                "-c".into(),
+                command.into(),
+            ],
+            cancel,
+        )
+        .await?;
+
+        let mut body = String::new();
+        if !output.stdout.is_empty() {
+            body.push_str(&output.stdout);
+        }
+        if !output.stderr.is_empty() {
+            body.push_str("\n--- stderr ---\n");
+            body.push_str(&output.stderr);
+        }
+        if output.timed_out {
+            body.push_str("\n[command timed out]");
+        }
+        if output.cancelled {
+            body.push_str("\n[command interrupted]");
+        }
+        if body.trim().is_empty() {
+            body = "(no output)".into();
+        }
+        let code = output.exit_code.unwrap_or(-1);
+        Ok(ToolOutcome {
+            content: format!("exit {code}\n\n{body}"),
+            ok: code == 0 && !output.timed_out && !output.cancelled,
+            touched: vec![policy.cwd],
+            patches: vec![],
+        })
+    }
+}
+
+pub struct ReadToolOutputTool {
+    pub store: Arc<ToolOutputStore>,
+}
+
+#[async_trait::async_trait]
+impl Tool for ReadToolOutputTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::workspace_read(ToolSpec {
+            name: "read_tool_output".into(),
+            description: "Read a line range from a complete tool result that was stored outside the conversation. Use the opaque handle shown in the truncated preview.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "handle": { "type": "string" },
+                    "offset": { "type": "integer", "description": "First line, 1-based." },
+                    "limit": { "type": "integer", "description": "Maximum lines, from 1 to 800." }
+                },
+                "required": ["handle"]
+            }),
+        })
+    }
+
+    async fn call(&self, args: Value, _cancel: &CancellationToken) -> Result<ToolOutcome> {
+        let handle = args["handle"].as_str().unwrap_or_default();
+        let offset = args["offset"].as_u64().unwrap_or(1) as usize;
+        let limit = args["limit"].as_u64().unwrap_or(400) as usize;
+        match self.store.read(handle, offset, limit) {
+            Ok(content) => Ok(ToolOutcome {
+                content,
+                ok: true,
+                touched: vec![],
+                patches: vec![],
+            }),
+            Err(error) => Ok(failed_outcome(&error.to_string())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Agent Skills
 // ---------------------------------------------------------------------------
 
@@ -761,8 +890,8 @@ pub struct ActivateSkillTool {
 
 #[async_trait::async_trait]
 impl Tool for ActivateSkillTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::workspace_read(ToolSpec {
             name: "activate_skill".into(),
             description: "Load the complete SKILL.md instructions for one installed skill. \
                           Use this only when the startup skill catalog clearly matches the \
@@ -778,11 +907,7 @@ impl Tool for ActivateSkillTool {
                 },
                 "required": ["name"]
             }),
-        }
-    }
-
-    fn read_only(&self) -> bool {
-        true
+        })
     }
 
     async fn call(&self, args: Value, _cancel: &CancellationToken) -> Result<ToolOutcome> {
@@ -807,8 +932,8 @@ pub struct ReadSkillResourceTool {
 
 #[async_trait::async_trait]
 impl Tool for ReadSkillResourceTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::workspace_read(ToolSpec {
             name: "read_skill_resource".into(),
             description: "Read one text resource inside an installed skill after activating \
                           that skill. Traversal, symlinks, binary files and oversized resources \
@@ -825,11 +950,7 @@ impl Tool for ReadSkillResourceTool {
                 },
                 "required": ["skill", "path"]
             }),
-        }
-    }
-
-    fn read_only(&self) -> bool {
-        true
+        })
     }
 
     async fn call(&self, args: Value, _cancel: &CancellationToken) -> Result<ToolOutcome> {
@@ -860,6 +981,8 @@ pub fn register_all(
     root: &Path,
     policy: SandboxPolicy,
     config: Arc<RwLock<AppConfig>>,
+    output_store: Arc<ToolOutputStore>,
+    privilege_broker: Arc<PrivilegeBroker>,
 ) {
     registry.register(Arc::new(ListFilesTool {
         root: root.to_path_buf(),
@@ -874,7 +997,16 @@ pub fn register_all(
         root: root.to_path_buf(),
         writable: policy.mode != SandboxMode::ReadOnly,
     }));
-    registry.register(Arc::new(ShellTool { policy }));
+    registry.register(Arc::new(ShellTool {
+        policy: policy.clone(),
+    }));
+    registry.register(Arc::new(SudoTool {
+        policy,
+        broker: privilege_broker,
+    }));
+    registry.register(Arc::new(ReadToolOutputTool {
+        store: output_store,
+    }));
     registry.register(Arc::new(ActivateSkillTool {
         workspace: root.to_path_buf(),
     }));

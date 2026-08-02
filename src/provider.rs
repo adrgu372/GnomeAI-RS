@@ -18,7 +18,7 @@
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use futures_util::stream::{BoxStream, StreamExt};
+use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -241,6 +241,9 @@ pub struct OpenAiCompatible {
     /// Current OpenAI reasoning models use `max_completion_tokens`; most
     /// compatibility providers still implement `max_tokens`.
     pub use_max_completion_tokens: bool,
+    /// OpenRouter alone may recover a depleted paid balance by retrying with
+    /// the best currently ranked free models.
+    pub openrouter_credit_fallback: bool,
 }
 
 impl OpenAiCompatible {
@@ -261,6 +264,7 @@ impl OpenAiCompatible {
             api_key,
             send_tool_choice: false,
             use_max_completion_tokens: false,
+            openrouter_credit_fallback: false,
         }
     }
 
@@ -300,6 +304,14 @@ impl OpenAiCompatible {
         }
 
         body
+    }
+
+    async fn send_request(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
+        let mut request = self.client.post(url).json(body);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        request.send().await.context("request failed")
     }
 }
 
@@ -349,12 +361,7 @@ impl Provider for OpenAiCompatible {
     async fn stream(&self, req: Request) -> Result<BoxStream<'static, Result<Delta>>> {
         let url = format!("{}/chat/completions", self.base_url);
         let mut body = self.body(&req);
-        let mut builder = self.client.post(&url).json(&body);
-        if let Some(key) = &self.api_key {
-            builder = builder.bearer_auth(key);
-        }
-
-        let mut resp = builder.send().await.context("request failed")?;
+        let mut resp = self.send_request(&url, &body).await?;
         // A few otherwise-compatible servers reject the optional usage
         // extension. Retry once without it instead of making every preset
         // carry a brittle compatibility flag.
@@ -364,17 +371,41 @@ impl Provider for OpenAiCompatible {
             if error_body.contains("stream_options") {
                 body.as_object_mut()
                     .map(|object| object.remove("stream_options"));
-                let mut retry = self.client.post(&url).json(&body);
-                if let Some(key) = &self.api_key {
-                    retry = retry.bearer_auth(key);
-                }
-                resp = retry.send().await.context("provider retry failed")?;
+                resp = self
+                    .send_request(&url, &body)
+                    .await
+                    .context("provider retry failed")?;
             } else {
                 bail!(
                     "provider returned {status}: {}",
                     error_body.chars().take(500).collect::<String>()
                 );
             }
+        }
+
+        let mut free_fallback = None;
+        if self.openrouter_credit_fallback && crate::openrouter::is_credit_exhausted(resp.status())
+        {
+            // Consume the paid request's error body before reusing the pooled
+            // connection, then discover a fresh quality-ranked free list.
+            let _ = resp.bytes().await;
+            let models = crate::openrouter::ranked_free_models(
+                &self.client,
+                self.api_key.as_deref(),
+                !req.tools.is_empty(),
+                request_has_images(&req),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "OpenRouter free-model discovery failed; using free router");
+                crate::openrouter::free_router_only()
+            });
+            free_fallback = models.first().cloned();
+            crate::openrouter::apply_free_model_fallback(&mut body, &models);
+            resp = self
+                .send_request(&url, &body)
+                .await
+                .context("OpenRouter free fallback request failed")?;
         }
         if !resp.status().is_success() {
             let status = resp.status();
@@ -385,8 +416,27 @@ impl Provider for OpenAiCompatible {
             );
         }
 
-        Ok(Box::pin(parse_sse(resp)))
+        let response_stream = parse_sse(resp);
+        if let Some(model) = free_fallback {
+            let notice = stream::once(async move {
+                Ok(Delta::Reasoning(format!(
+                    "OpenRouter credits exhausted — using ranked free fallback (first candidate: {model})"
+                )))
+            });
+            Ok(Box::pin(notice.chain(response_stream)))
+        } else {
+            Ok(Box::pin(response_stream))
+        }
     }
+}
+
+fn request_has_images(req: &Request) -> bool {
+    req.messages.iter().any(|message| {
+        matches!(
+            message,
+            Message::User { content } if openai_user_content(content).is_some()
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------

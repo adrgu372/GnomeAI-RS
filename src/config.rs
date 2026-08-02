@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -26,12 +27,20 @@ pub struct AppConfig {
     pub max_chunk_size: usize,
     pub default_model: String,
     pub llama_api_key: String,
+    /// Provider-scoped API keys. `llama_api_key` remains the active key for
+    /// backwards compatibility, while this map lets switching providers keep
+    /// every previously saved credential.
+    pub provider_api_keys: BTreeMap<String, String>,
     pub llama_base_url: String,
     pub llama_api_mode: String,
     pub llama_timeout: u64,
     pub llama_max_tokens: u32,
     pub tool_loop_max_steps: u32,
     pub agent_max_depth: u32,
+    /// Maximum number of local/remote subagents that may execute at once.
+    /// This keeps proactive delegation useful without exhausting a local
+    /// model server or creating an unbounded number of background workers.
+    pub agent_max_concurrent: u32,
     pub remote_agent_api_url: String,
     pub remote_agent_api_key: String,
     pub history_window: usize,
@@ -74,6 +83,9 @@ pub struct AppConfig {
     pub memory_dream_max_seconds: u64,
     pub host: String,
     pub port: u16,
+    /// Shared execution policy for WebTool and WhatsApp tool calls.
+    /// Root access is never implied; the dedicated Sudo tool always asks.
+    pub web_sandbox_mode: String,
     pub whatsapp_enabled: bool,
     pub whatsapp_bridge_port: u16,
     pub whatsapp_assistant_name: String,
@@ -102,12 +114,14 @@ impl Default for AppConfig {
             max_chunk_size: 3_500,
             default_model: "gemma-3n-E4B-it-Q4_K_M".into(),
             llama_api_key: String::new(),
+            provider_api_keys: BTreeMap::new(),
             llama_base_url: "http://127.0.0.1:8090/v1".into(),
             llama_api_mode: "chat".into(),
             llama_timeout: 120,
             llama_max_tokens: 4_096,
             tool_loop_max_steps: 6,
             agent_max_depth: 3,
+            agent_max_concurrent: 4,
             remote_agent_api_url: String::new(),
             remote_agent_api_key: String::new(),
             history_window: 5,
@@ -135,6 +149,7 @@ impl Default for AppConfig {
             memory_dream_max_seconds: 120,
             host: "127.0.0.1".into(),
             port: 8787,
+            web_sandbox_mode: "normal".into(),
             whatsapp_enabled: false,
             whatsapp_bridge_port: 8788,
             whatsapp_assistant_name: "Gnome AI".into(),
@@ -151,9 +166,9 @@ impl AppConfig {
             return Ok(Self::default());
         }
 
-        let raw = fs::read_to_string(path)
+        let contents = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let mut cfg: Self = serde_json::from_str(&raw).unwrap_or_default();
+        let mut cfg: Self = serde_json::from_str(&contents).unwrap_or_default();
         cfg.normalize();
         Ok(cfg)
     }
@@ -165,14 +180,14 @@ impl AppConfig {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
         let temporary = parent.join(format!(".config-{}.tmp", uuid::Uuid::new_v4().simple()));
-        let raw = serde_json::to_vec_pretty(self)?;
+        let encoded = serde_json::to_vec_pretty(self)?;
         let result = (|| -> anyhow::Result<()> {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(&temporary)?;
-            file.write_all(&raw)?;
+            file.write_all(&encoded)?;
             file.write_all(b"\n")?;
             file.sync_all()?;
             fs::rename(&temporary, path)
@@ -196,6 +211,25 @@ impl AppConfig {
         if self.provider_id.is_empty() {
             self.provider_id = "custom".into();
         }
+        let mut provider_api_keys = std::mem::take(&mut self.provider_api_keys)
+            .into_iter()
+            .filter_map(|(provider_id, api_key)| {
+                let provider_id = provider_id.trim().to_lowercase();
+                let api_key = api_key.trim().to_string();
+                (!provider_id.is_empty() && !api_key.is_empty()).then_some((provider_id, api_key))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let has_scoped_keys = !provider_api_keys.is_empty();
+        let legacy_active_key = self.llama_api_key.trim().to_string();
+        if !has_scoped_keys && !legacy_active_key.is_empty() {
+            provider_api_keys.insert(self.provider_id.clone(), legacy_active_key);
+        }
+        self.provider_api_keys = provider_api_keys;
+        self.llama_api_key = self
+            .provider_api_keys
+            .get(&self.provider_id)
+            .cloned()
+            .unwrap_or_default();
         self.provider_protocol = self.provider_protocol.trim().to_lowercase();
         if !matches!(
             self.provider_protocol.as_str(),
@@ -204,6 +238,9 @@ impl AppConfig {
             self.provider_protocol = "openai".into();
         }
         self.firecrawl_api_url = self.firecrawl_api_url.trim().trim_end_matches('/').into();
+        self.tool_loop_max_steps = self.tool_loop_max_steps.clamp(1, 64);
+        self.agent_max_depth = self.agent_max_depth.clamp(1, 8);
+        self.agent_max_concurrent = self.agent_max_concurrent.clamp(1, 16);
         self.memory_max_facts_in_prompt = self.memory_max_facts_in_prompt.clamp(1, 20);
         if self.memory_max_age_days > 0 {
             self.memory_max_age_days = self.memory_max_age_days.clamp(1, 3_650);
@@ -244,6 +281,13 @@ impl AppConfig {
         self.memory_dream_max_facts = self.memory_dream_max_facts.clamp(20, 5000);
         self.memory_dream_max_llm_calls = self.memory_dream_max_llm_calls.min(20);
         self.memory_dream_max_seconds = self.memory_dream_max_seconds.clamp(10, 900);
+        self.web_sandbox_mode = self.web_sandbox_mode.trim().to_ascii_lowercase();
+        if !matches!(
+            self.web_sandbox_mode.as_str(),
+            "read-only" | "normal" | "full-access"
+        ) {
+            self.web_sandbox_mode = "normal".into();
+        }
         self.whatsapp_assistant_name = compact_ws(&self.whatsapp_assistant_name);
         self.whatsapp_allowed_jids = self
             .whatsapp_allowed_jids
@@ -253,6 +297,41 @@ impl AppConfig {
             .collect();
     }
 
+    pub fn provider_api_key(&self, provider_id: &str) -> Option<&str> {
+        self.provider_api_keys
+            .get(&provider_id.trim().to_lowercase())
+            .map(String::as_str)
+            .filter(|key| !key.is_empty())
+    }
+
+    /// Prefer a newly supplied key, otherwise reuse the credential remembered
+    /// for this provider. The legacy active key is a final migration fallback.
+    pub fn resolve_provider_api_key(
+        &self,
+        provider_id: &str,
+        supplied: Option<String>,
+    ) -> Option<String> {
+        supplied
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+            .or_else(|| self.provider_api_key(provider_id).map(str::to_string))
+            .or_else(|| {
+                (self.provider_id == provider_id && !self.llama_api_key.trim().is_empty())
+                    .then(|| self.llama_api_key.trim().to_string())
+            })
+    }
+
+    pub fn remember_provider_api_key(&mut self, provider_id: &str, api_key: Option<&str>) {
+        let provider_id = provider_id.trim().to_lowercase();
+        let api_key = api_key.map(str::trim).filter(|key| !key.is_empty());
+        if !provider_id.is_empty() {
+            if let Some(api_key) = api_key {
+                self.provider_api_keys
+                    .insert(provider_id, api_key.to_string());
+            }
+        }
+    }
+
     pub fn merge_patch(&mut self, patch: &Value) {
         let Some(obj) = patch.as_object() else {
             return;
@@ -260,7 +339,11 @@ impl AppConfig {
         let mut value = serde_json::to_value(self.clone()).unwrap_or(Value::Object(Map::new()));
         if let Some(current) = value.as_object_mut() {
             for (key, new_value) in obj {
-                if current.contains_key(key) {
+                // Provider credentials are changed only through the dedicated
+                // provider endpoint, never through a generic JSON merge.
+                if !matches!(key.as_str(), "provider_api_keys" | "llama_api_key")
+                    && current.contains_key(key)
+                {
                     current.insert(key.clone(), new_value.clone());
                 }
             }
@@ -296,5 +379,63 @@ mod tests {
         config.merge_patch(&json!({"default_model": "new-model"}));
         assert_eq!(config.default_model, "new-model");
         assert_eq!(config.web_api_token, "runtime-secret");
+    }
+
+    #[test]
+    fn provider_keys_survive_switches_and_legacy_config_is_migrated() {
+        let mut config = AppConfig::default();
+        config.provider_id = "openai".into();
+        config.llama_api_key = "sk-openai".into();
+        config.normalize();
+        assert_eq!(config.provider_api_key("openai"), Some("sk-openai"));
+
+        config.remember_provider_api_key("anthropic", Some("sk-anthropic"));
+        config.provider_id = "anthropic".into();
+        config.llama_api_key = config.provider_api_key("anthropic").unwrap().to_string();
+        assert_eq!(config.llama_api_key, "sk-anthropic");
+        assert_eq!(
+            config.resolve_provider_api_key("openai", None),
+            Some("sk-openai".into())
+        );
+
+        config.merge_patch(&json!({"provider_api_keys": {"openai": "stolen"}}));
+        assert_eq!(config.provider_api_key("openai"), Some("sk-openai"));
+    }
+
+    #[test]
+    fn provider_keys_round_trip_in_owner_only_config() {
+        let root = std::env::temp_dir().join(format!(
+            "gnomef-provider-keys-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path = root.join("config.json");
+        let mut config = AppConfig::default();
+        config.provider_id = "anthropic".into();
+        config.remember_provider_api_key("openai", Some("sk-openai"));
+        config.remember_provider_api_key("anthropic", Some("sk-anthropic"));
+        config.llama_api_key = "sk-anthropic".into();
+        config.save(&path).unwrap();
+
+        let loaded = AppConfig::load(&path).unwrap();
+        assert_eq!(loaded.provider_api_key("openai"), Some("sk-openai"));
+        assert_eq!(loaded.provider_api_key("anthropic"), Some("sk-anthropic"));
+        assert_eq!(loaded.llama_api_key, "sk-anthropic");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_web_sandbox_mode_is_normalized() {
+        let mut config = AppConfig::default();
+        config.web_sandbox_mode = " FULL-ACCESS ".into();
+        config.normalize();
+        assert_eq!(config.web_sandbox_mode, "full-access");
+
+        config.web_sandbox_mode = "unknown".into();
+        config.normalize();
+        assert_eq!(config.web_sandbox_mode, "normal");
     }
 }

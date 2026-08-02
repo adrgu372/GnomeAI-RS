@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
+use zeroize::Zeroize;
 
 /// A serialisable secret that is always redacted from diagnostics.
 #[derive(Clone, Serialize, Deserialize)]
@@ -35,6 +36,12 @@ impl SecretString {
 impl fmt::Debug for SecretString {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("[REDACTED]")
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -69,6 +76,14 @@ pub enum Op {
     Approve {
         call_id: String,
         decision: Decision,
+    },
+
+    /// Answer a local sudo credential prompt. The credential is transported
+    /// only on the in-process channel and its memory is zeroed on drop.
+    ProvidePrivilegeCredential {
+        request_id: String,
+        credential: Option<SecretString>,
+        remember: bool,
     },
 
     /// Force context compaction now instead of waiting for the budget.
@@ -231,6 +246,9 @@ pub enum Event {
         /// Recently used workspaces, newest first, for the `/workspace` picker.
         #[serde(default)]
         recent_workspaces: Vec<String>,
+        /// Available models for the current provider, for the model picker.
+        #[serde(default)]
+        models: Vec<String>,
     },
 
     SessionReset,
@@ -248,6 +266,9 @@ pub enum Event {
     ProviderChanged {
         provider: String,
         model: String,
+        /// Available models for the new provider.
+        #[serde(default)]
+        models: Vec<String>,
     },
 
     WebSearchChanged {
@@ -297,6 +318,18 @@ pub enum Event {
         cwd: PathBuf,
         /// Why approval is needed: outside the sandbox, network access, etc.
         reason: String,
+        /// Privileged commands deliberately disable session-wide approval.
+        allow_always: bool,
+    },
+
+    /// The core needs a sudo credential. Interfaces must render this as a
+    /// masked local input and must never add its value to the transcript.
+    PrivilegeCredentialRequest {
+        request_id: String,
+        command: String,
+        keyring_available: bool,
+        attempt: u8,
+        message: Option<String>,
     },
 
     PatchApplied {
@@ -350,5 +383,29 @@ mod tests {
         let debug = format!("{op:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("sk-not-for-logs"));
+    }
+
+    #[test]
+    fn provider_changed_serializes_the_live_model_list() {
+        let event = Event::ProviderChanged {
+            provider: "DeepSeek".into(),
+            model: "deepseek-v4-pro".into(),
+            models: vec!["deepseek-v4-pro".into(), "deepseek-v4-flash".into()],
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["event"], "provider_changed");
+        assert_eq!(value["models"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn privilege_secrets_are_redacted_from_debug_output() {
+        let op = Op::ProvidePrivilegeCredential {
+            request_id: "request".into(),
+            credential: Some(SecretString::new("root-secret")),
+            remember: true,
+        };
+        let debug = format!("{op:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("root-secret"));
     }
 }

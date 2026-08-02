@@ -94,6 +94,14 @@
       border: 1px solid var(--line); border-radius: 10px; background: #0d1219;
       font-size: 13px;
     }
+    .workspace-pill { width: 100%; text-align: left; margin: 0; }
+    .sandbox-badge {
+      padding: 5px 9px; color: var(--muted); white-space: nowrap;
+      border: 1px solid var(--line); border-radius: 999px; background: #0d141d;
+      font-size: 11px; cursor: pointer;
+    }
+    .sandbox-badge[data-mode="full-access"] { color: var(--red); border-color: #5b3038; }
+    .sandbox-badge[data-mode="read-only"] { color: var(--green); border-color: #315640; }
 
     /* ---------- main ---------- */
     .main { min-width: 0; display: grid; grid-template-rows: 58px minmax(0, 1fr) auto; }
@@ -241,11 +249,11 @@
     .form-grid { display: grid; gap: 13px; }
     .field { display: grid; gap: 6px; }
     .field label { color: var(--muted); font-size: 13px; }
-    .field input, .field select {
+    .field input, .field select, .field textarea {
       width: 100%; padding: 10px 11px; color: var(--text);
       border: 1px solid var(--line); border-radius: 10px; outline: none; background: #0b1017;
     }
-    .field input:focus, .field select:focus { border-color: #4b8190; }
+    .field input:focus, .field select:focus, .field textarea:focus { border-color: #4b8190; }
     .field small { color: #6f7c8f; }
     .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 18px; }
     .ghost { padding: 9px 13px; }
@@ -256,6 +264,34 @@
     .wa-row { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
     .wa-qr { display: grid; place-items: center; margin-top: 8px; }
     .wa-qr img { width: 220px; height: 220px; border-radius: 10px; background: #fff; padding: 8px; }
+    .folder-list, .recent-workspaces {
+      display: grid; gap: 5px; max-height: 300px; overflow: auto;
+      margin-top: 10px; padding: 6px; border: 1px solid var(--line); border-radius: 11px;
+      background: #0b1017;
+    }
+    .folder-row {
+      width: 100%; padding: 8px 10px; overflow: hidden; color: var(--muted);
+      text-align: left; text-overflow: ellipsis; white-space: nowrap;
+      border: 1px solid transparent; border-radius: 8px; background: transparent; cursor: pointer;
+    }
+    .folder-row:hover, .folder-row.selected { color: var(--text); border-color: #34465f; background: #151d28; }
+    .approval-command {
+      max-height: 220px; overflow: auto; padding: 11px; white-space: pre-wrap; overflow-wrap: anywhere;
+      color: #d8e2ef; border: 1px solid #3d4b60; border-radius: 10px; background: #0a0f16;
+      font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .danger-note { color: var(--red); }
+    .agent-list { display: grid; gap: 9px; max-height: min(62vh, 640px); overflow: auto; }
+    .agent-card { padding: 11px; border: 1px solid var(--line); border-radius: 12px; background: #0b1017; }
+    .agent-card-head { display: flex; align-items: start; justify-content: space-between; gap: 10px; }
+    .agent-card-title { min-width: 0; }
+    .agent-card-title strong, .agent-card-title small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .agent-card-title small { color: var(--muted); }
+    .agent-status { padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 11px; }
+    .agent-status[data-status="running"], .agent-status[data-status="in_progress"], .agent-status[data-status="pending"] { color: var(--orange); border-color: #65502e; }
+    .agent-status[data-status="completed"] { color: var(--green); border-color: #315640; }
+    .agent-status[data-status="failed"] { color: var(--red); border-color: #5b3038; }
+    .agent-output { max-height: 160px; margin: 9px 0 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #aeb9c9; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
     /* toast */
     #toast {
@@ -292,6 +328,8 @@
       <button class="new-chat" id="newChat">＋ Conversație nouă</button>
       <div class="chat-list" id="chatList"></div>
       <div class="side-footer">
+        <button class="provider-pill workspace-pill" id="workspacePill" title="Schimbă folderul de lucru">Folder: —</button>
+        <button class="new-chat" id="agentsButton">🤖 Subagenți</button>
         <div class="provider-pill" id="providerPill">Provider: —</div>
         <button class="new-chat" id="settingsButton">⚙ Provider și setări</button>
       </div>
@@ -307,6 +345,7 @@
           </div>
         </div>
         <div class="actions">
+          <button class="sandbox-badge" id="sandboxBadge" data-mode="normal" title="Politica de execuție comună WebTool + WhatsApp">normal</button>
           <label class="switch-wrap" title="Activează sau dezactivează Web Search">
             <span class="switch-label">Web Search</span>
             <input id="webSearchTop" type="checkbox">
@@ -364,6 +403,15 @@
         <input id="webSearchSettings" type="checkbox">
         <span class="switch"></span>
       </label>
+      <div class="field">
+        <label for="sandboxMode">Execuția tool-urilor în WebTool și WhatsApp</label>
+        <select id="sandboxMode">
+          <option value="read-only">read-only — fără scrieri, Bash sau sudo</option>
+          <option value="normal">normal — confirmă scrierile și comenzile</option>
+          <option value="full-access">full-access — fără confirmări standard</option>
+        </select>
+        <small>Sudo cere confirmare și parolă locală în toate modurile în care este permis.</small>
+      </div>
       <label class="switch-wrap">
         <span>Memorie între conversații</span>
         <input id="memoryEnabled" type="checkbox">
@@ -423,6 +471,102 @@
     </form>
   </dialog>
 
+  <dialog id="workspaceDialog">
+    <div class="dialog-head">
+      <div><h2>Folder de lucru</h2><small style="color:var(--muted)">Comun pentru WebTool, WhatsApp, skill-uri și toate tool-urile</small></div>
+      <button class="icon-button" id="closeWorkspace" aria-label="Închide">✕</button>
+    </div>
+    <div class="field">
+      <label for="workspacePath">Cale</label>
+      <div class="wa-row">
+        <button type="button" class="ghost" id="workspaceUp">↑ Sus</button>
+        <input id="workspacePath" style="flex:1" autocomplete="off" spellcheck="false">
+        <button type="button" class="ghost" id="workspaceGo">Deschide</button>
+      </div>
+    </div>
+    <div class="folder-list" id="workspaceFolders"></div>
+    <div class="section-title">Recente</div>
+    <div class="recent-workspaces" id="recentWorkspaces"></div>
+    <div class="status" id="workspaceStatus"></div>
+    <div class="dialog-actions">
+      <button type="button" class="ghost" id="cancelWorkspace">Renunță</button>
+      <button type="button" class="primary" id="selectWorkspace">Folosește folderul</button>
+    </div>
+  </dialog>
+
+  <dialog id="agentsDialog">
+    <div class="dialog-head">
+      <div><h2>Subagenți</h2><small id="agentsSummary" style="color:var(--muted)">Registru comun WebTool + WhatsApp</small></div>
+      <button class="icon-button" id="closeAgents" aria-label="Închide">✕</button>
+    </div>
+    <p style="color:var(--muted);margin-top:0">Agentul principal poate împărți sarcina în contexte izolate și poate executa în paralel subagenți Explore, Plan sau general-purpose.</p>
+    <details style="margin-bottom:12px">
+      <summary style="cursor:pointer;color:var(--cyan)">Pornește manual un subagent pe providerul ales</summary>
+      <div class="form-grid" style="margin-top:10px">
+        <div class="field">
+          <label for="agentDescription">Nume scurt</label>
+          <input id="agentDescription" maxlength="100" placeholder="Ex.: Analizează backend-ul">
+        </div>
+        <div class="field">
+          <label for="agentPrompt">Sarcină completă</label>
+          <textarea id="agentPrompt" rows="4" placeholder="Include toate detaliile de care are nevoie; subagentul pornește cu un context separat."></textarea>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px">
+          <div class="field">
+            <label for="agentType">Tip</label>
+            <select id="agentType">
+              <option value="general-purpose">general-purpose</option>
+              <option value="Explore">Explore (read-only)</option>
+              <option value="Plan">Plan (read-only)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="agentProvider">Provider</label>
+            <select id="agentProvider"></select>
+          </div>
+          <div class="field">
+            <label for="agentModel">Model</label>
+            <input id="agentModel" list="agentModelSuggestions" placeholder="inherit">
+            <datalist id="agentModelSuggestions"></datalist>
+          </div>
+        </div>
+        <div class="wa-row">
+          <button type="button" class="primary" id="launchAgent">Pornește subagentul</button>
+          <small id="agentLaunchStatus" style="color:var(--muted)"></small>
+        </div>
+      </div>
+    </details>
+    <div class="agent-list" id="agentList"></div>
+    <div class="dialog-actions">
+      <button type="button" class="ghost" id="refreshAgents">Reîmprospătează</button>
+      <button type="button" class="primary" id="doneAgents">Închide</button>
+    </div>
+  </dialog>
+
+  <dialog id="approvalDialog">
+    <div class="dialog-head">
+      <div><h2 id="approvalTitle">Confirmare necesară</h2><small id="approvalSource" style="color:var(--muted)"></small></div>
+    </div>
+    <p id="approvalReason"></p>
+    <div class="approval-command" id="approvalCommand"></div>
+    <p><small id="approvalWorkspace" style="color:var(--muted)"></small></p>
+    <div class="field" id="sudoCredentialField" hidden>
+      <label for="sudoCredential">Parola sudo</label>
+      <input id="sudoCredential" type="password" autocomplete="current-password">
+      <label class="switch-wrap" id="sudoRememberWrap">
+        <span>Salvează în keyring-ul desktop</span>
+        <input id="sudoRemember" type="checkbox">
+        <span class="switch"></span>
+      </label>
+      <small>Parola merge direct la sudo; backend-ul o păstrează într-un tip zeroizing și nu o trimite modelului sau istoricului.</small>
+    </div>
+    <div class="status danger-note" id="approvalMessage"></div>
+    <div class="dialog-actions">
+      <button type="button" class="ghost" id="denyApproval">Refuză</button>
+      <button type="button" class="primary" id="allowApproval">Permite o dată</button>
+    </div>
+  </dialog>
+
   <script>
     "use strict";
     const apiToken = String(window.__GNOMEF_TOKEN__ || "");
@@ -436,8 +580,15 @@
       stream: null,
       whatsappStream: null,
       questionTimer: null,
+      approvalTimer: null,
       renderedQuestionId: null,
+      renderedApprovalId: null,
+      workspace: null,
+      browsePath: null,
       uploadsInFlight: 0,
+      modelRefreshId: 0,
+      agents: [],
+      agentTimer: null,
     };
 
     /* ------------------------------------------------------------------ */
@@ -993,6 +1144,340 @@
     }
 
     /* ------------------------------------------------------------------ */
+    /* shared tool approvals (WebTool + WhatsApp)                          */
+    /* ------------------------------------------------------------------ */
+
+    function startApprovalPolling() {
+      clearInterval(state.approvalTimer);
+      state.approvalTimer = setInterval(pollPendingApproval, 1000);
+      pollPendingApproval();
+    }
+
+    async function pollPendingApproval() {
+      try {
+        const data = await api("/api/approvals/pending");
+        if (data.pending && data.request) renderApproval(data.request);
+      } catch { /* transient */ }
+    }
+
+    function renderApproval(request) {
+      if (state.renderedApprovalId === request.id) return;
+      state.renderedApprovalId = request.id;
+      const credential = request.kind === "sudo_credential";
+      $("#approvalTitle").textContent = credential ? "Autentificare sudo" : `Confirmă ${request.tool || "tool-ul"}`;
+      $("#approvalSource").textContent = request.source === "whatsapp"
+        ? "Cerere pornită din WhatsApp"
+        : "Cerere pornită din WebTool";
+      $("#approvalReason").textContent = credential
+        ? "Introdu parola local. Modelul nu o poate vedea."
+        : (request.reason || "Tool-ul are nevoie de aprobarea ta.");
+      $("#approvalCommand").textContent = request.command || "";
+      $("#approvalWorkspace").textContent = request.workspace ? `Folder: ${request.workspace}` : "";
+      $("#approvalMessage").textContent = request.message || "";
+      $("#sudoCredentialField").hidden = !credential;
+      $("#sudoRememberWrap").hidden = !request.keyringAvailable;
+      $("#sudoRemember").checked = false;
+      $("#sudoCredential").value = "";
+      $("#allowApproval").textContent = credential ? "Autentifică" : "Permite o dată";
+      const dialog = $("#approvalDialog");
+      if (!dialog.open) dialog.showModal();
+      if (credential) setTimeout(() => $("#sudoCredential").focus(), 0);
+    }
+
+    async function answerApproval(allowed) {
+      const id = state.renderedApprovalId;
+      if (!id) return;
+      const credentialMode = !$("#sudoCredentialField").hidden;
+      const secret = $("#sudoCredential").value;
+      if (allowed && credentialMode && !secret) {
+        $("#approvalMessage").textContent = "Introdu parola sudo.";
+        return;
+      }
+      try {
+        await api(`/api/approvals/${encodeURIComponent(id)}/answer`, {
+          method: "POST",
+          body: JSON.stringify({
+            decision: allowed ? (credentialMode ? "submit" : "allow") : "deny",
+            credential: allowed && credentialMode ? secret : null,
+            remember: allowed && credentialMode && $("#sudoRemember").checked,
+          }),
+        });
+      } catch (error) {
+        toast(error.message);
+        return;
+      } finally {
+        $("#sudoCredential").value = "";
+      }
+      state.renderedApprovalId = null;
+      if ($("#approvalDialog").open) $("#approvalDialog").close();
+      pollPendingApproval();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Claude Code-style subagents                                        */
+    /* ------------------------------------------------------------------ */
+
+    function agentIsRunning(status) {
+      return ["pending", "in_progress", "running", "awaiting_input"].includes(status);
+    }
+
+    function populateAgentProviders() {
+      const select = $("#agentProvider");
+      const previous = select.value || "inherit";
+      select.innerHTML = "";
+      const inherit = document.createElement("option");
+      inherit.value = "inherit";
+      inherit.textContent = `inherit — ${state.current?.provider_id || "provider curent"}`;
+      select.append(inherit);
+      for (const provider of state.providers.filter((item) => item.web_supported)) {
+        const option = document.createElement("option");
+        option.value = provider.id;
+        option.textContent = provider.name;
+        select.append(option);
+      }
+      select.value = [...select.options].some((option) => option.value === previous)
+        ? previous
+        : "inherit";
+    }
+
+    async function refreshAgentModels(reset = false) {
+      const providerId = $("#agentProvider").value || "inherit";
+      const provider = state.providers.find((item) => item.id === providerId);
+      if (reset) {
+        $("#agentModel").value = provider?.default_model || state.current?.model || "inherit";
+      }
+      try {
+        const models = providerId === "inherit"
+          ? await api("/api/models")
+          : await api("/api/models", {
+              method: "POST",
+              body: JSON.stringify({ provider_id: providerId }),
+            });
+        $("#agentModelSuggestions").innerHTML = "";
+        for (const model of models || []) {
+          const option = document.createElement("option");
+          option.value = model;
+          $("#agentModelSuggestions").append(option);
+        }
+      } catch {
+        $("#agentModelSuggestions").innerHTML = "";
+      }
+    }
+
+    async function launchManualAgent() {
+      const prompt = $("#agentPrompt").value.trim();
+      if (!prompt) return toast("Scrie sarcina subagentului.");
+      const status = $("#agentLaunchStatus");
+      status.style.color = "var(--muted)";
+      status.textContent = "Pornesc…";
+      try {
+        const result = await api("/api/agents", {
+          method: "POST",
+          body: JSON.stringify({
+            scope: state.activeChat || "manual",
+            description: $("#agentDescription").value.trim() || prompt.replace(/\s+/g, " ").slice(0, 80),
+            prompt,
+            subagent_type: $("#agentType").value,
+            provider_id: $("#agentProvider").value || "inherit",
+            model: $("#agentModel").value.trim() || "inherit",
+          }),
+        });
+        status.textContent = `Pornit: ${result.agentId}`;
+        $("#agentDescription").value = "";
+        $("#agentPrompt").value = "";
+        await refreshAgents();
+      } catch (error) {
+        status.textContent = error.message;
+        status.style.color = "var(--red)";
+      }
+    }
+
+    async function refreshAgents() {
+      try {
+        const data = await api("/api/agents");
+        state.agents = data.agents || [];
+        $("#agentsSummary").textContent =
+          `${data.running || 0} activi · ${data.total || 0} total · registru comun WebTool + WhatsApp`;
+        const list = $("#agentList");
+        list.innerHTML = "";
+        for (const agent of state.agents) {
+          const card = document.createElement("article");
+          card.className = "agent-card";
+          const head = document.createElement("div");
+          head.className = "agent-card-head";
+          const title = document.createElement("div");
+          title.className = "agent-card-title";
+          const subject = document.createElement("strong");
+          subject.textContent = agent.subject || "Subagent";
+          const meta = document.createElement("small");
+          const profile = agent.agentType || agent.metadata?.agent_type || "general-purpose";
+          const provider = agent.metadata?.provider_id || "inherit";
+          const parent = agent.metadata?.parent_agent_id
+            ? ` · părinte ${agent.metadata.parent_agent_id}`
+            : " · agent principal";
+          meta.textContent = `${agent.id} · ${profile} · ${provider}/${agent.model || "inherit"} · ${agent.metadata?.source || "webtool"}${parent}`;
+          title.append(subject, meta);
+          const status = document.createElement("span");
+          status.className = "agent-status";
+          status.dataset.status = agent.status || "unknown";
+          status.textContent = agent.status || "unknown";
+          head.append(title, status);
+          card.append(head);
+
+          const output = document.createElement("pre");
+          output.className = "agent-output";
+          output.textContent = agent.outputPreview?.trim() || "Fără output încă.";
+          card.append(output);
+
+          const actions = document.createElement("div");
+          actions.className = "wa-row";
+          actions.style.marginTop = "8px";
+          const details = document.createElement("button");
+          details.type = "button";
+          details.className = "ghost";
+          details.textContent = "Detalii";
+          details.onclick = async () => {
+            try {
+              const data = await api(`/api/agents/${encodeURIComponent(agent.id)}`);
+              output.textContent = data.agent?.output?.trim() || "Fără output încă.";
+              output.style.maxHeight = "360px";
+            } catch (error) { toast(error.message); }
+          };
+          actions.append(details);
+          if (agentIsRunning(agent.status)) {
+            const stop = document.createElement("button");
+            stop.type = "button";
+            stop.className = "ghost";
+            stop.textContent = "Oprește";
+            stop.onclick = async () => {
+              try {
+                await api(`/api/tasks/${encodeURIComponent(agent.id)}/stop`, {
+                  method: "POST",
+                  body: JSON.stringify({ scope: agent.scope || "default" }),
+                });
+                await refreshAgents();
+              } catch (error) { toast(error.message); }
+            };
+            actions.append(stop);
+          }
+          card.append(actions);
+          list.append(card);
+        }
+        if (!list.children.length) {
+          list.textContent = "Nu există încă subagenți. Agentul principal îi va porni automat pentru sarcini complexe.";
+        }
+      } catch (error) {
+        $("#agentList").textContent = `Eroare: ${error.message}`;
+      }
+    }
+
+    async function openAgents() {
+      $("#agentsDialog").showModal();
+      populateAgentProviders();
+      await refreshAgentModels(false);
+      await refreshAgents();
+      clearInterval(state.agentTimer);
+      state.agentTimer = setInterval(refreshAgents, 2000);
+    }
+
+    function closeAgents() {
+      clearInterval(state.agentTimer);
+      state.agentTimer = null;
+      if ($("#agentsDialog").open) $("#agentsDialog").close();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* shared workspace                                                    */
+    /* ------------------------------------------------------------------ */
+
+    function workspaceName(path) {
+      if (!path) return "—";
+      const clean = String(path).replace(/\/+$/, "");
+      return clean.split("/").pop() || "/";
+    }
+
+    async function loadWorkspace() {
+      state.workspace = await api("/api/workspace");
+      const pill = $("#workspacePill");
+      pill.textContent = `Folder: ${workspaceName(state.workspace.current)}`;
+      pill.title = state.workspace.current || "Schimbă folderul de lucru";
+      pill.disabled = !state.workspace.browse_enabled;
+      renderRecentWorkspaces();
+    }
+
+    function renderRecentWorkspaces() {
+      const list = $("#recentWorkspaces");
+      list.innerHTML = "";
+      for (const path of state.workspace?.recent || []) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "folder-row";
+        button.textContent = path;
+        button.title = path;
+        button.onclick = () => browseWorkspace(path);
+        list.append(button);
+      }
+      if (!list.children.length) list.textContent = "Nu există foldere recente.";
+    }
+
+    async function browseWorkspace(path) {
+      const status = $("#workspaceStatus");
+      status.textContent = "Se încarcă…";
+      status.className = "status";
+      try {
+        const data = await api(`/api/workspace/browse?path=${encodeURIComponent(path || "")}`);
+        state.browsePath = data.path;
+        $("#workspacePath").value = data.path;
+        $("#workspaceUp").disabled = !data.parent;
+        $("#workspaceUp").dataset.parent = data.parent || "";
+        const list = $("#workspaceFolders");
+        list.innerHTML = "";
+        for (const folder of data.directories || []) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "folder-row";
+          button.textContent = `📁 ${folder.name}`;
+          button.title = folder.path;
+          button.onclick = () => browseWorkspace(folder.path);
+          list.append(button);
+        }
+        if (!list.children.length) list.textContent = "Folderul nu conține subfoldere vizibile.";
+        status.textContent = `${(data.directories || []).length} subfoldere`;
+      } catch (error) {
+        status.textContent = error.message;
+        status.className = "status error";
+      }
+    }
+
+    async function openWorkspaceDialog() {
+      await loadWorkspace();
+      if (!state.workspace?.browse_enabled) {
+        toast("Selectorul de folder este disponibil numai local.");
+        return;
+      }
+      $("#workspaceStatus").className = "status";
+      $("#workspaceDialog").showModal();
+      await browseWorkspace(state.workspace.current);
+    }
+
+    async function selectWorkspace() {
+      const path = $("#workspacePath").value.trim() || state.browsePath;
+      try {
+        await api("/api/workspace", {
+          method: "POST",
+          body: JSON.stringify({ path }),
+        });
+        await loadWorkspace();
+        await refreshSkills();
+        $("#workspaceDialog").close();
+        toast(`Folder activ: ${state.workspace.current}`);
+      } catch (error) {
+        $("#workspaceStatus").textContent = error.message;
+        $("#workspaceStatus").className = "status error";
+      }
+    }
+
+    /* ------------------------------------------------------------------ */
     /* uploads: picker, drag & drop, paste                                 */
     /* ------------------------------------------------------------------ */
 
@@ -1093,6 +1578,7 @@
       setWebSwitches(Boolean(state.current.web_search_enabled));
       $("#memoryEnabled").checked = Boolean(state.current.memory_enabled);
       $("#memoryAge").value = String(state.current.memory_max_age_days ?? 90);
+      $("#sandboxMode").value = state.current.sandbox_mode || "normal";
       if (![...$("#memoryAge").options].some((option) => option.value === $("#memoryAge").value)) {
         const option = document.createElement("option");
         option.value = String(state.current.memory_max_age_days);
@@ -1115,11 +1601,14 @@
       $("#providerDescription").textContent = provider.description;
       $("#baseUrlField").hidden = provider.id !== "custom";
       $("#apiKeyField").hidden = provider.auth === "account";
-      if (provider.id !== "custom") $("#baseUrl").value = provider.base_url;
+      if (provider.id !== "custom" || resetModel) $("#baseUrl").value = provider.base_url;
       if (resetModel) $("#model").value = provider.default_model;
+      $("#apiKey").placeholder = provider.has_api_key
+        ? "Cheie salvată pentru acest provider — lasă gol pentru a o păstra"
+        : "Introdu cheia API";
       $("#keyHint").textContent = provider.auth === "optional_api_key"
-        ? "Cheia este opțională pentru endpointurile locale."
-        : "Cheia nu este trimisă înapoi către browser după salvare.";
+        ? "Cheia este opțională și se păstrează separat pentru acest endpoint."
+        : "Fiecare provider își păstrează cheia; valorile nu sunt trimise înapoi către browser.";
     }
 
     function refreshHeader() {
@@ -1129,6 +1618,9 @@
         : `${state.current?.memory_max_age_days ?? 90}z`;
       $("#providerPill").textContent = `Provider: ${provider?.name || state.current?.provider_id || "—"}`;
       $("#modelTitle").textContent = state.current?.model || "GnomeAI-RS";
+      const sandboxMode = state.current?.sandbox_mode || "normal";
+      $("#sandboxBadge").textContent = sandboxMode;
+      $("#sandboxBadge").dataset.mode = sandboxMode;
       $("#connectionState").textContent = provider
         ? `${provider.name} · ${state.current.web_search_enabled ? "Web ON" : "Web OFF"} · ${state.current.memory_enabled ? `Memorie ${memoryAge}` : "Memorie OFF"}`
         : "WebTool local";
@@ -1164,6 +1656,11 @@
       event.preventDefault();
       const provider = selectedProvider();
       if (!provider) return;
+      if (
+        $("#sandboxMode").value === "full-access" &&
+        state.current?.sandbox_mode !== "full-access" &&
+        !window.confirm("full-access permite scrieri și comenzi fără confirmări standard. Sudo va cere în continuare aprobare. Continui?")
+      ) return;
       reportSettings("Se salvează…");
       try {
         await api("/api/provider", {
@@ -1176,10 +1673,12 @@
             web_search_enabled: $("#webSearchSettings").checked,
             memory_enabled: $("#memoryEnabled").checked,
             memory_max_age_days: Number($("#memoryAge").value),
+            sandbox_mode: $("#sandboxMode").value,
           }),
         });
         $("#apiKey").value = "";
         await loadProviders();
+        await refreshModels();
         reportSettings("Setările au fost salvate.");
         setTimeout(() => $("#settingsDialog").close(), 450);
       } catch (error) {
@@ -1187,16 +1686,32 @@
       }
     }
 
-    async function refreshModels() {
+    async function refreshModels(draft = false) {
+      const refreshId = ++state.modelRefreshId;
       try {
-        const models = await api("/api/models");
+        const provider = selectedProvider();
+        const models = draft && provider
+          ? await api("/api/models", {
+              method: "POST",
+              body: JSON.stringify({
+                provider_id: provider.id,
+                api_key: $("#apiKey").value.trim(),
+                base_url: $("#baseUrl").value.trim(),
+              }),
+            })
+          : await api("/api/models");
+        if (refreshId !== state.modelRefreshId) return;
         $("#modelSuggestions").innerHTML = "";
         for (const model of models || []) {
           const option = document.createElement("option");
           option.value = model;
           $("#modelSuggestions").append(option);
         }
-      } catch { /* offline provider */ }
+      } catch {
+        if (refreshId === state.modelRefreshId) {
+          $("#modelSuggestions").innerHTML = "";
+        }
+      }
     }
 
     async function refreshMemoryStats() {
@@ -1553,13 +2068,53 @@
     /* wiring                                                              */
     /* ------------------------------------------------------------------ */
 
-    $("#provider").addEventListener("change", () => updateProviderFields(true));
+    $("#provider").addEventListener("change", () => {
+      updateProviderFields(true);
+      refreshModels(true);
+    });
+    $("#apiKey").addEventListener("change", () => refreshModels(true));
+    $("#baseUrl").addEventListener("change", () => refreshModels(true));
     $("#providerForm").addEventListener("submit", saveProvider);
     $("#newChat").addEventListener("click", newChat);
     $("#settingsButton").addEventListener("click", openSettings);
+    $("#agentsButton").addEventListener("click", openAgents);
     $("#settingsTop").addEventListener("click", openSettings);
+    $("#sandboxBadge").addEventListener("click", openSettings);
+    $("#workspacePill").addEventListener("click", openWorkspaceDialog);
     $("#closeSettings").addEventListener("click", () => $("#settingsDialog").close());
     $("#cancelSettings").addEventListener("click", () => $("#settingsDialog").close());
+    $("#closeWorkspace").addEventListener("click", () => $("#workspaceDialog").close());
+    $("#cancelWorkspace").addEventListener("click", () => $("#workspaceDialog").close());
+    $("#closeAgents").addEventListener("click", closeAgents);
+    $("#doneAgents").addEventListener("click", closeAgents);
+    $("#refreshAgents").addEventListener("click", refreshAgents);
+    $("#launchAgent").addEventListener("click", launchManualAgent);
+    $("#agentProvider").addEventListener("change", () => refreshAgentModels(true));
+    $("#agentsDialog").addEventListener("cancel", (event) => {
+      event.preventDefault();
+      closeAgents();
+    });
+    $("#workspaceUp").addEventListener("click", (event) => browseWorkspace(event.currentTarget.dataset.parent));
+    $("#workspaceGo").addEventListener("click", () => browseWorkspace($("#workspacePath").value.trim()));
+    $("#workspacePath").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        browseWorkspace(event.currentTarget.value.trim());
+      }
+    });
+    $("#selectWorkspace").addEventListener("click", selectWorkspace);
+    $("#denyApproval").addEventListener("click", () => answerApproval(false));
+    $("#allowApproval").addEventListener("click", () => answerApproval(true));
+    $("#approvalDialog").addEventListener("cancel", (event) => {
+      event.preventDefault();
+      answerApproval(false);
+    });
+    $("#sudoCredential").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        answerApproval(true);
+      }
+    });
     $("#send").addEventListener("click", sendMessage);
     $("#attach").addEventListener("click", () => $("#fileInput").click());
     $("#fileInput").addEventListener("change", (event) => {
@@ -1601,8 +2156,10 @@
     (async () => {
       try {
         await loadProviders();
+        await loadWorkspace();
         await loadChats();
         startWhatsAppEvents();
+        startApprovalPolling();
         $("#connectionState").textContent = `${$("#connectionState").textContent} · conectat`;
         $("#prompt").focus();
       } catch (error) {

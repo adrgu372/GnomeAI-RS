@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use async_stream::try_stream;
@@ -25,6 +26,105 @@ pub struct ModelInfo {
     pub capabilities: Vec<String>,
 }
 
+/// Known models per provider, used when the provider has no public `/models`
+/// endpoint (Anthropic) or as a fallback when the endpoint is unreachable.
+pub fn known_models(provider_id: &str) -> Vec<ModelInfo> {
+    match provider_id {
+        "openai" => vec![
+            model("gpt-5.6-terra"),
+            model("gpt-5.4"),
+            model("gpt-5.3"),
+            model("gpt-4o"),
+            model("gpt-4o-mini"),
+        ],
+        "anthropic" => vec![
+            model("claude-sonnet-5"),
+            model("claude-opus-4-8"),
+            model("claude-opus-4-7"),
+            model("claude-haiku-3-5"),
+        ],
+        "deepseek" => vec![
+            model("deepseek-v4-pro"),
+            model("deepseek-v4"),
+            model("deepseek-v3"),
+            model("deepseek-r1"),
+        ],
+        "moonshot" => vec![model("kimi-k3"), model("kimi-k2.5")],
+        "qwen" => vec![
+            model("qwen-plus"),
+            model("qwen-max"),
+            model("qwen-turbo"),
+            model("qwen-coder-plus"),
+        ],
+        "xai" => vec![model("grok-4.5"), model("grok-4"), model("grok-3")],
+        "mistral" => vec![
+            model("mistral-medium-latest"),
+            model("mistral-small-latest"),
+            model("pixtral-large-latest"),
+            model("codestral-latest"),
+        ],
+        "gemini" => vec![
+            model("gemini-3.6-flash"),
+            model("gemini-3.6-pro"),
+            model("gemini-3.0-flash"),
+            model("gemini-3.0-pro"),
+        ],
+        "groq" => vec![
+            model("openai/gpt-oss-120b"),
+            model("meta-llama/llama-4.5-maverick"),
+            model("qwen-3.5"),
+        ],
+        "openrouter" => vec![model("openrouter/auto")],
+        "together" => vec![model("MiniMaxAI/MiniMax-M3")],
+        "fireworks" => vec![model("accounts/fireworks/models/deepseek-v3p1")],
+        "perplexity" => vec![model("sonar-pro"), model("sonar-deep-research")],
+        "cerebras" => vec![model("gpt-oss-120b"), model("llama-4.5-maverick")],
+        "nvidia" => vec![model("openai/gpt-oss-120b")],
+        "sambanova" => vec![model("DeepSeek-V3.1"), model("DeepSeek-R1")],
+        "cohere" => vec![model("command-a-03-2025"), model("command-r-plus")],
+        // Account-backed providers and custom — the caller supplies the
+        // default model from config when the list is empty.
+        "openai-account" | "anthropic-account" | "custom" | _ => Vec::new(),
+    }
+}
+
+/// Convert provider model metadata into a stable list for user interfaces.
+/// The active model is always present and shown first, even when an account
+/// provider cannot expose a model-list endpoint or the API omits it.
+pub fn model_ids(models: Vec<ModelInfo>, active_model: &str) -> Vec<String> {
+    let ids = models
+        .into_iter()
+        .map(|model| model.id.trim().to_string())
+        .collect::<Vec<_>>();
+    normalize_model_ids(ids, active_model)
+}
+
+pub fn normalize_model_ids(mut ids: Vec<String>, active_model: &str) -> Vec<String> {
+    ids = ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+
+    let active_model = active_model.trim();
+    if !active_model.is_empty() {
+        if let Some(index) = ids.iter().position(|id| id == active_model) {
+            ids.remove(index);
+        }
+        ids.insert(0, active_model.to_string());
+    }
+    ids
+}
+
+fn model(id: &str) -> ModelInfo {
+    ModelInfo {
+        id: id.to_string(),
+        capabilities: vec![],
+    }
+}
+
 pub type TokenStream = Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Send>>;
 
 impl LlamaClient {
@@ -42,39 +142,80 @@ impl LlamaClient {
 
     pub async fn list_models(&self, cfg: &AppConfig) -> anyhow::Result<Vec<ModelInfo>> {
         if cfg.provider_protocol == "anthropic" {
-            return Ok(Vec::new());
+            return Ok(known_models("anthropic"));
         }
         ensure_web_provider_supported(cfg)?;
-        let mut last_error = None;
         for url in candidate_model_urls(cfg) {
-            let result = self.http.get(&url).headers(headers(cfg)?).send().await;
+            let result = self
+                .http
+                .get(&url)
+                .headers(headers(cfg)?)
+                .timeout(Duration::from_secs(8))
+                .send()
+                .await;
             let response = match result {
                 Ok(response) => response,
-                Err(err) => {
-                    last_error = Some(err.into());
-                    continue;
-                }
+                Err(_) => continue,
             };
             if response.status().as_u16() == 404 {
                 continue;
             }
             if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                last_error = Some(anyhow!("{url} returned {status}: {body}"));
+                // Consume the response so the pooled connection can be reused.
+                let _ = response.bytes().await;
                 continue;
             }
-            let payload: Value = response.json().await?;
+            let payload: Value = match response.json().await {
+                Ok(payload) => payload,
+                Err(_) => continue,
+            };
             let models = parse_models(&payload);
             if !models.is_empty() {
                 return Ok(models);
             }
         }
-        if let Some(err) = last_error {
-            Err(err)
-        } else {
-            Ok(Vec::new())
+        Ok(known_models(&cfg.provider_id))
+    }
+
+    async fn retry_openrouter_free(
+        &self,
+        cfg: &AppConfig,
+        url: &str,
+        payload: &mut Value,
+        response: reqwest::Response,
+        needs_tools: bool,
+        needs_images: bool,
+    ) -> anyhow::Result<reqwest::Response> {
+        if cfg.provider_id != "openrouter"
+            || !crate::openrouter::is_credit_exhausted(response.status())
+        {
+            return Ok(response);
         }
+
+        let _ = response.bytes().await;
+        let models = crate::openrouter::ranked_free_models(
+            &self.http,
+            (!cfg.llama_api_key.trim().is_empty()).then_some(cfg.llama_api_key.as_str()),
+            needs_tools,
+            needs_images,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "OpenRouter free-model discovery failed; using free router");
+            crate::openrouter::free_router_only()
+        });
+        crate::openrouter::apply_free_model_fallback(payload, &models);
+        tracing::warn!(
+            first_candidate = %models.first().map(String::as_str).unwrap_or("openrouter/free"),
+            "OpenRouter credits exhausted; retrying with ranked free models"
+        );
+        self.http
+            .post(url)
+            .headers(headers(cfg)?)
+            .json(payload)
+            .send()
+            .await
+            .context("OpenRouter free fallback request failed")
     }
 
     pub async fn chat(
@@ -125,24 +266,25 @@ impl LlamaClient {
             }
             attempted = true;
 
-            let payload = if (is_completion || cfg.llama_api_mode == "completion") && !has_images {
-                json!({
-                    "prompt": prompt_from_messages(&messages),
-                    "temperature": temperature,
-                    "n_predict": cfg.llama_max_tokens,
-                    "cache_prompt": true,
-                    "stream": true,
-                })
-            } else {
-                let mut payload = json!({
-                    "model": model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "stream": true,
-                });
-                set_openai_token_limit(cfg, &mut payload);
-                payload
-            };
+            let mut payload =
+                if (is_completion || cfg.llama_api_mode == "completion") && !has_images {
+                    json!({
+                        "prompt": prompt_from_messages(&messages),
+                        "temperature": temperature,
+                        "n_predict": cfg.llama_max_tokens,
+                        "cache_prompt": true,
+                        "stream": true,
+                    })
+                } else {
+                    let mut payload = json!({
+                        "model": model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "stream": true,
+                    });
+                    set_openai_token_limit(cfg, &mut payload);
+                    payload
+                };
 
             let response = self
                 .http
@@ -156,6 +298,20 @@ impl LlamaClient {
                 Err(err) => {
                     last_error = Some(err.into());
                     continue;
+                }
+            };
+            let response = if is_completion {
+                response
+            } else {
+                match self
+                    .retry_openrouter_free(cfg, &url, &mut payload, response, false, has_images)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(err) => {
+                        last_error = Some(err);
+                        continue;
+                    }
                 }
             };
             if response.status().as_u16() == 404 {
@@ -209,7 +365,7 @@ impl LlamaClient {
             }
             attempted = true;
 
-            let payload = if (is_completion || cfg.llama_api_mode == "completion")
+            let mut payload = if (is_completion || cfg.llama_api_mode == "completion")
                 && !has_images
                 && !has_tools
             {
@@ -249,6 +405,21 @@ impl LlamaClient {
                 Err(err) => {
                     last_error = Some(err.into());
                     continue;
+                }
+            };
+
+            let response = if is_completion {
+                response
+            } else {
+                match self
+                    .retry_openrouter_free(cfg, &url, &mut payload, response, has_tools, has_images)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(err) => {
+                        last_error = Some(err);
+                        continue;
+                    }
                 }
             };
 
@@ -1001,6 +1172,18 @@ mod tests {
 
         assert_eq!(models.len(), 1);
         assert!(models[0].capabilities.iter().any(|item| item == "image"));
+    }
+
+    #[test]
+    fn model_ids_are_sorted_deduplicated_and_keep_the_active_model_first() {
+        let ids = model_ids(
+            vec![model("zeta"), model("alpha"), model("zeta"), model("  ")],
+            "current",
+        );
+        assert_eq!(ids, vec!["current", "alpha", "zeta"]);
+
+        let ids = model_ids(vec![model("zeta"), model("alpha")], "zeta");
+        assert_eq!(ids, vec!["zeta", "alpha"]);
     }
 }
 

@@ -4,8 +4,22 @@ Open-source personal AI agent in Rust: coding-agent TUI, self-hosted WebTool,
 optional WhatsApp assistant, multiple model providers, persistent memory,
 installable skills, and explicit execution permissions.
 
-Current release: **1.1.1**. See the release notes below for the complete
+Current release: **1.2.0**. See the release notes below for the complete
 list of changes.
+
+## Release Notes - 1.2.0
+
+Version **1.2.0** adds native Claude Code-style subagent orchestration with
+independent providers and models, shared WebTool and WhatsApp management,
+workspace selection, persistent provider-scoped API keys, OpenRouter free-model
+fallback, live model lists, and a secure native `sudo` execution path.
+
+The release also centralizes tool policy in a shared registry, bounds large
+tool outputs, unifies access modes across interfaces, and expands the terminal
+model picker and slash-command autosuggestions. See [CHANGELOG.md](CHANGELOG.md)
+for the detailed list.
+
+---
 
 ## Release Notes - 1.1.1
 
@@ -851,11 +865,13 @@ cargo run --bin gnomef-agent -- .
 ```
 
 Typing `/` opens an interactive command menu listing every command with what
-it does. `↑`/`↓` (or `Tab`/`Shift+Tab`) move through it, wrapping at both ends
-and scrolling when the list is longer than the popup; typing more characters
-narrows it; `Enter` picks the highlighted command and a second `Enter` runs it;
-`Esc` closes the menu. With the menu closed, `↑`/`↓` still walk the input
-history as before.
+it does. `↑`/`↓` (or `Tab`/`Shift+Tab` while the bare menu is open) move through
+it, wrapping at both ends and scrolling when the list is longer than the popup.
+Typing a command prefix narrows the menu and shows the selected completion as
+dim inline text; `Tab` or `Enter` accepts it without running the command, and a
+second `Enter` runs it. `/provider` and `/model` skip the generic inline
+suggestion because they open their dedicated searchable pickers. `Esc` closes
+the menu. With the menu closed, `↑`/`↓` still walk the input history as before.
 
 Useful TUI commands:
 
@@ -873,7 +889,8 @@ Useful TUI commands:
   workspaces and `/workspace N` picks one by number. The last workspace is
   remembered: starting `gnomef-rs` from your home directory reopens it.
 - `/provider` opens the provider and authentication picker.
-- `/model MODEL` switches the model for subsequent turns.
+- `/model` opens a searchable picker populated from the provider API;
+  `/model MODEL` switches directly to a manually supplied model.
 - `/websearch` toggles web search; `/websearch on|off` sets it explicitly.
 - `/sandbox read-only|normal|full-access` changes the execution policy.
 - `/skills` lists installed skills. `/skill use NAME` activates one for the
@@ -934,12 +951,24 @@ also asks for a base URL. The built-in catalog includes:
 - Cerebras, NVIDIA NIM, SambaNova, and Cohere
 - any custom or local OpenAI-compatible endpoint
 
-The selected provider and model take effect without restarting. `/model MODEL`
-can override the preset's current default.
+The selected provider and model take effect without restarting. Model lists are
+loaded live from compatible provider APIs and fall back to the maintained
+catalog when an endpoint is unavailable. `/model` opens the searchable list,
+while `/model MODEL` can override the preset's current default directly.
 
-API keys are kept out of transcripts and diagnostic output. They are stored in
-`store/providers.json` with owner-only (`0600`) permissions. Do not commit this
-runtime file.
+API keys are kept out of transcripts, browser responses, and diagnostic output.
+Each provider keeps its own saved key, so switching away and back does not ask
+for it again; entering a new value replaces only that provider's key. The
+credentials are stored in owner-only (`0600`) configuration files. Do not
+commit those runtime files.
+
+For OpenRouter only, an `HTTP 402` credit error triggers a live zero-cost
+fallback. GnomeAI queries OpenRouter's current model catalog, filters for the
+request's tool/image capabilities and zero input/output/request pricing, keeps
+OpenRouter's agentic/intelligence ranking, then retries with the candidates in
+quality order. `openrouter/free` is the final availability fallback. The paid
+model remains selected, so adding credits automatically restores normal use on
+the next request.
 
 ### OpenAI and Anthropic account login
 
@@ -979,6 +1008,21 @@ mutations. Strict internal jobs that process untrusted uploads or
 model-generated Python continue to use a separate fail-closed
 Landlock/seccomp sandbox regardless of this user-facing setting. Use
 `--session ID` to resume a session stored in `store/agent.db`.
+
+Root commands use a separate native `sudo` tool. Every proposed root command
+gets its own approval even in `full-access`; ordinary shell children run with
+Linux `no_new_privs`, so they cannot reuse a cached sudo ticket to bypass that
+approval. When authentication is needed, the TUI or local WebTool opens a masked dialog
+and writes the password directly to sudo's standard input. The password is
+never included in model context, arguments, environment variables, temporary
+files, or logs. With `libsecret-tools` installed, the user may explicitly save
+it in the desktop keyring; there is no plaintext file fallback.
+
+Native tool metadata now carries side effects, concurrency and approval policy
+together with each JSON schema. Large command results are saved in private
+owner-only files for seven days; the model receives a bounded head/tail preview
+and can request line ranges from the complete result through
+`read_tool_output`.
 
 ### Installable skills
 
@@ -1034,6 +1078,52 @@ lowest free number, so the list does not drift upwards after deletions.
 Settings also contains the shared skill manager and lets a validated skill be
 activated for the current conversation. Skill activation messages are stored
 as system context and never rendered as fake assistant replies.
+
+The sidebar folder selector changes the live coding workspace without moving
+private chats, uploads, credentials, or memory. The selection and recent-folder
+history use the same `store/workspaces.json` format as the terminal agent.
+Relative `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`, `Skill`, and delegated
+agent operations are rooted in that selected folder; path traversal and
+symlink escapes are rejected.
+
+WebTool and WhatsApp use the same execution mode from `web_sandbox_mode`:
+
+- `read-only` blocks file mutations, Bash, and sudo;
+- `normal` asks locally before every file write/edit or shell command;
+- `full-access` skips standard user-level confirmations, but never grants root.
+
+Root execution is exposed only by the dedicated `Sudo` tool. It asks once for
+the exact root command even in `full-access`, then requests a masked password
+only if the existing sudo ticket/keyring credential is unavailable. Generic
+Bash runs through the native helper with `no_new_privs`, so it cannot reuse a
+sudo ticket. Sudo and filesystem browsing are disabled when WebTool binds to a
+non-loopback address.
+
+### Subagents
+
+The WebTool/WhatsApp tool loop implements subagents natively in Rust, following
+the useful behavior of Claude Code without depending on its source:
+
+- the main agent delegates a complete prompt into a fresh, isolated context;
+- `Explore` and `Plan` are read-only profiles, while `general-purpose` may edit
+  and run approved commands;
+- several `Agent` calls returned in the same model round execute concurrently;
+- every subagent has a durable ID, parent ID, scope, provider/model, status,
+  output log, and stop handle;
+- nested delegation is bounded by `agent_max_depth`, and simultaneous workers
+  by `agent_max_concurrent`;
+- synchronous results return directly to the parent; background results remain
+  available through `TaskOutput` and the common registry;
+- stale running entries are marked interrupted after an application restart.
+
+Each individual subagent may use `provider_id: inherit` or another configured
+API provider plus its own model. Switching a subagent does not switch the main
+conversation: the runtime clones the configuration and reuses the API key
+already saved for that provider. In WebTool, open **Subagenți** to launch one
+manually with a selected type, provider, and model, inspect live output, or stop
+it. WhatsApp offers `/agents`, `/agent ID`, and `/stopagent ID` against the same
+registry. Account-backed Codex/Claude CLI providers remain terminal-only; the
+shared WebTool/WhatsApp loop accepts API providers.
 
 ### Supported attachments
 
@@ -1289,6 +1379,13 @@ Once connected, the assistant also accepts `/skills`,
 `/skill inspect NAME`, and `/skill use NAME`. Skills activated from WhatsApp
 are persisted as system context for that WhatsApp conversation and use the
 same memory and model-provider configuration as WebTool.
+
+WhatsApp turns run through the same workspace-aware native tool loop as
+WebTool. Provider, model, memory, skills, workspace, Web Search and sandbox
+mode are shared live. `/workspace`, `/sandbox`, and the expanded `/status`
+report that state. If a WhatsApp turn proposes a write, shell command, or sudo
+operation, its approval appears in the local WebTool and is labeled as a
+WhatsApp request; credentials never enter the WhatsApp transcript.
 
 ## Notes
 

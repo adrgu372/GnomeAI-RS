@@ -30,60 +30,13 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{Decision, Event};
-use crate::provider::{Delta, Message, Provider, Request, StopReason, ToolCall, ToolSpec};
+use crate::provider::{Delta, Message, Provider, Request, StopReason, ToolCall};
 use crate::sandbox::SandboxPolicy;
 use crate::store::Store;
+use crate::tooling::{
+    ApprovalRequirement, Registry, Tool, ToolConcurrency, ToolOutcome, ToolOutputStore,
+};
 use crate::verify;
-
-// ---------------------------------------------------------------------------
-// Tools
-// ---------------------------------------------------------------------------
-
-pub struct FilePatch {
-    /// Workspace-relative path.
-    pub path: PathBuf,
-    pub before: Option<String>,
-    pub after: Option<String>,
-    pub diff: String,
-}
-
-pub struct ToolOutcome {
-    /// What the model sees.
-    pub content: String,
-    pub ok: bool,
-    /// Files this call wrote, if any. Non-empty triggers verification.
-    pub touched: Vec<PathBuf>,
-    /// Reversible file changes, normally produced by `apply_patch`.
-    pub patches: Vec<FilePatch>,
-}
-
-#[async_trait::async_trait]
-pub trait Tool: Send + Sync {
-    fn spec(&self) -> ToolSpec;
-    /// False for anything that writes or executes. Drives both the concurrency
-    /// decision and the default approval policy.
-    fn read_only(&self) -> bool {
-        false
-    }
-    async fn call(&self, args: Value, cancel: &CancellationToken) -> Result<ToolOutcome>;
-}
-
-#[derive(Default)]
-pub struct Registry {
-    tools: Vec<Arc<dyn Tool>>,
-}
-
-impl Registry {
-    pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.push(tool);
-    }
-    pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.iter().map(|t| t.spec()).collect()
-    }
-    fn find(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.iter().find(|t| t.spec().name == name).cloned()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Approval
@@ -113,6 +66,7 @@ pub struct Agent {
     pub context_budget: i64,
     pub workspace: PathBuf,
     pub verify_policy: SandboxPolicy,
+    pub output_store: Arc<ToolOutputStore>,
 
     events: mpsc::Sender<Event>,
     /// Approvals arrive out of band from whichever interface is attached.
@@ -133,6 +87,7 @@ impl Agent {
         context_budget: i64,
         workspace: PathBuf,
         verify_policy: SandboxPolicy,
+        output_store: Arc<ToolOutputStore>,
         events: mpsc::Sender<Event>,
         approvals: mpsc::Receiver<(String, Decision)>,
     ) -> Self {
@@ -147,6 +102,7 @@ impl Agent {
             context_budget,
             workspace,
             verify_policy,
+            output_store,
             events,
             approvals: Arc::new(Mutex::new(approvals)),
             always_allow: Arc::new(Mutex::new(Vec::new())),
@@ -334,7 +290,7 @@ impl Agent {
         let (reads, writes): (Vec<_>, Vec<_>) = calls.iter().cloned().partition(|c| {
             self.registry
                 .find(&c.name)
-                .map(|t| t.read_only())
+                .map(|tool| tool.definition().concurrency == ToolConcurrency::Parallel)
                 .unwrap_or(false)
         });
 
@@ -389,12 +345,6 @@ impl Agent {
             })
             .await;
 
-        if !self.approved(&call, &tool, &summary).await? {
-            self.record_result(&call, turn_id, "denied by the user", false)
-                .await?;
-            return Ok(Vec::new());
-        }
-
         // A malformed argument object is feedback for the model, not a crash.
         let args: Value = match serde_json::from_str(&call.arguments) {
             Ok(v) => v,
@@ -404,6 +354,12 @@ impl Agent {
                 return Ok(Vec::new());
             }
         };
+
+        if !self.approved(&call, &tool, &summary).await? {
+            self.record_result(&call, turn_id, "denied by the user", false)
+                .await?;
+            return Ok(Vec::new());
+        }
 
         let started = Instant::now();
         let outcome = match tool.call(args, cancel).await {
@@ -453,23 +409,47 @@ impl Agent {
             })
             .await;
 
-        self.record_result(&call, turn_id, &outcome.content, outcome.ok)
+        let presented = self
+            .output_store
+            .present(&outcome.content)
+            .unwrap_or_else(|error| {
+                let preview: String = outcome.content.chars().take(32 * 1024).collect();
+                format!("{preview}\n\n[full tool output could not be stored securely: {error}]")
+            });
+        self.record_result(&call, turn_id, &presented, outcome.ok)
             .await?;
         Ok(outcome.touched)
     }
 
     async fn approved(&self, call: &ToolCall, tool: &Arc<dyn Tool>, summary: &str) -> Result<bool> {
-        if tool.read_only() || self.approval == ApprovalPolicy::Never {
+        let definition = tool.definition();
+        if definition.approval == ApprovalRequirement::None
+            || (definition.approval == ApprovalRequirement::Standard
+                && self.approval == ApprovalPolicy::Never)
+        {
             return Ok(true);
         }
-        if self.always_allow.lock().await.iter().any(|s| s == summary) {
+        if definition.approval == ApprovalRequirement::Standard
+            && self.always_allow.lock().await.iter().any(|s| s == summary)
+        {
             return Ok(true);
         }
 
+        let reason = match definition.approval {
+            ApprovalRequirement::Privileged => format!(
+                "`{}` requests root privileges; full-access never implies root",
+                call.name
+            ),
+            ApprovalRequirement::Standard => {
+                format!("`{}` writes or executes with normal OS access", call.name)
+            }
+            ApprovalRequirement::None => unreachable!(),
+        };
         self.request_approval(
             call.id.clone(),
             summary.to_string(),
-            format!("`{}` writes or executes with normal OS access", call.name),
+            reason,
+            definition.approval == ApprovalRequirement::Standard,
         )
         .await
     }
@@ -484,6 +464,7 @@ impl Agent {
             summary,
             "the account-backed coding provider executes its own commands with full OS access"
                 .into(),
+            true,
         )
         .await
     }
@@ -493,6 +474,7 @@ impl Agent {
         call_id: String,
         command: String,
         reason: String,
+        allow_always: bool,
     ) -> Result<bool> {
         let _ = self
             .events
@@ -501,6 +483,7 @@ impl Agent {
                 command: command.clone(),
                 cwd: self.workspace.clone(),
                 reason,
+                allow_always,
             })
             .await;
 
@@ -513,7 +496,9 @@ impl Agent {
             return Ok(match decision {
                 Decision::Allow => true,
                 Decision::AlwaysAllow => {
-                    self.always_allow.lock().await.push(command);
+                    if allow_always {
+                        self.always_allow.lock().await.push(command);
+                    }
                     true
                 }
                 Decision::Deny => false,
@@ -706,6 +691,7 @@ impl Agent {
             context_budget: self.context_budget,
             workspace: self.workspace.clone(),
             verify_policy: self.verify_policy.clone(),
+            output_store: self.output_store.clone(),
             events: self.events.clone(),
             approvals: self.approvals.clone(),
             always_allow: self.always_allow.clone(),
@@ -726,11 +712,16 @@ fn summarise(call: &ToolCall) -> String {
     let v: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     match call.name.as_str() {
         "shell" => v["command"].as_str().unwrap_or("?").to_string(),
+        "sudo" => format!("sudo {}", v["command"].as_str().unwrap_or("?")),
         "apply_patch" => {
             let n = v["patch"].as_str().unwrap_or("").matches("*** ").count();
             format!("patch touching {n} file(s)")
         }
         "read_file" => format!("read {}", v["path"].as_str().unwrap_or("?")),
+        "read_tool_output" => format!(
+            "read stored tool output {}",
+            v["handle"].as_str().unwrap_or("?")
+        ),
         "search" => format!("search {:?}", v["pattern"].as_str().unwrap_or("?")),
         "activate_skill" => format!("activate skill {}", v["name"].as_str().unwrap_or("?")),
         "read_skill_resource" => format!(

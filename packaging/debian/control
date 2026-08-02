@@ -1,5 +1,5 @@
 Package: gnomeai-rs
-Version: 1.1.1
+Version: 1.2.0
 Section: utils
 Priority: optional
 Architecture: amd64
@@ -7,7 +7,7 @@ Maintainer: GnomeAI-RS Project <noreply@example.invalid>
 Homepage: https://github.com/adrgu372/GnomeAI-RS
 Installed-Size: 408924
 Depends: libc6 (>= 2.39), libgcc-s1, ca-certificates, curl, util-linux, nodejs (>= 20)
-Recommends: podman (>= 4.3), xdg-utils, git, wl-clipboard | xclip | xsel
+Recommends: podman (>= 4.3), xdg-utils, git, libsecret-tools, wl-clipboard | xclip | xsel
 Suggests: npm, claude-code
 Description: multi-provider personal AI agent written in Rust
  GnomeAI-RS provides a terminal coding agent, local WebTool and optional

@@ -20,6 +20,10 @@ mod llama;
 mod memory;
 #[path = "../memory_engine.rs"]
 mod memory_engine;
+#[path = "../openrouter.rs"]
+mod openrouter;
+#[path = "../privilege.rs"]
+mod privilege;
 #[path = "../protocol.rs"]
 mod protocol;
 #[path = "../provider.rs"]
@@ -34,6 +38,8 @@ mod skills;
 mod storage;
 #[path = "../store.rs"]
 mod store;
+#[path = "../tooling.rs"]
+mod tooling;
 #[path = "../coding_tools.rs"]
 mod tools;
 #[path = "../tui.rs"]
@@ -43,10 +49,11 @@ mod verify;
 #[path = "../workspaces.rs"]
 mod workspaces;
 
-use agent::{Agent, ApprovalPolicy, Registry};
+use agent::{Agent, ApprovalPolicy};
 use anyhow::{Context, Result, bail};
 use config::AppConfig;
 use memory_engine::{DreamHandle, MemoryEngine, spawn_dream_worker};
+use privilege::{PrivilegeBroker, PrivilegeCredential};
 use protocol::{Decision, Event, HistoryTurn, Op, SessionSummary};
 use provider_catalog::{ProviderSelection, ProviderSettingsStore, build_provider, preset};
 use sandbox::{SandboxMode, SandboxPolicy};
@@ -57,6 +64,7 @@ use store::Store;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tooling::{Registry, ToolOutputStore};
 use workspaces::{WorkspaceHistory, resolve_startup_workspace};
 
 struct Cli {
@@ -172,23 +180,33 @@ async fn async_main() -> Result<()> {
     let policy = policy_for(cli.sandbox, &workspace);
     provider_selection.model = model.clone();
     let provider = build_provider(&provider_selection, &workspace, policy.mode)?;
-    let config_state = Arc::new(RwLock::new(config));
+    let mut runtime_config = config;
+    apply_selection_to_config(&provider_selection, &mut runtime_config);
+    let config_state = Arc::new(RwLock::new(runtime_config));
+    let models = fetch_model_ids(&config_state, &model).await;
     let dream = spawn_dream_worker(
         memory_engine.clone(),
         llama::LlamaClient::new(),
         config_state.clone(),
     );
+    let (op_tx, op_rx) = mpsc::channel(256);
+    let (event_tx, event_rx) = mpsc::channel(1_024);
+    let (approval_tx, approval_rx) = mpsc::channel(64);
+    let (privilege_tx, privilege_rx) = mpsc::channel(8);
+    let output_store = Arc::new(ToolOutputStore::new(
+        app_paths.store_dir.join("tool_outputs"),
+    )?);
+    let privilege_broker = Arc::new(PrivilegeBroker::new(event_tx.clone(), privilege_rx));
+
     let mut registry = Registry::default();
     tools::register_all(
         &mut registry,
         &workspace,
         policy.clone(),
         config_state.clone(),
+        output_store.clone(),
+        privilege_broker.clone(),
     );
-
-    let (op_tx, op_rx) = mpsc::channel(256);
-    let (event_tx, event_rx) = mpsc::channel(1_024);
-    let (approval_tx, approval_rx) = mpsc::channel(64);
 
     let agent = Agent::new(
         provider,
@@ -201,11 +219,12 @@ async fn async_main() -> Result<()> {
         96_000,
         workspace,
         policy.clone(),
-        event_tx,
+        output_store,
+        event_tx.clone(),
         approval_rx,
     );
 
-    send_ready(&agent, &policy, &config_state, &workspace_history).await;
+    send_ready(&agent, &policy, &config_state, &workspace_history, &models).await;
     if let Some(note) = workspace_note {
         let _ = agent
             .event_sender()
@@ -223,8 +242,11 @@ async fn async_main() -> Result<()> {
         app_paths,
         memory_engine,
         dream,
+        models,
         op_rx,
         approval_tx,
+        privilege_tx,
+        privilege_broker,
     ));
     let ui_result = tui::run(op_tx, event_rx).await;
     let core_result = core.await.context("agent core task panicked")?;
@@ -250,10 +272,13 @@ struct Core {
     config_state: Arc<RwLock<AppConfig>>,
     config_path: PathBuf,
     approvals: mpsc::Sender<(String, Decision)>,
+    privilege_replies: mpsc::Sender<PrivilegeCredential>,
+    privilege_broker: Arc<PrivilegeBroker>,
     workspace_history: WorkspaceHistory,
     app_paths: storage::AppPaths,
     memory: Arc<MemoryEngine>,
     dream: DreamHandle,
+    models: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -268,8 +293,11 @@ async fn core_loop(
     app_paths: storage::AppPaths,
     memory: Arc<MemoryEngine>,
     dream: DreamHandle,
+    models: Vec<String>,
     mut ops: mpsc::Receiver<Op>,
     approvals: mpsc::Sender<(String, Decision)>,
+    privilege_replies: mpsc::Sender<PrivilegeCredential>,
+    privilege_broker: Arc<PrivilegeBroker>,
 ) -> Result<()> {
     let events = agent.event_sender();
     let mut core = Core {
@@ -280,10 +308,13 @@ async fn core_loop(
         config_state,
         config_path,
         approvals,
+        privilege_replies,
+        privilege_broker,
         workspace_history,
         app_paths,
         memory,
         dream,
+        models,
     };
     let mut active: Option<ActiveTurn> = None;
     let mut queued: VecDeque<String> = VecDeque::new();
@@ -328,6 +359,20 @@ async fn core_loop(
                         }
                         Op::Approve { call_id, decision } => {
                             let _ = core.approvals.send((call_id, decision)).await;
+                        }
+                        Op::ProvidePrivilegeCredential {
+                            request_id,
+                            credential,
+                            remember,
+                        } => {
+                            let _ = core
+                                .privilege_replies
+                                .send(PrivilegeCredential {
+                                    request_id,
+                                    credential,
+                                    remember,
+                                })
+                                .await;
                         }
                         Op::Shutdown => {
                             turn.cancel.cancel();
@@ -378,6 +423,20 @@ async fn handle_idle_op(
         Op::Interrupt => notice(events, "nothing is running").await,
         Op::Approve { call_id, decision } => {
             let _ = core.approvals.send((call_id, decision)).await;
+        }
+        Op::ProvidePrivilegeCredential {
+            request_id,
+            credential,
+            remember,
+        } => {
+            let _ = core
+                .privilege_replies
+                .send(PrivilegeCredential {
+                    request_id,
+                    credential,
+                    remember,
+                })
+                .await;
         }
         Op::Compact => match core.agent.force_compact().await {
             Ok(true) => {}
@@ -441,6 +500,7 @@ async fn handle_idle_op(
                 &core.policy,
                 &core.config_state,
                 &core.workspace_history,
+                &core.models,
             )
             .await;
             notice(events, "started a new session").await;
@@ -451,6 +511,15 @@ async fn handle_idle_op(
         },
         Op::SetModel { model } => {
             set_model(core, model, events).await?;
+            core.models = llama::normalize_model_ids(core.models.clone(), &core.agent.model);
+            send_ready(
+                &core.agent,
+                &core.policy,
+                &core.config_state,
+                &core.workspace_history,
+                &core.models,
+            )
+            .await;
         }
         Op::SetProvider {
             provider_id,
@@ -720,6 +789,11 @@ async fn set_provider(
     base_url: Option<String>,
     events: &mpsc::Sender<Event>,
 ) -> Result<()> {
+    let api_key = core
+        .config_state
+        .read()
+        .await
+        .resolve_provider_api_key(&provider_id, api_key);
     let selection = ProviderSelection::from_choice(provider_id, api_key, base_url)?;
     let provider = build_provider(&selection, &core.agent.workspace, core.policy.mode)?;
     core.provider_settings.save(&selection)?;
@@ -736,10 +810,15 @@ async fn set_provider(
     core.agent.model = selection.model.clone();
     core.provider_selection = selection;
 
+    // Fetch once, outside the configuration lock. The helper falls back to
+    // the maintained provider catalog and always keeps the active model.
+    core.models = fetch_model_ids(&core.config_state, &core.agent.model).await;
+
     let _ = events
         .send(Event::ProviderChanged {
             provider: core.agent.provider.name().to_string(),
             model: core.agent.model.clone(),
+            models: core.models.clone(),
         })
         .await;
     send_ready(
@@ -747,6 +826,7 @@ async fn set_provider(
         &core.policy,
         &core.config_state,
         &core.workspace_history,
+        &core.models,
     )
     .await;
 
@@ -785,6 +865,8 @@ async fn set_sandbox(core: &mut Core, mode: &str, events: &mpsc::Sender<Event>) 
         &core.agent.workspace,
         policy.clone(),
         core.config_state.clone(),
+        core.agent.output_store.clone(),
+        core.privilege_broker.clone(),
     );
     core.agent.registry = Arc::new(registry);
     core.agent.verify_policy = policy.clone();
@@ -799,6 +881,7 @@ async fn set_sandbox(core: &mut Core, mode: &str, events: &mpsc::Sender<Event>) 
         &core.policy,
         &core.config_state,
         &core.workspace_history,
+        &core.models,
     )
     .await;
     notice(
@@ -848,6 +931,8 @@ async fn set_workspace(
         &workspace,
         policy.clone(),
         core.config_state.clone(),
+        core.agent.output_store.clone(),
+        core.privilege_broker.clone(),
     );
     let session = core
         .agent
@@ -876,6 +961,7 @@ async fn set_workspace(
         &core.policy,
         &core.config_state,
         &core.workspace_history,
+        &core.models,
     )
     .await;
     notice(
@@ -907,6 +993,7 @@ async fn set_web_search(core: &Core, enabled: bool, events: &mpsc::Sender<Event>
         &core.policy,
         &core.config_state,
         &core.workspace_history,
+        &core.models,
     )
     .await;
     Ok(())
@@ -960,6 +1047,8 @@ async fn resume_session(core: &mut Core, id: &str, events: &mpsc::Sender<Event>)
             &workspace,
             policy.clone(),
             core.config_state.clone(),
+            core.agent.output_store.clone(),
+            core.privilege_broker.clone(),
         );
         core.agent.workspace = workspace.clone();
         core.agent.verify_policy = policy.clone();
@@ -982,6 +1071,7 @@ async fn resume_session(core: &mut Core, id: &str, events: &mpsc::Sender<Event>)
         &core.policy,
         &core.config_state,
         &core.workspace_history,
+        &core.models,
     )
     .await;
     notice(
@@ -1011,6 +1101,7 @@ async fn fork_session(core: &mut Core, events: &mpsc::Sender<Event>) -> Result<(
         &core.policy,
         &core.config_state,
         &core.workspace_history,
+        &core.models,
     )
     .await;
     notice(
@@ -1047,6 +1138,7 @@ async fn delete_session(core: &mut Core, id: &str, events: &mpsc::Sender<Event>)
             &core.policy,
             &core.config_state,
             &core.workspace_history,
+            &core.models,
         )
         .await;
         notice(events, "deleted the active session and started a new one").await;
@@ -1290,6 +1382,19 @@ async fn run_doctor(core: &Core) -> String {
         "workspace is a git repository (rollback safety net)".into(),
     );
 
+    // Optional privilege support. sudo is required for the native root tool;
+    // secret-tool only adds encrypted desktop-keyring persistence.
+    check(
+        &mut lines,
+        firecrawl::command_in_path("sudo"),
+        "sudo executable available for privileged tools".into(),
+    );
+    lines.push(if firecrawl::command_in_path("secret-tool") {
+        "✓ desktop keyring available for optional sudo credential storage".into()
+    } else {
+        "· desktop keyring helper absent — sudo passwords remain session-only".into()
+    });
+
     // Provider.
     let selection = &core.provider_selection;
     lines.push(format!(
@@ -1440,6 +1545,7 @@ fn apply_selection_to_config(selection: &ProviderSelection, config: &mut AppConf
     config.provider_id = selection.provider_id.clone();
     config.provider_protocol = selection.protocol_name().to_string();
     config.default_model = selection.model.clone();
+    config.remember_provider_api_key(&selection.provider_id, selection.api_key());
     config.llama_api_key = selection.api_key().unwrap_or_default().to_string();
     if let Some(base_url) = selection.resolved_base_url() {
         config.llama_base_url = base_url.to_string();
@@ -1451,8 +1557,10 @@ async fn send_ready(
     policy: &SandboxPolicy,
     config_state: &Arc<RwLock<AppConfig>>,
     workspace_history: &WorkspaceHistory,
+    models: &[String],
 ) {
     let web_search_enabled = config_state.read().await.web_search_enabled;
+    let models = llama::normalize_model_ids(models.to_vec(), &agent.model);
     let _ = agent
         .event_sender()
         .send(Event::Ready {
@@ -1468,8 +1576,18 @@ async fn send_ready(
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect(),
+            models,
         })
         .await;
+}
+
+async fn fetch_model_ids(config_state: &Arc<RwLock<AppConfig>>, active_model: &str) -> Vec<String> {
+    let cfg = config_state.read().await.clone();
+    let models = llama::LlamaClient::new()
+        .list_models(&cfg)
+        .await
+        .unwrap_or_else(|_| llama::known_models(&cfg.provider_id));
+    llama::model_ids(models, active_model)
 }
 
 fn initialize_session(

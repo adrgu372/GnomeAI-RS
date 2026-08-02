@@ -51,7 +51,7 @@ impl RuntimeProfile {
             runtime_mode,
             host_identity,
             bash_executes_on,
-            workspace_root: paths.app_dir.to_string_lossy().to_string(),
+            workspace_root: paths.workspace_dir.to_string_lossy().to_string(),
             workspace_filesystem_scope,
             bash_filesystem_scope,
             direct_hardware_access,
@@ -207,7 +207,7 @@ pub struct SourceAttribution {
 impl SourceAttribution {
     pub fn for_tool(profile: &RuntimeProfile, tool_name: &str, args: &Map<String, Value>) -> Self {
         match tool_name {
-            "Bash" => {
+            "Bash" | "Sudo" => {
                 let can_infer_user_device = profile.bash_runs_on_user_machine();
                 let source_scope = if can_infer_user_device {
                     "local_host"
@@ -224,8 +224,8 @@ impl SourceAttribution {
                     "first_party_runtime_host"
                 };
                 let mut notes = vec![format!(
-                    "Bash executed on host '{}'.",
-                    profile.bash_executes_on
+                    "{} executed on host '{}'.",
+                    tool_name, profile.bash_executes_on
                 )];
                 if can_infer_user_device {
                     notes.push(

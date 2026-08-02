@@ -252,6 +252,125 @@ pub fn task_list(paths: &AppPaths, scope_key: &str) -> anyhow::Result<Value> {
     Ok(json!({"tasks": tasks, "scope": scope_key}))
 }
 
+/// Return the durable subagent registry. With no scope filter this is the
+/// common WebTool/WhatsApp view; a chat scope can still request only its own
+/// children when the model uses TaskList internally.
+pub fn agent_list(paths: &AppPaths, scope_filter: Option<&str>) -> anyhow::Result<Value> {
+    let _guard = WORKFLOW_LOCK.lock().unwrap();
+    let store = load_store(paths);
+    let mut agents = Vec::new();
+    for (scope_key, scope) in &store.scopes {
+        if scope_filter.is_some_and(|wanted| wanted != scope_key) {
+            continue;
+        }
+        for task_id in &scope.task_order {
+            let Some(task) = scope.tasks.get(task_id) else {
+                continue;
+            };
+            if !is_agent_task(task) {
+                continue;
+            }
+            let mut public = task_public_view(task, false)?;
+            if let Some(obj) = public.as_object_mut() {
+                obj.insert("scope".into(), json!(scope_key));
+                obj.insert(
+                    "outputPreview".into(),
+                    json!(read_task_output_text(paths, task_id, 2_000)),
+                );
+            }
+            agents.push(public);
+        }
+    }
+    agents.sort_by(|left, right| {
+        right
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .cmp(&left.get("createdAt").and_then(Value::as_str))
+    });
+    let running = agents
+        .iter()
+        .filter(|agent| {
+            matches!(
+                agent.get("status").and_then(Value::as_str),
+                Some("pending" | "in_progress" | "running" | "awaiting_input")
+            )
+        })
+        .count();
+    let total = agents.len();
+    Ok(json!({
+        "agents": agents,
+        "running": running,
+        "total": total,
+        "scope": scope_filter,
+    }))
+}
+
+pub fn agent_get(paths: &AppPaths, agent_id: &str) -> anyhow::Result<Value> {
+    if agent_id.trim().is_empty() {
+        bail!("agent id is required");
+    }
+    let _guard = WORKFLOW_LOCK.lock().unwrap();
+    let store = load_store(paths);
+    let Some((scope, task)) = find_task_by_id_in_store(&store, agent_id) else {
+        return Ok(json!({"agent": null}));
+    };
+    if !is_agent_task(&task) {
+        return Ok(json!({"agent": null}));
+    }
+    let mut public = task_public_view(&task, true)?;
+    if let Some(obj) = public.as_object_mut() {
+        obj.insert("scope".into(), json!(scope));
+        obj.insert(
+            "output".into(),
+            json!(read_task_output_text(paths, agent_id, 50_000)),
+        );
+    }
+    Ok(json!({"agent": public}))
+}
+
+/// A process restart cannot keep Tokio workers alive. Preserve their history
+/// but mark stale running subagents as failed so the shared registry never
+/// claims that a vanished worker is still active.
+pub fn recover_interrupted_agents(paths: &AppPaths) -> anyhow::Result<usize> {
+    let _guard = WORKFLOW_LOCK.lock().unwrap();
+    let mut store = load_store(paths);
+    let mut recovered = 0usize;
+    for scope in store.scopes.values_mut() {
+        for task in scope.tasks.values_mut() {
+            if !is_agent_task(task) {
+                continue;
+            }
+            let status = task
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !matches!(
+                status,
+                "pending" | "in_progress" | "running" | "awaiting_input"
+            ) {
+                continue;
+            }
+            let obj = object_mut(task)?;
+            obj.insert("status".into(), json!("failed"));
+            obj.insert(
+                "error".into(),
+                json!("Subagent interrupted by application restart"),
+            );
+            append_task_history(
+                obj,
+                "failed",
+                "Subagent interrupted by application restart",
+                None,
+            );
+            recovered += 1;
+        }
+    }
+    if recovered > 0 {
+        save_store(paths, &store)?;
+    }
+    Ok(recovered)
+}
+
 pub fn task_update(
     paths: &AppPaths,
     scope_key: &str,
@@ -898,6 +1017,13 @@ fn runtime_task_prefix(task_type: &str) -> &'static str {
     }
 }
 
+fn is_agent_task(task: &Value) -> bool {
+    matches!(
+        task.get("type").and_then(Value::as_str),
+        Some("local_agent" | "remote_agent")
+    )
+}
+
 fn sanitize_string_list(value: Option<&Value>) -> Vec<String> {
     let Some(items) = value.and_then(Value::as_array) else {
         return Vec::new();
@@ -990,4 +1116,104 @@ fn normalize_ws(text: &str) -> String {
         .replace_all(text, " ")
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_paths(label: &str) -> (PathBuf, AppPaths) {
+        let root =
+            std::env::temp_dir().join(format!("gnomef-rs-{label}-{}", Uuid::new_v4().simple()));
+        let paths = AppPaths::new(root.clone()).unwrap();
+        (root, paths)
+    }
+
+    #[test]
+    fn agent_registry_is_shared_across_web_and_whatsapp_scopes() {
+        let (root, paths) = test_paths("agent-registry");
+        let web = create_runtime_task(
+            &paths,
+            "chat-1",
+            "local_agent",
+            "Explore code",
+            "Explore code",
+            "Find the parser",
+            "running",
+            json!({"agent_type": "Explore", "provider_id": "custom"}),
+        )
+        .unwrap();
+        let whatsapp = create_runtime_task(
+            &paths,
+            "whatsapp_40700",
+            "local_agent",
+            "Implement fix",
+            "Implement fix",
+            "Patch the parser",
+            "completed",
+            json!({"agent_type": "general-purpose", "provider_id": "deepseek"}),
+        )
+        .unwrap();
+        append_task_output_text(
+            &paths,
+            whatsapp.get("id").and_then(Value::as_str).unwrap(),
+            "done",
+        )
+        .unwrap();
+
+        let registry = agent_list(&paths, None).unwrap();
+        assert_eq!(registry["total"], 2);
+        assert_eq!(registry["running"], 1);
+        let agents = registry["agents"].as_array().unwrap();
+        assert!(agents.iter().any(|agent| agent["scope"] == "chat-1"));
+        assert!(
+            agents
+                .iter()
+                .any(|agent| agent["scope"] == "whatsapp_40700")
+        );
+        let detail =
+            agent_get(&paths, whatsapp.get("id").and_then(Value::as_str).unwrap()).unwrap();
+        assert!(detail["agent"]["output"].as_str().unwrap().contains("done"));
+        assert!(web.get("id").is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restart_marks_only_live_agents_as_interrupted() {
+        let (root, paths) = test_paths("agent-recovery");
+        let running = create_runtime_task(
+            &paths,
+            "chat",
+            "local_agent",
+            "Running",
+            "Running",
+            "work",
+            "running",
+            json!({}),
+        )
+        .unwrap();
+        let completed = create_runtime_task(
+            &paths,
+            "chat",
+            "local_agent",
+            "Completed",
+            "Completed",
+            "work",
+            "completed",
+            json!({}),
+        )
+        .unwrap();
+        assert_eq!(recover_interrupted_agents(&paths).unwrap(), 1);
+        assert_eq!(
+            agent_get(&paths, running.get("id").and_then(Value::as_str).unwrap()).unwrap()["agent"]
+                ["status"],
+            "failed"
+        );
+        assert_eq!(
+            agent_get(&paths, completed.get("id").and_then(Value::as_str).unwrap()).unwrap()["agent"]
+                ["status"],
+            "completed"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }

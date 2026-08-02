@@ -334,9 +334,9 @@ impl ProviderSettingsStore {
             fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("cannot protect {}", self.path.display()))?;
         }
-        let raw = fs::read_to_string(&self.path)
+        let contents = fs::read_to_string(&self.path)
             .with_context(|| format!("cannot read {}", self.path.display()))?;
-        let selection: ProviderSelection = serde_json::from_str(&raw)
+        let selection: ProviderSelection = serde_json::from_str(&contents)
             .with_context(|| format!("invalid provider settings in {}", self.path.display()))?;
         let selected = preset(&selection.provider_id).with_context(|| {
             format!(
@@ -364,7 +364,7 @@ impl ProviderSettingsStore {
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
         let tmp = parent.join(format!(".providers-{}.tmp", uuid::Uuid::new_v4().simple()));
-        let raw = serde_json::to_vec_pretty(selection)?;
+        let encoded = serde_json::to_vec_pretty(selection)?;
 
         let write_result = (|| -> Result<()> {
             let mut file = OpenOptions::new()
@@ -373,7 +373,7 @@ impl ProviderSettingsStore {
                 .mode(0o600)
                 .open(&tmp)
                 .with_context(|| format!("cannot create {}", tmp.display()))?;
-            file.write_all(&raw)?;
+            file.write_all(&encoded)?;
             file.write_all(b"\n")?;
             file.sync_all()?;
             fs::rename(&tmp, &self.path)
@@ -406,6 +406,7 @@ pub fn build_provider(
             let mut provider =
                 OpenAiCompatible::named(selected.name, base_url, selection.api_key.clone());
             provider.use_max_completion_tokens = selected.id == "openai";
+            provider.openrouter_credit_fallback = selected.id == "openrouter";
             Arc::new(provider)
         }
         WireProtocol::Anthropic => Arc::new(Anthropic::new(

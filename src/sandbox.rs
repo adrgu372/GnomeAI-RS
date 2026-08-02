@@ -56,6 +56,11 @@ pub struct SandboxPolicy {
     pub readable: Vec<PathBuf>,
     /// If false, AF_INET/AF_INET6/AF_PACKET sockets return EAFNOSUPPORT.
     pub allow_network: bool,
+    /// Only the dedicated sudo tool enables this. Ordinary normal/full-access
+    /// commands still get `no_new_privs`, so a cached sudo ticket cannot turn
+    /// the generic shell into an unapproved root channel.
+    #[serde(default)]
+    pub allow_privilege_escalation: bool,
     /// Refuse to execute when Landlock is unavailable instead of degrading to
     /// seccomp-only isolation. Required for model-generated code and parsers
     /// that consume untrusted files.
@@ -113,9 +118,10 @@ impl SandboxPolicy {
             writable,
             readable,
             allow_network: false,
+            allow_privilege_escalation: false,
             require_landlock: false,
             timeout_ms: 120_000,
-            max_output_bytes: 64 * 1024,
+            max_output_bytes: 4 * 1024 * 1024,
             env_allowlist: vec![
                 "PATH".into(),
                 "HOME".into(),
@@ -154,9 +160,10 @@ impl SandboxPolicy {
             writable: Vec::new(),
             readable: Vec::new(),
             allow_network: true,
+            allow_privilege_escalation: false,
             require_landlock: false,
             timeout_ms: 120_000,
-            max_output_bytes: 64 * 1024,
+            max_output_bytes: 4 * 1024 * 1024,
             env_allowlist: Vec::new(),
             env_extra: Vec::new(),
         }
@@ -199,30 +206,7 @@ pub async fn spawn_sandboxed_with_cancel(
     args: &[String],
     cancel: &CancellationToken,
 ) -> Result<ExecOutput> {
-    let policy_json = serde_json::to_string(policy)?;
-
-    let mut cmd = Command::new("/proc/self/exe");
-    cmd.arg0(SANDBOX_ARG0);
-    cmd.arg(program);
-    cmd.args(args);
-
-    if !policy.inherits_environment() {
-        // Strict internal jobs get an allowlisted environment. Interactive
-        // normal/full-access commands intentionally inherit the user's
-        // environment so approved desktop/build commands behave normally.
-        cmd.env_clear();
-        for key in &policy.env_allowlist {
-            if let Some(val) = std::env::var_os(key) {
-                cmd.env(key, val);
-            }
-        }
-    }
-    for (key, value) in &policy.env_extra {
-        cmd.env(key, value);
-    }
-    cmd.env(POLICY_ENV, policy_json);
-
-    cmd.current_dir(&policy.cwd);
+    let mut cmd = sandboxed_command(policy, program, args)?;
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -277,6 +261,38 @@ pub async fn spawn_sandboxed_with_cancel(
         cancelled,
         truncated: out_trunc || err_trunc,
     })
+}
+
+/// Build a streaming-capable child command with exactly the same sandbox
+/// helper and privilege rules as `spawn_sandboxed_with_cancel`.
+pub fn sandboxed_command(
+    policy: &SandboxPolicy,
+    program: &str,
+    args: &[String],
+) -> Result<Command> {
+    let policy_json = serde_json::to_string(policy)?;
+    let mut cmd = Command::new("/proc/self/exe");
+    cmd.arg0(SANDBOX_ARG0);
+    cmd.arg(program);
+    cmd.args(args);
+
+    if !policy.inherits_environment() {
+        // Strict internal jobs get an allowlisted environment. Interactive
+        // normal/full-access commands intentionally inherit the user's
+        // environment so approved desktop/build commands behave normally.
+        cmd.env_clear();
+        for key in &policy.env_allowlist {
+            if let Some(val) = std::env::var_os(key) {
+                cmd.env(key, val);
+            }
+        }
+    }
+    for (key, value) in &policy.env_extra {
+        cmd.env(key, value);
+    }
+    cmd.env(POLICY_ENV, policy_json);
+    cmd.current_dir(&policy.cwd);
+    Ok(cmd)
 }
 
 async fn read_capped<R>(reader: &mut R, cap: usize) -> Result<(String, bool)>
@@ -354,8 +370,13 @@ pub fn maybe_run_as_helper() -> Result<()> {
 
 fn apply_sandbox(policy: &SandboxPolicy) -> Result<()> {
     if matches!(policy.mode, SandboxMode::Normal | SandboxMode::FullAccess) {
-        // Still set up the process group so timeouts work.
+        // Still set up the process group so timeouts work. Normal command
+        // access does not imply root access: prevent setuid/file-capability
+        // elevation unless the dedicated sudo tool explicitly opted in.
         unsafe { libc::setsid() };
+        if !policy.allow_privilege_escalation {
+            set_no_new_privs()?;
+        }
         return Ok(());
     }
 

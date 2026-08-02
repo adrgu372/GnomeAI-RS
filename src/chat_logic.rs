@@ -22,6 +22,7 @@ use crate::{
         SYSTEM_PROMPT, build_image_vision_messages, find_extracted_content, find_image_path,
         generate_image_response, supports_images,
     },
+    web_approvals::PendingApprovals,
 };
 
 pub enum StreamResponsePlan {
@@ -63,8 +64,10 @@ pub async fn generate_chat_response_with_uploads(
     history: &[ChatMessage],
     session_key: Option<&str>,
     pending_questions: &PendingQuestions,
+    pending_approvals: &PendingApprovals,
     runtime: &RuntimeHandles,
     config_state: Option<Arc<RwLock<AppConfig>>>,
+    local_web: bool,
 ) -> String {
     let memory_block =
         load_memory_block(memory_state.clone(), cfg, query, history, session_key).await;
@@ -117,8 +120,10 @@ pub async fn generate_chat_response_with_uploads(
         history,
         session_key,
         pending_questions,
+        pending_approvals,
         runtime,
         config_state,
+        local_web,
     )
     .await
 }
@@ -135,8 +140,10 @@ pub async fn prepare_streaming_response_with_uploads(
     history: &[ChatMessage],
     session_key: Option<&str>,
     pending_questions: &PendingQuestions,
+    pending_approvals: &PendingApprovals,
     runtime: &RuntimeHandles,
     config_state: Option<Arc<RwLock<AppConfig>>>,
+    local_web: bool,
 ) -> StreamResponsePlan {
     let memory_block =
         load_memory_block(memory_state.clone(), cfg, query, history, session_key).await;
@@ -216,8 +223,10 @@ pub async fn prepare_streaming_response_with_uploads(
             history,
             session_key,
             pending_questions,
+            pending_approvals,
             runtime,
             config_state,
+            local_web,
         )
         .await,
     )
@@ -235,8 +244,10 @@ pub async fn generate_standard_chat_response(
     history: &[ChatMessage],
     session_key: Option<&str>,
     pending_questions: &PendingQuestions,
+    pending_approvals: &PendingApprovals,
     runtime: &RuntimeHandles,
     config_state: Option<Arc<RwLock<AppConfig>>>,
+    local_web: bool,
 ) -> String {
     let ctx = build_context(history, cfg.history_window);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -294,9 +305,11 @@ web results; otherwise omit the date.\n\n",
         &prompt,
         session_key,
         pending_questions,
+        pending_approvals,
         runtime,
         config_state,
         0,
+        local_web,
     )
     .await
 }

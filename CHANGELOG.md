@@ -1,3 +1,55 @@
+# GnomeAI-RS 1.2.0 - 2026-08-02
+
+- Added native Rust, Claude Code-style subagent orchestration: every subagent
+  receives an isolated context and durable ID, parent/child metadata, bounded
+  nesting/concurrency, profile-specific tools, and a result returned to the
+  parent. Multiple `Agent` calls emitted in one model response run concurrently.
+- Each subagent can independently use `inherit` or a chosen API provider and
+  model without changing the main chat provider. Saved provider-scoped API keys
+  are reused, while account-backed terminal providers remain excluded from the
+  WebTool/WhatsApp tool loop.
+- WebTool has a shared subagent panel for manual per-instance provider/model
+  selection, live output, history, and stopping workers. WhatsApp exposes the
+  same registry through `/agents`, `/agent ID`, and `/stopagent ID`.
+- WebTool now has a safe live workspace selector with persistent recent
+  folders; WebTool skills, file tools, Bash, delegated agents, and WhatsApp
+  turns all resolve against the same selected workspace.
+- WebTool and WhatsApp now share `read-only`, `normal`, and `full-access`
+  execution modes. Normal-mode writes and commands produce local approval
+  dialogs labeled with their originating interface.
+- The native `Sudo` tool is available to WebTool/WhatsApp through a masked
+  local credential dialog. Remote WebTool bindings cannot browse folders or
+  request sudo, and ordinary Bash is launched with `no_new_privs`.
+- Added an original native Rust `sudo` tool with per-command root approval,
+  masked TUI authentication, zeroized secrets, optional Secret Service keyring
+  persistence, and no plaintext credential fallback.
+- Ordinary `shell` children now run with Linux `no_new_privs`, including in
+  full-access mode, so a cached sudo ticket cannot bypass the dedicated root
+  approval path.
+- Native tool schemas now carry explicit side effects, concurrency and approval
+  requirements in one deterministic registry.
+- Large tool results are retained for seven days in private owner-only files;
+  the model receives a bounded preview and can retrieve the complete result in
+  line ranges with `read_tool_output`.
+- API keys are now persisted per provider and automatically restored when the
+  user switches back; secret maps are never returned by WebTool APIs.
+- OpenRouter `402 Payment Required` responses now retry against a live,
+  capability-filtered list of zero-cost models ordered by current agentic or
+  intelligence ranking, with `openrouter/free` as the last fallback.
+- The terminal composer now shows inline slash-command autosuggestions and
+  accepts them with `Tab` or `Enter` without executing them; `/provider` and
+  `/model` remain dedicated searchable pickers.
+- Provider model lists are loaded from live OpenAI-compatible `/models`
+  endpoints with an eight-second timeout and maintained per-provider fallback.
+- The terminal `/model` command opens a searchable model picker populated by
+  the active provider; `/model MODEL` remains available for manual overrides.
+- Agent `ProviderChanged` and `Ready` snapshots now carry the same normalized
+  model list instead of replacing live results with the hardcoded catalog.
+- WebTool refreshes model suggestions for the provider currently being edited,
+  ignores stale concurrent responses, and refreshes again after saving.
+
+---
+
 # GnomeAI-RS 1.1.1 - 2026-08-02
 
 - Fixed agent turns that stopped after displaying an intermediate tool status:

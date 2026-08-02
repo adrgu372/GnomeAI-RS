@@ -31,6 +31,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use zeroize::Zeroize;
 
 use crate::protocol::{Decision, Event, Op, SecretString, SessionSummary};
 use crate::provider_catalog::{AuthKind, PROVIDERS};
@@ -108,6 +109,11 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/quit", "exit"),
 ];
 
+/// These commands own searchable pickers, so the generic inline suggestion
+/// must not complete them. They remain visible in the `/` command browser and
+/// still open their dedicated dialogs when submitted exactly.
+const DEDICATED_PICKER_COMMANDS: &[&str] = &["/provider", "/model"];
+
 #[derive(Debug)]
 enum ProviderStage {
     Select,
@@ -136,6 +142,47 @@ impl ProviderDialog {
     }
 }
 
+#[derive(Debug)]
+struct ModelDialog {
+    models: Vec<String>,
+    selected: usize,
+    query: String,
+}
+
+impl ModelDialog {
+    fn new(models: Vec<String>, current: &str) -> Self {
+        let selected = models
+            .iter()
+            .position(|model| model == current)
+            .unwrap_or(0);
+        Self {
+            models,
+            selected,
+            query: String::new(),
+        }
+    }
+
+    fn matches(&self) -> Vec<&str> {
+        let query = self.query.trim().to_lowercase();
+        self.models
+            .iter()
+            .filter(|model| query.is_empty() || model.to_lowercase().contains(&query))
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn selected_model(&self) -> Option<String> {
+        self.matches()
+            .get(self.selected)
+            .map(|model| model.to_string())
+    }
+
+    fn clamp_selection(&mut self) {
+        let maximum = self.matches().len().saturating_sub(1);
+        self.selected = self.selected.min(maximum);
+    }
+}
+
 enum UiAction {
     None,
     Authenticate {
@@ -150,6 +197,22 @@ struct SessionDialog {
     selected: usize,
     /// `Some` while typing a new title for the selected session.
     renaming: Option<String>,
+}
+
+struct PrivilegeDialog {
+    request_id: String,
+    command: String,
+    input: String,
+    remember: bool,
+    keyring_available: bool,
+    attempt: u8,
+    message: Option<String>,
+}
+
+impl Drop for PrivilegeDialog {
+    fn drop(&mut self) {
+        self.input.zeroize();
+    }
 }
 
 enum AccountLogin {
@@ -213,12 +276,15 @@ pub struct App {
     /// `completion_idx` so the highlight can never scroll out of view.
     completion_offset: usize,
 
-    pending_approval: Option<(String, String)>,
+    pending_approval: Option<(String, String, bool)>,
+    privilege_dialog: Option<PrivilegeDialog>,
     provider_dialog: Option<ProviderDialog>,
+    model_dialog: Option<ModelDialog>,
     session_dialog: Option<SessionDialog>,
 
     provider: String,
     model: String,
+    models: Vec<String>,
     workspace: String,
     branch: Option<String>,
     sandbox: String,
@@ -285,10 +351,13 @@ impl App {
             completion_idx: 0,
             completion_offset: 0,
             pending_approval: None,
+            privilege_dialog: None,
             provider_dialog: None,
+            model_dialog: None,
             session_dialog: None,
             provider: "—".into(),
             model: "—".into(),
+            models: Vec::new(),
             workspace: "—".into(),
             branch: None,
             sandbox: "normal".into(),
@@ -390,7 +459,15 @@ pub async fn run(ops: mpsc::Sender<Op>, mut events: mpsc::Receiver<Event>) -> Re
                             }
                         }
                     }
-                    TermEvent::Paste(text) => handle_paste(&mut app, &text),
+                    TermEvent::Paste(text) => {
+                        if let Some(dialog) = app.privilege_dialog.as_mut() {
+                            dialog
+                                .input
+                                .extend(text.chars().filter(|character| !matches!(character, '\r' | '\n' | '\0')));
+                        } else {
+                            handle_paste(&mut app, &text);
+                        }
+                    }
                     TermEvent::Mouse(mouse) => handle_mouse(&mut app, mouse),
                     _ => {}
                 }
@@ -481,10 +558,12 @@ fn apply_event(app: &mut App, ev: Event) {
             web_search_enabled,
             git_branch,
             recent_workspaces,
+            models,
             ..
         } => {
             app.provider = provider;
             app.model = model;
+            set_available_models(app, models);
             app.workspace = workspace.display().to_string();
             app.sandbox = sandbox;
             app.web_search_enabled = web_search_enabled;
@@ -531,9 +610,14 @@ fn apply_event(app: &mut App, ev: Event) {
             app.token_history.clear();
         }
 
-        Event::ProviderChanged { provider, model } => {
+        Event::ProviderChanged {
+            provider,
+            model,
+            models,
+        } => {
             app.provider = provider;
             app.model = model;
+            set_available_models(app, models);
         }
 
         Event::WebSearchChanged { enabled } => {
@@ -599,13 +683,35 @@ fn apply_event(app: &mut App, ev: Event) {
             call_id,
             command,
             reason,
+            allow_always,
             ..
         } => {
             if app.notifications_enabled {
                 let short: String = command.chars().take(120).collect();
                 desktop_notify("GnomeAI — approval needed", &format!("{short}\n{reason}"));
             }
-            app.pending_approval = Some((call_id, format!("{command}\n\n{reason}")));
+            app.pending_approval = Some((call_id, format!("{command}\n\n{reason}"), allow_always));
+        }
+
+        Event::PrivilegeCredentialRequest {
+            request_id,
+            command,
+            keyring_available,
+            attempt,
+            message,
+        } => {
+            if app.notifications_enabled {
+                desktop_notify("GnomeAI — sudo authentication", &command);
+            }
+            app.privilege_dialog = Some(PrivilegeDialog {
+                request_id,
+                command,
+                input: String::with_capacity(128),
+                remember: false,
+                keyring_available,
+                attempt,
+                message,
+            });
         }
 
         Event::PatchApplied { diff, .. } => app.blocks.push(Block_::Diff(diff)),
@@ -670,6 +776,25 @@ fn apply_event(app: &mut App, ev: Event) {
     }
 }
 
+fn set_available_models(app: &mut App, mut models: Vec<String>) {
+    models = models
+        .into_iter()
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+        .collect();
+    models.sort_unstable();
+    models.dedup();
+
+    let current = app.model.trim();
+    if !current.is_empty() && current != "—" {
+        if let Some(index) = models.iter().position(|model| model == current) {
+            models.remove(index);
+        }
+        models.insert(0, current.to_string());
+    }
+    app.models = models;
+}
+
 // ---------------------------------------------------------------------------
 // Keys
 // ---------------------------------------------------------------------------
@@ -682,10 +807,10 @@ async fn handle_key(app: &mut App, key: KeyEvent, ops: &mpsc::Sender<Op>) -> UiA
     // An open approval prompt swallows everything. Answering it is the only
     // thing that unblocks the core, so do not let a stray keystroke land in
     // the composer instead.
-    if let Some((call_id, _)) = app.pending_approval.clone() {
+    if let Some((call_id, _, allow_always)) = app.pending_approval.clone() {
         let decision = match key.code {
             KeyCode::Char('y') => Some(Decision::Allow),
-            KeyCode::Char('a') => Some(Decision::AlwaysAllow),
+            KeyCode::Char('a') if allow_always => Some(Decision::AlwaysAllow),
             KeyCode::Char('n') | KeyCode::Esc => Some(Decision::Deny),
             _ => None,
         };
@@ -696,8 +821,55 @@ async fn handle_key(app: &mut App, key: KeyEvent, ops: &mpsc::Sender<Op>) -> UiA
         return UiAction::None;
     }
 
+    if app.privilege_dialog.is_some() {
+        let mut reply = None;
+        let mut close = false;
+        if let Some(dialog) = app.privilege_dialog.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    reply = Some(Op::ProvidePrivilegeCredential {
+                        request_id: dialog.request_id.clone(),
+                        credential: None,
+                        remember: false,
+                    });
+                    close = true;
+                }
+                KeyCode::Enter if !dialog.input.is_empty() => {
+                    let secret = SecretString::new(std::mem::take(&mut dialog.input));
+                    reply = Some(Op::ProvidePrivilegeCredential {
+                        request_id: dialog.request_id.clone(),
+                        credential: Some(secret),
+                        remember: dialog.remember && dialog.keyring_available,
+                    });
+                    close = true;
+                }
+                KeyCode::Tab if dialog.keyring_available => {
+                    dialog.remember = !dialog.remember;
+                }
+                KeyCode::Backspace => {
+                    dialog.input.pop();
+                }
+                KeyCode::Char(character) if !ctrl && !alt => {
+                    dialog.input.push(character);
+                }
+                _ => {}
+            }
+        }
+        if close {
+            app.privilege_dialog = None;
+        }
+        if let Some(reply) = reply {
+            let _ = ops.send(reply).await;
+        }
+        return UiAction::None;
+    }
+
     if app.provider_dialog.is_some() {
         return handle_provider_key(app, key, ops).await;
+    }
+    if app.model_dialog.is_some() {
+        handle_model_key(app, key, ops).await;
+        return UiAction::None;
     }
     if app.session_dialog.is_some() {
         handle_session_key(app, key, ops).await;
@@ -833,7 +1005,9 @@ async fn handle_key(app: &mut App, key: KeyEvent, ops: &mpsc::Sender<Op>) -> UiA
         (KeyCode::Enter, _, true) => insert(app, '\n'),
 
         (KeyCode::Tab, _, _) => {
-            if app.completions.is_empty() {
+            if command_autosuggestion(app).is_some() {
+                accept_completion(app);
+            } else if app.completions.is_empty() {
                 recompute_completions(app);
                 sync_completion_offset(app);
             } else {
@@ -917,7 +1091,9 @@ async fn handle_key(app: &mut App, key: KeyEvent, ops: &mpsc::Sender<Op>) -> UiA
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     if app.pending_approval.is_some()
+        || app.privilege_dialog.is_some()
         || app.provider_dialog.is_some()
+        || app.model_dialog.is_some()
         || app.session_dialog.is_some()
     {
         return;
@@ -975,6 +1151,11 @@ fn handle_paste(app: &mut App, text: &str) {
     }
     if let Some(dialog) = app.provider_dialog.as_mut() {
         dialog.input.push_str(text.trim());
+        return;
+    }
+    if let Some(dialog) = app.model_dialog.as_mut() {
+        dialog.query.push_str(text.trim());
+        dialog.selected = 0;
         return;
     }
     if let Some(dialog) = app.session_dialog.as_mut()
@@ -1118,10 +1299,6 @@ async fn handle_provider_key(app: &mut App, key: KeyEvent, ops: &mpsc::Sender<Op
             KeyCode::Enter => {
                 let selected = &PROVIDERS[dialog.selected];
                 let key = dialog.input.trim().to_string();
-                if selected.auth == AuthKind::ApiKey && key.is_empty() {
-                    dialog.error = Some("this provider requires an API key".to_string());
-                    return UiAction::None;
-                }
                 let provider_id = selected.id.to_string();
                 let base_url = dialog.base_url.clone();
                 let api_key = (!key.is_empty()).then(|| SecretString::new(key));
@@ -1146,6 +1323,62 @@ async fn handle_provider_key(app: &mut App, key: KeyEvent, ops: &mpsc::Sender<Op
     }
 
     UiAction::None
+}
+
+async fn handle_model_key(app: &mut App, key: KeyEvent, ops: &mpsc::Sender<Op>) {
+    if key.code == KeyCode::Esc {
+        app.model_dialog = None;
+        return;
+    }
+
+    if key.code == KeyCode::Enter {
+        let model = app
+            .model_dialog
+            .as_ref()
+            .and_then(ModelDialog::selected_model);
+        if let Some(model) = model {
+            app.model_dialog = None;
+            app.model = model.clone();
+            let models = app.models.clone();
+            set_available_models(app, models);
+            let _ = ops.send(Op::SetModel { model }).await;
+        }
+        return;
+    }
+
+    let Some(dialog) = app.model_dialog.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Up => dialog.selected = dialog.selected.saturating_sub(1),
+        KeyCode::Down => {
+            let maximum = dialog.matches().len().saturating_sub(1);
+            dialog.selected = (dialog.selected + 1).min(maximum);
+        }
+        KeyCode::PageUp => dialog.selected = dialog.selected.saturating_sub(10),
+        KeyCode::PageDown => {
+            let maximum = dialog.matches().len().saturating_sub(1);
+            dialog.selected = (dialog.selected + 10).min(maximum);
+        }
+        KeyCode::Home => dialog.selected = 0,
+        KeyCode::End => {
+            let maximum = dialog.matches().len().saturating_sub(1);
+            dialog.selected = maximum;
+        }
+        KeyCode::Backspace => {
+            dialog.query.pop();
+            dialog.selected = 0;
+        }
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            dialog.query.push(character);
+            dialog.selected = 0;
+        }
+        _ => dialog.clamp_selection(),
+    }
 }
 
 async fn handle_session_key(app: &mut App, key: KeyEvent, ops: &mpsc::Sender<Op>) {
@@ -1427,6 +1660,45 @@ fn recompute_completions(app: &mut App) {
         .filter(|(name, _)| name.starts_with(t))
         .map(|(name, _)| *name)
         .collect();
+
+    // If a dedicated picker and a regular command share a prefix (`/mo`),
+    // highlight the regular command so the inline suggestion still helps.
+    // The bare `/` browser preserves the documented command order.
+    if t != "/" {
+        if let Some(index) = app
+            .completions
+            .iter()
+            .position(|command| !DEDICATED_PICKER_COMMANDS.contains(command))
+        {
+            app.completion_idx = index;
+        }
+    }
+}
+
+/// Selected command offered as inline ghost text. A bare `/` is deliberately
+/// kept as a browsable menu, while provider and model keep their richer
+/// searchable pickers instead of using this generic completion path.
+fn command_autosuggestion(app: &App) -> Option<&'static str> {
+    if app.cursor != app.composer.len() {
+        return None;
+    }
+
+    let typed = app.composer.trim_start();
+    if typed == "/" || typed.contains(char::is_whitespace) {
+        return None;
+    }
+
+    let command = app.completions.get(app.completion_idx).copied()?;
+    if DEDICATED_PICKER_COMMANDS.contains(&command) || command == typed {
+        return None;
+    }
+
+    command.starts_with(typed).then_some(command)
+}
+
+fn command_autosuggestion_suffix(app: &App) -> Option<&'static str> {
+    let command = command_autosuggestion(app)?;
+    command.strip_prefix(app.composer.trim_start())
 }
 
 /// Move the highlight by `delta`, wrapping at both ends, and keep the drawn
@@ -1476,7 +1748,10 @@ fn help_text() -> String {
     for (keys, what) in [
         ("Enter", "send · Alt+Enter newline"),
         ("↑/↓", "command menu when open, otherwise input history"),
-        ("Tab / Shift+Tab", "next / previous command"),
+        (
+            "Tab / Shift+Tab",
+            "accept autosuggestion / previous command",
+        ),
         (
             "Esc",
             "close the menu, clear a selection, jump to the latest message",
@@ -1622,7 +1897,13 @@ async fn submit(app: &mut App, text: String, ops: &mpsc::Sender<Op>) {
             return;
         }
         "/model" => {
-            app.blocks.push(Block_::Error("usage: /model MODEL".into()));
+            if app.models.is_empty() {
+                app.blocks.push(Block_::Error(
+                    "no model list is available; use /model MODEL".into(),
+                ));
+            } else {
+                app.model_dialog = Some(ModelDialog::new(app.models.clone(), &app.model));
+            }
             return;
         }
         "/sandbox" => {
@@ -1739,6 +2020,9 @@ async fn submit(app: &mut App, text: String, ops: &mpsc::Sender<Op>) {
         if model.is_empty() {
             app.blocks.push(Block_::Error("usage: /model MODEL".into()));
         } else {
+            app.model = model.to_string();
+            let models = app.models.clone();
+            set_available_models(app, models);
             let _ = ops
                 .send(Op::SetModel {
                     model: model.to_string(),
@@ -2021,15 +2305,86 @@ fn draw(f: &mut Frame, app: &mut App) {
     if !app.completions.is_empty() {
         draw_completions(f, app, composer);
     }
-    if let Some((_, body)) = &app.pending_approval {
-        draw_approval(f, body, f.area());
+    if let Some((_, body, allow_always)) = &app.pending_approval {
+        draw_approval(f, body, *allow_always, f.area());
     }
     if let Some(dialog) = &app.provider_dialog {
         draw_provider_dialog(f, dialog, f.area());
     }
+    if let Some(dialog) = &app.model_dialog {
+        draw_model_dialog(f, dialog, f.area());
+    }
     if let Some(dialog) = &app.session_dialog {
         draw_session_dialog(f, dialog, f.area());
     }
+    if let Some(dialog) = &app.privilege_dialog {
+        draw_privilege_dialog(f, dialog, f.area());
+    }
+}
+
+fn draw_model_dialog(f: &mut Frame, dialog: &ModelDialog, screen: Rect) {
+    let matches = dialog.matches();
+    let width = screen.width.min(96);
+    let height = screen.height.min((matches.len() as u16 + 7).clamp(9, 24));
+    let area = Rect {
+        x: screen.x + screen.width.saturating_sub(width) / 2,
+        y: screen.y + screen.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" model ")
+        .border_style(Style::new().fg(Color::Cyan));
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    let [query_area, list_area, footer] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .areas(inner);
+    f.render_widget(
+        Paragraph::new(format!("filter: {}▏", dialog.query)).style(Style::new().fg(Color::Cyan)),
+        query_area,
+    );
+
+    if matches.is_empty() {
+        f.render_widget(Paragraph::new("no matching models"), list_area);
+    } else {
+        let visible = list_area.height.max(1) as usize;
+        let start = dialog
+            .selected
+            .saturating_sub(visible / 2)
+            .min(matches.len().saturating_sub(visible));
+        let items = matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(index, model)| {
+                let style = if index == dialog.selected {
+                    Style::new().bg(Color::DarkGray).bold()
+                } else {
+                    Style::new()
+                };
+                ListItem::new(Line::styled((*model).to_string(), style))
+            })
+            .collect::<Vec<_>>();
+        f.render_widget(List::new(items), list_area);
+    }
+
+    f.render_widget(
+        Paragraph::new(format!(
+            "{} model(s)   type to filter   ↑/↓ select   Enter use   Esc close",
+            matches.len()
+        ))
+        .style(Style::new().fg(Color::DarkGray)),
+        footer,
+    );
 }
 
 fn draw_session_dialog(f: &mut Frame, dialog: &SessionDialog, screen: Rect) {
@@ -2441,14 +2796,28 @@ fn draw_composer(f: &mut Frame, app: &App, area: Rect) {
         Color::Cyan
     };
 
-    f.render_widget(
-        Paragraph::new(app.composer.as_str())
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::new().fg(border)),
+    let content = if let Some(suffix) = command_autosuggestion_suffix(app) {
+        Text::from(Line::from(vec![
+            Span::raw(app.composer.as_str()),
+            Span::styled(
+                suffix,
+                Style::new().fg(if app.high_contrast {
+                    Color::Gray
+                } else {
+                    Color::DarkGray
+                }),
             ),
+        ]))
+    } else {
+        Text::raw(app.composer.as_str())
+    };
+
+    f.render_widget(
+        Paragraph::new(content).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(border)),
+        ),
         area,
     );
 
@@ -2532,7 +2901,7 @@ fn draw_completions(f: &mut Frame, app: &App, composer: Rect) {
     );
 }
 
-fn draw_approval(f: &mut Frame, body: &str, screen: Rect) {
+fn draw_approval(f: &mut Frame, body: &str, allow_always: bool, screen: Rect) {
     let w = screen.width.min(70);
     let h = screen.height.min(12);
     let area = Rect {
@@ -2544,14 +2913,58 @@ fn draw_approval(f: &mut Frame, body: &str, screen: Rect) {
 
     f.render_widget(Clear, area);
     f.render_widget(
-        Paragraph::new(format!("{body}\n\n[y] allow   [a] always   [n] deny"))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" approval required ")
-                    .border_style(Style::new().fg(Color::Yellow)),
-            ),
+        Paragraph::new(if allow_always {
+            format!("{body}\n\n[y] allow   [a] always   [n] deny")
+        } else {
+            format!("{body}\n\n[y] allow once   [n] deny")
+        })
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" approval required ")
+                .border_style(Style::new().fg(Color::Yellow)),
+        ),
+        area,
+    );
+}
+
+fn draw_privilege_dialog(f: &mut Frame, dialog: &PrivilegeDialog, screen: Rect) {
+    let width = screen.width.min(78);
+    let height = screen.height.min(16);
+    let area = Rect {
+        x: screen.x + screen.width.saturating_sub(width) / 2,
+        y: screen.y + screen.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let remembered = if !dialog.keyring_available {
+        "Keyring indisponibil: parola rămâne numai în memorie pentru această autentificare."
+            .to_string()
+    } else if dialog.remember {
+        "[x] Salvează în keyring-ul desktop (Tab schimbă)".to_string()
+    } else {
+        "[ ] Salvează în keyring-ul desktop (Tab schimbă)".to_string()
+    };
+    let message = dialog
+        .message
+        .as_deref()
+        .map(|text| format!("\n{text}\n"))
+        .unwrap_or_default();
+    let masked = "•".repeat(dialog.input.chars().count());
+    let body = format!(
+        "Comandă root:\n{}\n{}\nParola sudo (încercarea {}/3):\n{}\n\n{}\n\nEnter confirmă · Esc anulează\nParola nu este trimisă modelului.",
+        dialog.command, message, dialog.attempt, masked, remembered
+    );
+
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" autentificare sudo ")
+                .border_style(Style::new().fg(Color::Yellow)),
+        ),
         area,
     );
 }
@@ -2626,9 +3039,9 @@ fn draw_provider_dialog(f: &mut Frame, dialog: &ProviderDialog, screen: Rect) {
             let is_key = matches!(dialog.stage, ProviderStage::ApiKey);
             let label = if is_key {
                 if selected.auth == AuthKind::OptionalApiKey {
-                    "API key (optional; Enter leaves it empty)"
+                    "API key (optional; blank reuses the saved key)"
                 } else {
-                    "API key"
+                    "API key (blank reuses the saved key)"
                 }
             } else {
                 "OpenAI-compatible base URL"
@@ -3066,6 +3479,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tab_accepts_inline_command_autosuggestion_without_submitting() {
+        let (ops, mut receiver) = mpsc::channel(8);
+        let mut app = App::new();
+
+        type_text(&mut app, "/mem", &ops).await;
+        assert_eq!(command_autosuggestion(&app), Some("/memory"));
+        assert_eq!(command_autosuggestion_suffix(&app), Some("ory"));
+
+        handle_key(&mut app, key(KeyCode::Tab), &ops).await;
+
+        assert_eq!(app.composer, "/memory ");
+        assert!(app.completions.is_empty());
+        assert!(receiver.try_recv().is_err(), "completion must not execute");
+    }
+
+    #[tokio::test]
+    async fn provider_and_model_are_excluded_from_generic_autosuggestion() {
+        let (ops, _receiver) = mpsc::channel(8);
+
+        for command in ["/pro", "/mod"] {
+            let mut app = App::new();
+            type_text(&mut app, command, &ops).await;
+            assert_eq!(app.completions.len(), 1);
+            assert!(command_autosuggestion(&app).is_none());
+            assert!(command_autosuggestion_suffix(&app).is_none());
+        }
+
+        let mut app = App::new();
+        type_text(&mut app, "/mo", &ops).await;
+        assert_eq!(command_autosuggestion(&app), Some("/mouse"));
+    }
+
+    #[tokio::test]
     async fn menu_scrolls_to_keep_the_selection_visible() {
         let (ops, _receiver) = mpsc::channel(8);
         let mut app = App::new();
@@ -3200,6 +3646,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_picker_allows_reusing_a_saved_key() {
+        let (ops, mut receiver) = mpsc::channel(2);
+        let mut app = App::new();
+        submit(&mut app, "/provider".into(), &ops).await;
+
+        handle_provider_key(&mut app, key(KeyCode::Enter), &ops).await;
+        handle_provider_key(&mut app, key(KeyCode::Enter), &ops).await;
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Op::SetProvider {
+                provider_id,
+                api_key: None,
+                ..
+            }) if provider_id == "openai"
+        ));
+    }
+
+    #[tokio::test]
     async fn exact_provider_command_opens_picker_on_first_enter() {
         let (ops, _receiver) = mpsc::channel(1);
         let mut app = App::new();
@@ -3214,6 +3679,38 @@ mod tests {
         assert!(app.provider_dialog.is_some());
         assert!(app.composer.is_empty());
         assert!(app.completions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_models_feed_the_searchable_model_picker() {
+        let (ops, mut receiver) = mpsc::channel(4);
+        let mut app = App::new();
+        apply_event(
+            &mut app,
+            Event::ProviderChanged {
+                provider: "DeepSeek".into(),
+                model: "deepseek-v4-pro".into(),
+                models: vec![
+                    "deepseek-v4-pro".into(),
+                    "deepseek-v4-flash".into(),
+                    "deepseek-r1".into(),
+                ],
+            },
+        );
+
+        submit(&mut app, "/model".into(), &ops).await;
+        assert!(app.model_dialog.is_some());
+        for character in "flash".chars() {
+            handle_model_key(&mut app, key(KeyCode::Char(character)), &ops).await;
+        }
+        handle_model_key(&mut app, key(KeyCode::Enter), &ops).await;
+
+        assert_eq!(app.model, "deepseek-v4-flash");
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Op::SetModel { model }) if model == "deepseek-v4-flash"
+        ));
+        assert!(app.model_dialog.is_none());
     }
 
     #[tokio::test]

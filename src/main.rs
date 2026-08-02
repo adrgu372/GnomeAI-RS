@@ -9,6 +9,9 @@ mod generation;
 mod llama;
 mod memory;
 mod memory_engine;
+mod openrouter;
+mod privilege;
+mod protocol;
 mod provider;
 mod provider_catalog;
 mod questions;
@@ -23,7 +26,9 @@ mod tools;
 mod transcribe;
 mod uploads;
 mod vision;
+mod web_approvals;
 mod whatsapp;
+mod workspaces;
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -32,6 +37,7 @@ use std::{
     io::Read,
     net::SocketAddr,
     os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -83,7 +89,9 @@ use crate::{
         ensure_upload_capacity, read_file, sanitize_upload_filename, save_base64_media,
         transcribe_media, write_unique_private,
     },
+    web_approvals::{ApprovalAnswerPayload, PendingApprovals},
     whatsapp::{WhatsAppBridge, qr_svg, self_whatsapp_jid, send_whatsapp_message},
+    workspaces::{WorkspaceHistory, resolve_startup_workspace},
 };
 
 #[derive(Clone)]
@@ -92,17 +100,23 @@ struct AppState {
     config: Arc<RwLock<AppConfig>>,
     memory: Arc<MemoryEngine>,
     dream: DreamHandle,
-    runtime_profile: Arc<RuntimeProfile>,
     llama: LlamaClient,
     pending_questions: PendingQuestions,
+    pending_approvals: PendingApprovals,
     runtime: RuntimeHandles,
     whatsapp: WhatsAppBridge,
     wa_seen: Arc<Mutex<SeenMessages>>,
     upload_lock: Arc<Mutex<()>>,
     api_token: Arc<str>,
-    skill_workspace: Arc<std::path::PathBuf>,
+    workspace: Arc<RwLock<WebWorkspace>>,
+    local_web: bool,
     /// Broadcasts complete WhatsApp status snapshots to browser SSE clients.
     whatsapp_events: tokio::sync::broadcast::Sender<Value>,
+}
+
+struct WebWorkspace {
+    current: PathBuf,
+    history: WorkspaceHistory,
 }
 
 const WA_SEEN_LIMIT: usize = 10_000;
@@ -176,10 +190,23 @@ async fn web_main() -> anyhow::Result<()> {
     let launch_dir = std::env::current_dir()?;
     let app_dir = app_dirs::resolve_app_home(&launch_dir)?;
     let paths = Arc::new(AppPaths::new(app_dir)?);
+    let interrupted_agents = workflow_tasks::recover_interrupted_agents(paths.as_ref())?;
+    if interrupted_agents > 0 {
+        info!("Recovered {interrupted_agents} interrupted subagent task(s)");
+    }
+    let mut workspace_history = WorkspaceHistory::load(paths.store_dir.join("workspaces.json"));
+    let (startup_workspace, workspace_note) =
+        resolve_startup_workspace(None, &launch_dir, &workspace_history);
+    let startup_workspace = startup_workspace
+        .canonicalize()
+        .unwrap_or(startup_workspace);
+    workspace_history.record(&startup_workspace);
+    if let Some(note) = workspace_note {
+        info!("Workspace: {note}");
+    }
     trace_startup("state paths ready");
     let memory = MemoryEngine::open(paths.as_ref())?;
-    let runtime_profile = Arc::new(RuntimeProfile::detect(paths.as_ref()));
-    trace_startup("memory and runtime profile ready");
+    trace_startup("memory ready");
     let mut config = AppConfig::load(&paths.config_file)?;
     let configured_api_token = std::env::var("GNOMEF_WEB_TOKEN")
         .ok()
@@ -217,15 +244,19 @@ async fn web_main() -> anyhow::Result<()> {
         config: config_state,
         memory,
         dream,
-        runtime_profile,
         llama,
         pending_questions: PendingQuestions::default(),
+        pending_approvals: PendingApprovals::default(),
         runtime: RuntimeHandles::default(),
         whatsapp: WhatsAppBridge::new(),
         wa_seen: Arc::new(Mutex::new(SeenMessages::default())),
         upload_lock: Arc::new(Mutex::new(())),
         api_token: Arc::from(api_token),
-        skill_workspace: Arc::new(launch_dir),
+        workspace: Arc::new(RwLock::new(WebWorkspace {
+            current: startup_workspace,
+            history: workspace_history,
+        })),
+        local_web: bind_addr.ip().is_loopback(),
         whatsapp_events: tokio::sync::broadcast::channel(16).0,
     };
     trace_startup("application state ready");
@@ -265,6 +296,10 @@ async fn web_main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/config", get(api_get_config).post(api_set_config))
+        .route("/api/workspace", get(api_workspace).post(api_set_workspace))
+        .route("/api/workspace/browse", get(api_browse_workspace))
+        .route("/api/approvals/pending", get(api_pending_approvals))
+        .route("/api/approvals/{id}/answer", post(api_answer_approval))
         .route("/api/providers", get(api_get_providers))
         .route("/api/provider", post(api_set_provider))
         .route("/api/memory", get(api_get_memory))
@@ -286,7 +321,7 @@ async fn web_main() -> anyhow::Result<()> {
             post(api_skill_activate),
         )
         .route("/api/runtime/profile", get(api_runtime_profile))
-        .route("/api/models", get(api_models))
+        .route("/api/models", get(api_models).post(api_preview_models))
         .route("/api/chats", get(api_list_chats))
         .route("/api/chats/new", post(api_new_chat))
         .route(
@@ -306,6 +341,8 @@ async fn web_main() -> anyhow::Result<()> {
             post(api_answer_pending_question),
         )
         .route("/api/chats/{cid}/tasks", get(api_chat_tasks))
+        .route("/api/agents", get(api_agents).post(api_launch_agent))
+        .route("/api/agents/{agent_id}", get(api_agent))
         .route("/api/tasks/{task_id}/stop", post(api_stop_task))
         .route(
             "/api/runtime/tasks/{task_id}/update",
@@ -473,12 +510,196 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 
 async fn api_get_config(State(state): State<AppState>) -> Json<Value> {
     let config = state.config.read().await.clone();
+    Json(public_config_value(&config))
+}
+
+fn public_config_value(config: &AppConfig) -> Value {
     let mut value = serde_json::to_value(&config).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.remove("provider_api_keys");
+    }
     value["llama_api_key"] = json!("");
     value["firecrawl_api_key"] = json!("");
     value["has_provider_api_key"] = json!(!config.llama_api_key.trim().is_empty());
     value["has_firecrawl_api_key"] = json!(!config.firecrawl_api_key.trim().is_empty());
-    Json(value)
+    value
+}
+
+async fn runtime_paths(state: &AppState) -> AppPaths {
+    let workspace = state.workspace.read().await.current.clone();
+    let mut paths = state.paths.as_ref().clone();
+    paths.workspace_dir = workspace;
+    paths
+}
+
+async fn current_workspace(state: &AppState) -> PathBuf {
+    state.workspace.read().await.current.clone()
+}
+
+async fn api_workspace(State(state): State<AppState>) -> Json<Value> {
+    let workspace = state.workspace.read().await;
+    Json(json!({
+        "current": workspace.current,
+        "recent": workspace.history.recent(),
+        "browse_enabled": state.local_web,
+    }))
+}
+
+async fn api_set_workspace(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Response, AppError> {
+    if !state.local_web {
+        return Ok((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "ok": false,
+                "error": "Workspace selection is available only on the local WebTool"
+            })),
+        )
+            .into_response());
+    }
+    let raw = payload
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if raw.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "path required"})),
+        )
+            .into_response());
+    }
+    let path = match PathBuf::from(raw).canonicalize() {
+        Ok(path) if path.is_dir() => path,
+        Ok(_) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": "Workspace must be a directory"})),
+            )
+                .into_response());
+        }
+        Err(error) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": format!("Cannot open workspace: {error}")})),
+            )
+                .into_response());
+        }
+    };
+    let mut workspace = state.workspace.write().await;
+    workspace.current = path.clone();
+    workspace.history.record(&path);
+    Ok(Json(json!({
+        "ok": true,
+        "current": path,
+        "recent": workspace.history.recent(),
+    }))
+    .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceBrowseQuery {
+    path: Option<String>,
+    show_hidden: Option<bool>,
+}
+
+async fn api_browse_workspace(
+    State(state): State<AppState>,
+    Query(query): Query<WorkspaceBrowseQuery>,
+) -> Result<Response, AppError> {
+    if !state.local_web {
+        return Ok((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "ok": false,
+                "error": "Folder browsing is available only on the local WebTool"
+            })),
+        )
+            .into_response());
+    }
+    let requested = query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(current_workspace(&state).await);
+    let directory = match requested.canonicalize() {
+        Ok(path) if path.is_dir() => path,
+        Ok(_) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": "Path is not a directory"})),
+            )
+                .into_response());
+        }
+        Err(error) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": format!("Cannot browse folder: {error}")})),
+            )
+                .into_response());
+        }
+    };
+    let show_hidden = query.show_hidden.unwrap_or(false);
+    let mut directories = fs::read_dir(&directory)?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !show_hidden && name.starts_with('.') {
+                return None;
+            }
+            let file_type = entry.file_type().ok()?;
+            (file_type.is_dir() || (file_type.is_symlink() && entry.path().is_dir())).then(|| {
+                json!({
+                    "name": name,
+                    "path": entry.path(),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    directories.sort_by(|left, right| {
+        left.get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .cmp(
+                &right
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase(),
+            )
+    });
+    directories.truncate(500);
+    Ok(Json(json!({
+        "ok": true,
+        "path": directory,
+        "parent": directory.parent().map(Path::to_path_buf),
+        "directories": directories,
+    }))
+    .into_response())
+}
+
+async fn api_pending_approvals(State(state): State<AppState>) -> Json<Value> {
+    Json(state.pending_approvals.public_view().await)
+}
+
+async fn api_answer_approval(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(payload): Json<ApprovalAnswerPayload>,
+) -> Response {
+    match state.pending_approvals.answer(&id, payload).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (
+            error.status_code(),
+            Json(json!({"ok": false, "error": error.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn api_get_providers(State(state): State<AppState>) -> Json<Value> {
@@ -504,6 +725,7 @@ async fn api_get_providers(State(state): State<AppState>) -> Json<Value> {
                 "default_model": provider.default_model,
                 "description": provider.description,
                 "web_supported": provider.auth != AuthKind::Account,
+                "has_api_key": config.provider_api_key(provider.id).is_some(),
             })
         })
         .collect::<Vec<_>>();
@@ -517,6 +739,7 @@ async fn api_get_providers(State(state): State<AppState>) -> Json<Value> {
             "web_search_enabled": config.web_search_enabled,
             "memory_enabled": config.memory_enabled,
             "memory_max_age_days": config.memory_max_age_days,
+            "sandbox_mode": config.web_sandbox_mode,
         }
     }))
 }
@@ -556,12 +779,17 @@ async fn api_set_provider(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let api_key = supplied_key.or_else(|| {
-        existing
-            .as_ref()
-            .filter(|selection| selection.provider_id == provider_id)
-            .and_then(|selection| selection.api_key().map(str::to_string))
-    });
+    let api_key = state
+        .config
+        .read()
+        .await
+        .resolve_provider_api_key(provider_id, supplied_key)
+        .or_else(|| {
+            existing
+                .as_ref()
+                .filter(|selection| selection.provider_id == provider_id)
+                .and_then(|selection| selection.api_key().map(str::to_string))
+        });
     let base_url = payload
         .get("base_url")
         .and_then(Value::as_str)
@@ -599,8 +827,11 @@ async fn api_set_provider(
         }
         if let Some(days) = payload.get("memory_max_age_days").and_then(Value::as_u64) {
             config.memory_max_age_days = u32::try_from(days).unwrap_or(3_650);
-            config.normalize();
         }
+        if let Some(mode) = payload.get("sandbox_mode").and_then(Value::as_str) {
+            config.web_sandbox_mode = mode.to_string();
+        }
+        config.normalize();
         config.save(&state.paths.config_file)?;
     }
     Ok(Json(json!({
@@ -631,12 +862,83 @@ async fn api_set_config(
 
 async fn api_models(State(state): State<AppState>) -> Json<Value> {
     let cfg = state.config.read().await.clone();
-    let models = state.llama.list_models(&cfg).await.unwrap_or_default();
-    if models.is_empty() {
-        Json(json!([cfg.default_model]))
-    } else {
-        Json(json!(models.into_iter().map(|m| m.id).collect::<Vec<_>>()))
+    let models = state
+        .llama
+        .list_models(&cfg)
+        .await
+        .unwrap_or_else(|_| llama::known_models(&cfg.provider_id));
+    Json(json!(llama::model_ids(models, &cfg.default_model)))
+}
+
+async fn api_preview_models(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Response, AppError> {
+    let provider_id = payload
+        .get("provider_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let Some(provider) = preset(provider_id) else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "Unknown provider"})),
+        )
+            .into_response());
+    };
+    if provider.auth == AuthKind::Account {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": "Account providers expose models through the terminal agent"
+            })),
+        )
+            .into_response());
     }
+
+    let settings = ProviderSettingsStore::new(state.paths.store_dir.join("providers.json"));
+    let existing = settings.load()?;
+    let supplied_key = payload
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let api_key = state
+        .config
+        .read()
+        .await
+        .resolve_provider_api_key(provider_id, supplied_key)
+        .or_else(|| {
+            existing
+                .as_ref()
+                .filter(|selection| selection.provider_id == provider_id)
+                .and_then(|selection| selection.api_key().map(str::to_string))
+        });
+    let base_url = payload
+        .get("base_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let selection = match ProviderSelection::from_choice(provider_id.to_string(), api_key, base_url)
+    {
+        Ok(selection) => selection,
+        Err(_) => {
+            let models = llama::model_ids(llama::known_models(provider_id), provider.default_model);
+            return Ok(Json(json!(models)).into_response());
+        }
+    };
+    let mut cfg = state.config.read().await.clone();
+    apply_provider_selection(&selection, &mut cfg);
+    let models = state
+        .llama
+        .list_models(&cfg)
+        .await
+        .unwrap_or_else(|_| llama::known_models(provider_id));
+    Ok(Json(json!(llama::model_ids(models, &selection.model))).into_response())
 }
 
 async fn api_get_memory(State(state): State<AppState>) -> Json<Value> {
@@ -711,9 +1013,10 @@ async fn api_memory_clear(State(state): State<AppState>) -> Result<Json<Value>, 
 }
 
 async fn api_skills(State(state): State<AppState>) -> Json<Value> {
+    let workspace = current_workspace(&state).await;
     Json(json!({
-        "skills": skills::discover(&state.skill_workspace),
-        "workspace": state.skill_workspace.as_path(),
+        "skills": skills::discover(&workspace),
+        "workspace": workspace,
     }))
 }
 
@@ -721,7 +1024,8 @@ async fn api_skill_inspect(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Json<Value> {
-    match skills::load(&state.skill_workspace, &name) {
+    let workspace = current_workspace(&state).await;
+    match skills::load(&workspace, &name) {
         Ok(skill) => Json(json!({
             "ok": true,
             "skill": skill.summary,
@@ -744,7 +1048,7 @@ async fn api_skill_install(
     if source.is_empty() {
         return Json(json!({"ok": false, "error": "source required"}));
     }
-    let workspace = state.skill_workspace.clone();
+    let workspace = current_workspace(&state).await;
     match tokio::task::spawn_blocking(move || skills::install(&source, &workspace)).await {
         Ok(Ok(skill)) => Json(json!({"ok": true, "skill": skill})),
         Ok(Err(error)) => Json(json!({"ok": false, "error": error.to_string()})),
@@ -756,7 +1060,7 @@ async fn api_skill_update(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Json<Value> {
-    let workspace = state.skill_workspace.clone();
+    let workspace = current_workspace(&state).await;
     match tokio::task::spawn_blocking(move || skills::update(&name, &workspace)).await {
         Ok(Ok(skill)) => Json(json!({"ok": true, "skill": skill})),
         Ok(Err(error)) => Json(json!({"ok": false, "error": error.to_string()})),
@@ -768,7 +1072,8 @@ async fn api_skill_verify(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Json<Value> {
-    match skills::verify(&state.skill_workspace, &name) {
+    let workspace = current_workspace(&state).await;
+    match skills::verify(&workspace, &name) {
         Ok(report) => Json(json!({"ok": true, "report": report})),
         Err(error) => Json(json!({"ok": false, "error": error.to_string()})),
     }
@@ -788,7 +1093,8 @@ async fn api_skill_activate(
     State(state): State<AppState>,
     AxumPath((name, cid)): AxumPath<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
-    let skill = match skills::load(&state.skill_workspace, &name) {
+    let workspace = current_workspace(&state).await;
+    let skill = match skills::load(&workspace, &name) {
         Ok(skill) => skill,
         Err(error) => return Ok(Json(json!({"ok": false, "error": error.to_string()}))),
     };
@@ -816,7 +1122,8 @@ async fn api_skill_activate(
 }
 
 async fn api_runtime_profile(State(state): State<AppState>) -> Json<Value> {
-    Json(state.runtime_profile.as_json())
+    let paths = runtime_paths(&state).await;
+    Json(RuntimeProfile::detect(&paths).as_json())
 }
 
 async fn api_list_chats(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -943,6 +1250,102 @@ async fn api_chat_tasks(
     AxumPath(cid): AxumPath<String>,
 ) -> Result<Json<Value>, AppError> {
     Ok(Json(workflow_tasks::task_list(&state.paths, &cid)?))
+}
+
+async fn api_agents(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    Ok(Json(workflow_tasks::agent_list(&state.paths, None)?))
+}
+
+async fn api_launch_agent(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> Result<Response, AppError> {
+    let prompt = payload
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(prompt) = prompt else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Subagent prompt is required"})),
+        )
+            .into_response());
+    };
+    let description = payload
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Subagent manual");
+    let subagent_type = payload
+        .get("subagent_type")
+        .and_then(Value::as_str)
+        .unwrap_or("general-purpose");
+    let provider_id = payload
+        .get("provider_id")
+        .and_then(Value::as_str)
+        .unwrap_or("inherit");
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let scope = payload
+        .get("scope")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("manual");
+    let cfg = state.config.read().await.clone();
+    let execution_paths = runtime_paths(&state).await;
+    let runtime_profile = RuntimeProfile::detect(&execution_paths);
+    let memory_block = cfg
+        .memory_enabled
+        .then(|| state.memory.agent_memory_block(&cfg));
+    match crate::tools::launch_background_subagent(
+        &state.llama,
+        &cfg,
+        &execution_paths,
+        &cfg.default_model,
+        &runtime_profile,
+        &state.pending_questions,
+        &state.pending_approvals,
+        &state.runtime,
+        Some(state.config.clone()),
+        state.local_web,
+        scope,
+        description,
+        prompt,
+        subagent_type,
+        provider_id,
+        model,
+        memory_block,
+    )
+    .await
+    {
+        Ok(result) => Ok(Json(result).into_response()),
+        Err(error) => Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response()),
+    }
+}
+
+async fn api_agent(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+) -> Result<Response, AppError> {
+    let value = workflow_tasks::agent_get(&state.paths, &agent_id)?;
+    if value.get("agent").is_none_or(Value::is_null) {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Subagent not found"})),
+        )
+            .into_response());
+    }
+    Ok(Json(value).into_response())
 }
 
 async fn api_stop_task(
@@ -1133,11 +1536,12 @@ async fn api_generate(
 
     let cfg = state.config.read().await.clone();
     let chat = load_chat(&state.paths, &cid)?;
+    let execution_paths = runtime_paths(&state).await;
     let (model, _) = resolve_model(&state.llama, &cfg, payload.model.as_deref()).await;
     match generate_document(
         &state.llama,
         &cfg,
-        &state.paths,
+        &execution_paths,
         Some(state.memory.clone()),
         &model,
         &payload.query,
@@ -1173,6 +1577,8 @@ async fn api_stream(
         let result = async move {
             let cfg = state_clone.config.read().await.clone();
             let chat = load_chat(&state_clone.paths, &cid)?;
+            let execution_paths = runtime_paths(&state_clone).await;
+            let runtime_profile = RuntimeProfile::detect(&execution_paths);
             let (model, known_models) = resolve_model(
                 &state_clone.llama,
                 &cfg,
@@ -1181,17 +1587,19 @@ async fn api_stream(
             let plan = prepare_streaming_response_with_uploads(
                 &state_clone.llama,
                 &cfg,
-                &state_clone.paths,
+                &execution_paths,
                 Some(state_clone.memory.clone()),
-                &state_clone.runtime_profile,
+                &runtime_profile,
                 &model,
                 &known_models,
                 &params.query,
                 &chat.messages,
                 Some(&cid),
                 &state_clone.pending_questions,
+                &state_clone.pending_approvals,
                 &state_clone.runtime,
                 Some(state_clone.config.clone()),
+                state_clone.local_web,
             ).await;
             Ok::<_, anyhow::Error>((cfg, model, plan))
         }.await;
@@ -1481,47 +1889,45 @@ async fn api_whatsapp_inbound(
     }
 
     if content.eq_ignore_ascii_case("/skills") {
-        let reply = skills::render_catalog(&state.skill_workspace);
+        let workspace = current_workspace(&state).await;
+        let reply = skills::render_catalog(&workspace);
         send_whatsapp_message(&cfg, chat_jid, &reply).await;
         return Ok(Json(
             json!({"ok": true, "reply": reply, "command": "skills"}),
         ));
     }
     if let Some(arguments) = content.strip_prefix("/skill ") {
+        let workspace = current_workspace(&state).await;
         let (action, value) = arguments
             .trim()
             .split_once(char::is_whitespace)
             .map(|(action, value)| (action.to_ascii_lowercase(), value.trim()))
             .unwrap_or((arguments.trim().to_ascii_lowercase(), ""));
         let reply = match action.as_str() {
-            "use" | "activate" if !value.is_empty() => {
-                match skills::load(&state.skill_workspace, value) {
-                    Ok(skill) => {
-                        let mut skill_extra = Map::new();
-                        skill_extra.insert("channel".into(), json!("whatsapp"));
-                        skill_extra.insert("type".into(), json!("skill_activation"));
-                        skill_extra.insert("skill".into(), json!(skill.summary.name));
-                        append_msg(
-                            &state.paths,
-                            &cfg,
-                            &cid,
-                            "system",
-                            Value::String(skills::render_for_model(&skill)),
-                            skill_extra,
-                        )?;
-                        format!(
-                            "Skillul `{}` este activ în acest chat. Permisiunile nu au fost \
+            "use" | "activate" if !value.is_empty() => match skills::load(&workspace, value) {
+                Ok(skill) => {
+                    let mut skill_extra = Map::new();
+                    skill_extra.insert("channel".into(), json!("whatsapp"));
+                    skill_extra.insert("type".into(), json!("skill_activation"));
+                    skill_extra.insert("skill".into(), json!(skill.summary.name));
+                    append_msg(
+                        &state.paths,
+                        &cfg,
+                        &cid,
+                        "system",
+                        Value::String(skills::render_for_model(&skill)),
+                        skill_extra,
+                    )?;
+                    format!(
+                        "Skillul `{}` este activ în acest chat. Permisiunile nu au fost \
                              modificate.",
-                            skill.summary.name
-                        )
-                    }
-                    Err(error) => format!("Nu pot activa skillul: {error}"),
+                        skill.summary.name
+                    )
                 }
-            }
-            "inspect" | "show" if !value.is_empty() => {
-                skills::inspect(&state.skill_workspace, value)
-                    .unwrap_or_else(|error| format!("Nu pot inspecta skillul: {error}"))
-            }
+                Err(error) => format!("Nu pot activa skillul: {error}"),
+            },
+            "inspect" | "show" if !value.is_empty() => skills::inspect(&workspace, value)
+                .unwrap_or_else(|error| format!("Nu pot inspecta skillul: {error}")),
             "install" | "update" | "remove" | "uninstall" => {
                 "Din motive de securitate, instalarea și ștergerea skillurilor se confirmă \
                  local în Agent sau WebTool."
@@ -1544,21 +1950,25 @@ async fn api_whatsapp_inbound(
         extra,
     )?;
     let chat = load_chat(&state.paths, &cid)?;
+    let execution_paths = runtime_paths(&state).await;
+    let runtime_profile = RuntimeProfile::detect(&execution_paths);
     let (model, known_models) = resolve_model(&state.llama, &cfg, None).await;
     let reply = generate_chat_response_with_uploads(
         &state.llama,
         &cfg,
-        &state.paths,
+        &execution_paths,
         Some(state.memory.clone()),
-        &state.runtime_profile,
+        &runtime_profile,
         &model,
         &known_models,
         &content,
         &chat.messages,
         Some(&cid),
         &state.pending_questions,
+        &state.pending_approvals,
         &state.runtime,
         Some(state.config.clone()),
+        state.local_web,
     )
     .await;
     append_msg(
@@ -1684,6 +2094,7 @@ fn apply_provider_selection(selection: &ProviderSelection, config: &mut AppConfi
     config.provider_id = selection.provider_id.clone();
     config.provider_protocol = selection.protocol_name().to_string();
     config.default_model = selection.model.clone();
+    config.remember_provider_api_key(&selection.provider_id, selection.api_key());
     config.llama_api_key = selection.api_key().unwrap_or_default().to_string();
     if let Some(base_url) = selection.resolved_base_url() {
         config.llama_base_url = base_url.to_string();
@@ -1778,15 +2189,173 @@ async fn handle_whatsapp_command(state: &AppState, chat_id: &str, command: &str)
         "/status" => {
             let cfg = state.config.read().await;
             let bridge_running = state.whatsapp.is_running().await;
+            let workspace = current_workspace(state).await;
             let status_text = if bridge_running {
                 "🟢 Bridge running"
             } else {
                 "🔴 Bridge stopped"
             };
             Some(format!(
-                "WhatsApp Status: {}\nAssistant: {}\nProvider: {}\nModel: {}",
-                status_text, cfg.whatsapp_assistant_name, cfg.provider_id, cfg.default_model
+                "WhatsApp Status: {}\nAssistant: {}\nProvider: {}\nModel: {}\nFolder: {}\nSandbox: {}",
+                status_text,
+                cfg.whatsapp_assistant_name,
+                cfg.provider_id,
+                cfg.default_model,
+                workspace.display(),
+                cfg.web_sandbox_mode,
             ))
+        }
+
+        "/workspace" => {
+            let workspace = current_workspace(state).await;
+            Some(format!(
+                "📁 Folderul comun WebTool + WhatsApp este:\n{}\n\nSchimbă-l din selectorul local WebTool.",
+                workspace.display()
+            ))
+        }
+
+        "/sandbox" => {
+            let cfg = state.config.read().await;
+            Some(format!(
+                "🛡️ Mod comun: {}\nAprobările pentru scrieri/comenzi și autentificarea sudo se fac local în WebTool.",
+                cfg.web_sandbox_mode
+            ))
+        }
+
+        "/agents" => match workflow_tasks::agent_list(&state.paths, None) {
+            Ok(value) => {
+                let agents = value
+                    .get("agents")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if agents.is_empty() {
+                    return Some("Nu există încă subagenți.".into());
+                }
+                let mut reply = format!(
+                    "🤖 Subagenți comuni — {} activi / {} total\n\n",
+                    value.get("running").and_then(Value::as_u64).unwrap_or(0),
+                    agents.len()
+                );
+                for agent in agents.iter().take(12) {
+                    let status = agent.get("status").and_then(Value::as_str).unwrap_or("?");
+                    let icon = match status {
+                        "running" | "in_progress" | "pending" => "🟡",
+                        "completed" => "🟢",
+                        "failed" => "🔴",
+                        "killed" | "cancelled" => "⚫",
+                        _ => "⚪",
+                    };
+                    let metadata = agent.get("metadata").and_then(Value::as_object);
+                    let profile = metadata
+                        .and_then(|meta| meta.get("agent_type"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("general-purpose");
+                    let provider = metadata
+                        .and_then(|meta| meta.get("provider_id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("inherit");
+                    reply.push_str(&format!(
+                        "{} {} · {} · {}/{} · {}\n   {}\n",
+                        icon,
+                        agent.get("id").and_then(Value::as_str).unwrap_or("?"),
+                        profile,
+                        provider,
+                        agent
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .unwrap_or("inherit"),
+                        status,
+                        agent
+                            .get("subject")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Subagent")
+                    ));
+                }
+                reply.push_str("\nDetalii: /agent ID · Oprire: /stopagent ID");
+                Some(reply)
+            }
+            Err(error) => Some(format!("Nu pot citi subagenții: {error}")),
+        },
+
+        "/agent" => {
+            let Some(agent_id) = parts.get(1) else {
+                return Some("Folosește /agent ID".into());
+            };
+            match workflow_tasks::agent_get(&state.paths, agent_id) {
+                Ok(value) => {
+                    let Some(agent) = value.get("agent").filter(|value| !value.is_null()) else {
+                        return Some(format!("Subagentul {agent_id} nu există."));
+                    };
+                    let output = agent.get("output").and_then(Value::as_str).unwrap_or("");
+                    let mut preview = output.chars().rev().take(3_500).collect::<String>();
+                    preview = preview.chars().rev().collect();
+                    Some(format!(
+                        "🤖 {}\nStare: {}\nTip: {}\nProvider/model: {}/{}\nTask: {}\n\n{}",
+                        agent.get("id").and_then(Value::as_str).unwrap_or(agent_id),
+                        agent.get("status").and_then(Value::as_str).unwrap_or("?"),
+                        agent
+                            .get("agentType")
+                            .and_then(Value::as_str)
+                            .unwrap_or("general-purpose"),
+                        agent
+                            .get("metadata")
+                            .and_then(|meta| meta.get("provider_id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("inherit"),
+                        agent
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .unwrap_or("inherit"),
+                        agent
+                            .get("subject")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Subagent"),
+                        if preview.trim().is_empty() {
+                            "Fără output încă."
+                        } else {
+                            preview.trim()
+                        }
+                    ))
+                }
+                Err(error) => Some(format!("Nu pot citi subagentul: {error}")),
+            }
+        }
+
+        "/stopagent" => {
+            let Some(agent_id) = parts.get(1) else {
+                return Some("Folosește /stopagent ID".into());
+            };
+            let status = workflow_tasks::agent_get(&state.paths, agent_id)
+                .ok()
+                .and_then(|value| value.get("agent").cloned())
+                .and_then(|agent| {
+                    agent
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+            if status.is_none() {
+                return Some(format!("Subagentul {agent_id} nu există."));
+            }
+            if status.as_deref().is_some_and(|status| {
+                matches!(status, "completed" | "failed" | "killed" | "cancelled")
+            }) {
+                return Some(format!(
+                    "Subagentul {agent_id} este deja {}.",
+                    status.unwrap()
+                ));
+            }
+            match workflow_tasks::task_stop(&state.paths, chat_id, agent_id) {
+                Ok(_) => {
+                    let stopped = state.runtime.stop(agent_id).await;
+                    Some(format!(
+                        "{} Subagentul {agent_id} a fost oprit.",
+                        if stopped { "✓" } else { "⚠" }
+                    ))
+                }
+                Err(error) => Some(format!("Nu pot opri subagentul: {error}")),
+            }
         }
 
         "/restart" => {
@@ -1805,6 +2374,11 @@ async fn handle_whatsapp_command(state: &AppState, chat_id: &str, command: &str)
                 /forget <id> - Remove a memory\n\
                 /memories - List all memories\n\
                 /status - Show WhatsApp and AI status\n\
+                /workspace - Show the shared working folder\n\
+                /sandbox - Show the shared execution policy\n\
+                /agents - List shared subagents\n\
+                /agent <id> - Show a subagent and its output\n\
+                /stopagent <id> - Stop a running subagent\n\
                 /restart - Restart the WhatsApp bridge\n\
                 /help - Show this help message"
                 .to_string(),
@@ -1859,5 +2433,18 @@ mod web_security_tests {
         assert!(seen.ids.len() <= WA_SEEN_LIMIT);
         assert!(seen.order.len() <= WA_SEEN_LIMIT);
         assert!(!seen.remember("first".into()));
+    }
+
+    #[test]
+    fn provider_key_map_is_never_exposed_to_the_browser() {
+        let mut config = AppConfig::default();
+        config.remember_provider_api_key("openai", Some("sk-browser-must-not-see"));
+        config.llama_api_key = "sk-browser-must-not-see".into();
+
+        let value = public_config_value(&config);
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(value.get("provider_api_keys").is_none());
+        assert_eq!(value["llama_api_key"], json!(""));
+        assert!(!serialized.contains("sk-browser-must-not-see"));
     }
 }
