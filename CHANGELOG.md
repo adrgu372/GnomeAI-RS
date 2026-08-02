@@ -8,6 +8,9 @@
   that process disappears, preventing stale listeners on port `8788`.
 - Project skills, including the eToro app skill, are copied into Debian
   packages under `/usr/share/gnomeai-rs/skills`.
+- WebTool now recognizes `omni` vision models and reads OpenRouter
+  `architecture.input_modalities`, so image-capable models are no longer
+  rejected when their identifier does not contain `vision` or `vl`.
 
 - Terminal `Ctrl+V` now sends clipboard images as real multimodal request
   parts to compatible OpenAI and Anthropic API providers. Only images captured

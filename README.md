@@ -20,6 +20,8 @@ Highlights:
 * tool loops synthesize a final answer when their round limit is reached;
 * WhatsApp bridge processes exit when their WebTool parent disappears;
 * the bundled eToro app skill is included in Debian packages;
+* WebTool recognizes `omni` models and OpenRouter image-input metadata for
+  vision requests;
 * the terminal, multimodal, WhatsApp SSE and QR improvements from `v1.0` remain
   included and are now documented in the source release.
 
