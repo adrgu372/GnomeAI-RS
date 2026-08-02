@@ -22,6 +22,7 @@ const bridgePort = Number(process.env.GNOME_WA_BRIDGE_PORT || 8788);
 const assistantName = process.env.GNOME_WA_ASSISTANT_NAME || 'Gnome AI';
 const webToken = process.env.GNOMEF_WEB_TOKEN || '';
 const hasOwnNumber = process.env.GNOME_WA_HAS_OWN_NUMBER === '1';
+const ownerPid = process.ppid;
 const maxInboundMediaBytes = Number(
   process.env.GNOME_WA_MAX_MEDIA_BYTES || 15 * 1024 * 1024,
 );
@@ -552,6 +553,17 @@ const server = http.createServer(async (req, res) => {
 server.listen(bridgePort, '127.0.0.1', () => {
   logger.info({ bridgePort }, 'Gnome WhatsApp bridge listening');
 });
+
+// Do not leave an orphan bridge holding the API port when WebTool is stopped
+// externally or crashes before it can call /shutdown.
+const ownerWatchdog = setInterval(() => {
+  if (shuttingDown || (ownerPid > 1 && process.ppid === ownerPid)) return;
+  logger.warn({ ownerPid, currentParentPid: process.ppid }, 'WebTool parent exited');
+  gracefulShutdown()
+    .then(() => process.exit(0))
+    .catch(() => process.exit(1));
+}, 1000);
+ownerWatchdog.unref();
 
 connectInternal().catch((err) => {
   state.last_error = err?.message || String(err);

@@ -42,6 +42,10 @@ mkdir -p \
     "$package_root/usr/share/gnomeai-rs/skills" \
     "$package_root/usr/share/gnomeai-rs/whatsapp"
 
+if [[ -d skills ]]; then
+    cp -a skills/. "$package_root/usr/share/gnomeai-rs/skills/"
+fi
+
 install -m 0755 target/release/gnomef-rs "$package_root/usr/lib/gnomeai-rs/gnomef-rs"
 install -m 0755 target/release/gnomef-web "$package_root/usr/lib/gnomeai-rs/gnomef-web"
 if command -v strip >/dev/null 2>&1; then
@@ -136,7 +140,7 @@ install -m 0644 packaging/icons/gnomeai-rs-agent.svg \
 install -m 0644 packaging/icons/gnomeai-rs-webtool.svg \
     "$package_root/usr/share/icons/hicolor/scalable/apps/gnomeai-rs-webtool.svg"
 
-install -m 0644 COPYING "$package_root/usr/share/doc/gnomeai-rs/LICENSE"
+install -m 0644 LICENSE "$package_root/usr/share/doc/gnomeai-rs/LICENSE"
 install -m 0644 README.md "$package_root/usr/share/doc/gnomeai-rs/README.md"
 install -m 0644 SECURITY-AUDIT-REMEDIATION.md \
     "$package_root/usr/share/doc/gnomeai-rs/SECURITY-AUDIT-REMEDIATION.md"

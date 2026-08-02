@@ -1,4 +1,13 @@
-# Unreleased — clipboard images and WhatsApp status
+# GnomeAI-RS 1.1.0 - 2026-08-02
+
+- Fixed agent turns that stopped after displaying an intermediate tool status:
+  textual tool calls from local model templates are now recognized and run.
+- Tool loops now always synthesize a final response when the execution round
+  limit is reached instead of leaving the user with a progress message.
+- The WhatsApp bridge watches its WebTool parent process and exits cleanly when
+  that process disappears, preventing stale listeners on port `8788`.
+- Project skills, including the eToro app skill, are copied into Debian
+  packages under `/usr/share/gnomeai-rs/skills`.
 
 - Terminal `Ctrl+V` now sends clipboard images as real multimodal request
   parts to compatible OpenAI and Anthropic API providers. Only images captured

@@ -60,6 +60,9 @@ pub async fn run_tool_loop(
         &build_runtime_aware_system_prompt(system_prompt, runtime_profile),
         memory_block,
     );
+    let runtime_aware_system_prompt = format!(
+        "{runtime_aware_system_prompt}\n\nWhen a tool is needed, call it through the native tool-calling API. Never print a tool call as markdown such as `**WebSearch** (query: ...)`. After receiving tool results, answer the user directly instead of announcing another intermediate step."
+    );
     let mut messages = vec![
         json!({"role": "system", "content": runtime_aware_system_prompt}),
         json!({"role": "user", "content": user_prompt}),
@@ -69,6 +72,7 @@ pub async fn run_tool_loop(
     let mut final_content = String::new();
     let mut structured_output_only = false;
     let mut tool_observations = Vec::new();
+    let mut exhausted_steps = true;
     let tool_ctx = ToolContext {
         session_key: session_key
             .map(normalize_ws)
@@ -106,19 +110,23 @@ pub async fn run_tool_loop(
             }
         };
 
-        let normalized_calls = response
+        let mut normalized_calls = response
             .tool_calls
             .iter()
             .filter_map(normalize_tool_call)
             .collect::<Vec<_>>();
         if normalized_calls.is_empty() {
-            final_content = response.content;
+            normalized_calls = parse_textual_tool_calls(&response.content);
+        }
+        if normalized_calls.is_empty() {
+            final_content = unwrap_textual_assistant_reply(&response.content);
+            exhausted_steps = false;
             break;
         }
 
         messages.push(json!({
             "role": "assistant",
-            "content": response.content,
+            "content": content_before_textual_tool_call(&response.content),
             "tool_calls": normalized_calls,
         }));
 
@@ -209,8 +217,23 @@ pub async fn run_tool_loop(
         {
             final_content = structured_output.unwrap_or_default();
             structured_output_only = true;
+            exhausted_steps = false;
             break;
         }
+    }
+
+    if exhausted_steps && !structured_output_only {
+        messages.push(json!({
+            "role": "user",
+            "content": "Tool round limit reached. Do not call or describe any more tools. Answer the original user request now using the tool results already present above. Return only the final answer."
+        }));
+        final_content = match client.chat(cfg, model, messages, 0.2).await {
+            Ok(response) => unwrap_textual_assistant_reply(&response.content),
+            Err(err) => {
+                warn!("Final synthesis after tool round limit failed: {err}");
+                String::new()
+            }
+        };
     }
 
     let trimmed = final_content.trim();
@@ -386,6 +409,180 @@ fn normalize_tool_call(tool_call: &Value) -> Option<Value> {
             "arguments": arguments,
         }
     }))
+}
+
+/// Some local chat templates render a native tool decision as markdown prose
+/// instead of populating `message.tool_calls`. Accept that narrow legacy shape
+/// only for tools that are actually registered, so normal bold text cannot
+/// accidentally execute anything.
+fn parse_textual_tool_calls(content: &str) -> Vec<Value> {
+    let trimmed = content.trim();
+    let Some(after_open) = trimmed.strip_prefix("**") else {
+        return Vec::new();
+    };
+    let Some((raw_name, rest)) = after_open.split_once("**") else {
+        return Vec::new();
+    };
+    let Some(arguments) = rest
+        .trim()
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+    else {
+        return Vec::new();
+    };
+    let Some(name) = canonical_tool_name(raw_name.trim()) else {
+        return Vec::new();
+    };
+    let args = parse_textual_arguments(arguments);
+    vec![json!({
+        "id": format!("call_{}", &Uuid::new_v4().simple().to_string()[..8]),
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": Value::Object(args).to_string(),
+        }
+    })]
+}
+
+fn canonical_tool_name(candidate: &str) -> Option<&'static str> {
+    tool_metadata().into_iter().find_map(|meta| {
+        (meta.name.eq_ignore_ascii_case(candidate)
+            || meta
+                .aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(candidate)))
+        .then_some(meta.name)
+    })
+}
+
+fn parse_textual_arguments(input: &str) -> Map<String, Value> {
+    let mut args = Map::new();
+    for field in split_top_level(input, ',') {
+        let Some((key, raw_value)) = split_once_top_level(field, ':') else {
+            continue;
+        };
+        let key = key.trim().trim_matches(|ch| matches!(ch, '`' | '\'' | '"'));
+        if key.is_empty() {
+            continue;
+        }
+        args.insert(key.to_string(), parse_textual_value(raw_value.trim()));
+    }
+    args
+}
+
+fn parse_textual_value(raw: &str) -> Value {
+    if raw.starts_with('"') && raw.ends_with('"') {
+        return serde_json::from_str(raw).unwrap_or_else(|_| json!(raw.trim_matches('"')));
+    }
+    if (raw.starts_with('\'') && raw.ends_with('\''))
+        || (raw.starts_with('`') && raw.ends_with('`'))
+    {
+        return json!(&raw[1..raw.len().saturating_sub(1)]);
+    }
+    serde_json::from_str(raw).unwrap_or_else(|_| json!(raw))
+}
+
+fn split_top_level(input: &str, separator: char) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut depth = 0u32;
+    for (index, ch) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote.is_some() && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if matches!(ch, '"' | '\'' | '`') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            }
+            continue;
+        }
+        if quote.is_some() {
+            continue;
+        }
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ if ch == separator && depth == 0 => {
+                fields.push(input[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    fields.push(input[start..].trim());
+    fields
+}
+
+fn split_once_top_level(input: &str, separator: char) -> Option<(&str, &str)> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut depth = 0u32;
+    for (index, ch) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote.is_some() && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if matches!(ch, '"' | '\'' | '`') {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            }
+            continue;
+        }
+        if quote.is_some() {
+            continue;
+        }
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ if ch == separator && depth == 0 => {
+                return Some((input[..index].trim(), input[index + ch.len_utf8()..].trim()));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn content_before_textual_tool_call(content: &str) -> &str {
+    let trimmed = content.trim();
+    if parse_textual_tool_calls(trimmed).is_empty() {
+        content
+    } else {
+        ""
+    }
+}
+
+fn unwrap_textual_assistant_reply(content: &str) -> String {
+    let trimmed = content.trim();
+    let Some(rest) = trimmed.strip_prefix("**Assistant**") else {
+        return content.to_string();
+    };
+    let Some(arguments) = rest
+        .trim()
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+    else {
+        return content.to_string();
+    };
+    parse_textual_arguments(arguments)
+        .remove("reply")
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| content.to_string())
 }
 
 fn tool_search(args: &Map<String, Value>) -> anyhow::Result<Value> {
@@ -2496,6 +2693,64 @@ mod tests {
         Json, Router,
         routing::{get, post},
     };
+
+    #[test]
+    fn parses_markdown_web_search_as_a_real_tool_call() {
+        let calls = parse_textual_tool_calls(
+            r#"**WebSearch** (query: "IBM Series/1 programming interface", language: Romanian)"#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].pointer("/function/name"),
+            Some(&json!("WebSearch"))
+        );
+        let args: Value = serde_json::from_str(
+            calls[0]
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(args["query"], "IBM Series/1 programming interface");
+        assert_eq!(args["language"], "Romanian");
+    }
+
+    #[test]
+    fn parses_markdown_task_output_and_aliases() {
+        let calls = parse_textual_tool_calls(
+            "**AgentOutputTool** (taskId : websearch-ibm-series-1, block: true)",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].pointer("/function/name"),
+            Some(&json!("TaskOutput"))
+        );
+        let args: Value = serde_json::from_str(
+            calls[0]
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(args["taskId"], "websearch-ibm-series-1");
+        assert_eq!(args["block"], true);
+    }
+
+    #[test]
+    fn does_not_execute_unknown_markdown_labels() {
+        assert!(parse_textual_tool_calls("**Assistant** (reply: hello)").is_empty());
+        assert!(parse_textual_tool_calls("**Important** (note: hello)").is_empty());
+    }
+
+    #[test]
+    fn unwraps_markdown_assistant_reply() {
+        assert_eq!(
+            unwrap_textual_assistant_reply(
+                r#"**Assistant** (reply: "Salut! Sunt aici și gata să te ajut.")"#,
+            ),
+            "Salut! Sunt aici și gata să te ajut."
+        );
+    }
 
     #[tokio::test]
     async fn background_bash_creates_completed_task_output() {
