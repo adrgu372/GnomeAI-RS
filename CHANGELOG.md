@@ -1,4 +1,4 @@
-# GnomeAI-RS 1.1.0 - 2026-08-02
+# GnomeAI-RS 1.1.1 - 2026-08-02
 
 - Fixed agent turns that stopped after displaying an intermediate tool status:
   textual tool calls from local model templates are now recognized and run.

@@ -3,7 +3,7 @@ GnomeAI-RS — pachet Debian Linux x86_64
 
 Instalare:
 
-  sudo apt install ./gnomeai-rs_1.1.0_amd64.deb
+  sudo apt install ./gnomeai-rs_1.1.1_amd64.deb
 
 Doar instalarea pachetului cere drepturi administrative. După instalare,
 Agentul și WebTool rulează ca utilizatorul curent și nu trebuie pornite cu

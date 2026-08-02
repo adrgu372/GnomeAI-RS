@@ -4,12 +4,12 @@ Open-source personal AI agent in Rust: coding-agent TUI, self-hosted WebTool,
 optional WhatsApp assistant, multiple model providers, persistent memory,
 installable skills, and explicit execution permissions.
 
-Current release: **1.1.0**. See the release notes below for the complete
+Current release: **1.1.1**. See the release notes below for the complete
 list of changes.
 
-## Release Notes - 1.1.0
+## Release Notes - 1.1.1
 
-Version **1.1.0** fixes agent tasks that stopped after an intermediate tool
+Version **1.1.1** fixes agent tasks that stopped after an intermediate tool
 status and prevents orphan WhatsApp bridges from keeping port `8788` occupied.
 It also packages the tracked skills with the Debian installer.
 
