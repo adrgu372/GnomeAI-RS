@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow, bail};
-use futures_util::future::join_all;
+use futures_util::{StreamExt, future::join_all};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use tokio::{
@@ -24,12 +24,13 @@ use crate::{
     config::AppConfig,
     consistency::{ToolObservation, enforce_final_answer},
     firecrawl::{firecrawl_fetch, firecrawl_search},
-    llama::LlamaClient,
+    llama::{ChatStreamEvent, LlamaClient, LlamaResponse},
     memory::append_memory_block,
     privilege::{
         clear_keyring_secret, command_requests_privilege, keyring_available, lookup_keyring_secret,
         store_keyring_secret, validate_sudo,
     },
+    protocol::Event,
     provider_catalog::{AuthKind, WireProtocol, preset},
     questions::PendingQuestions,
     runtime::RuntimeHandles,
@@ -38,9 +39,151 @@ use crate::{
     skills,
     storage::AppPaths,
     tasks,
+    turn_stream::TurnStream,
     vision::SYSTEM_PROMPT,
     web_approvals::PendingApprovals,
 };
+
+/// Ceiling on the serialized conversation carried between tool rounds.
+///
+/// Rounds are unbounded, so something else has to stop a loop that keeps
+/// producing large tool results. Sized to leave room under a 128k-token
+/// context after the system prompt and tool schemas.
+const MAX_LOOP_CONTEXT_BYTES: usize = 256 * 1024;
+
+/// How many trailing messages stay verbatim when the loop compacts.
+const COMPACTION_KEEP_RECENT: usize = 6;
+
+/// Ceiling on the generated summary, so folding cannot grow the context.
+const MAX_SUMMARY_BYTES: usize = 6 * 1024;
+
+/// Cheap stand-in for a token count. Every provider ships a different
+/// tokenizer, and this only has to be right to within a factor of two.
+fn context_bytes(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .map(|message| message.to_string().len())
+        .sum()
+}
+
+fn message_role(message: &Value) -> &str {
+    message["role"].as_str().unwrap_or_default()
+}
+
+/// The stretch of conversation to fold into one summary.
+#[derive(Debug, PartialEq, Eq)]
+struct MessageCompaction {
+    range: std::ops::Range<usize>,
+    freed_bytes: usize,
+}
+
+/// Decide what to fold away. `None` means there is nothing safe to do.
+///
+/// Two rules that are not optional, both inherited from the terminal agent's
+/// store:
+///
+/// 1. Never cut between an assistant message carrying tool calls and its
+///    matching tool results. Every provider rejects a dangling tool call, and
+///    the error message is never about that. The cut walks backwards until no
+///    tool result is left orphaned at the head of what survives.
+///
+/// 2. The seed survives — the system prompt and the original request.
+///    Summarise the goal away and the model starts confidently solving a
+///    different problem.
+fn plan_message_compaction(
+    messages: &[Value],
+    budget_bytes: usize,
+    keep_recent: usize,
+) -> Option<MessageCompaction> {
+    if context_bytes(messages) <= budget_bytes {
+        return None;
+    }
+    // Everything before the first assistant reply is the seed: the system
+    // prompt and the request being worked on.
+    let pinned = messages
+        .iter()
+        .position(|message| message_role(message) == "assistant")
+        .unwrap_or(messages.len());
+
+    let mut cut = messages.len().saturating_sub(keep_recent);
+    // A tool result must never be the first surviving message after a cut.
+    while cut > pinned && message_role(&messages[cut]) == "tool" {
+        cut -= 1;
+    }
+    // Folding one message into one summary frees nothing and would let the
+    // loop spin: insist on real progress.
+    if cut < pinned + 2 {
+        return None;
+    }
+
+    let range = pinned..cut;
+    let freed_bytes = context_bytes(&messages[range.clone()]);
+    Some(MessageCompaction { range, freed_bytes })
+}
+
+/// Replace a stretch of the conversation with a model-written summary.
+///
+/// The summary enters as a `user` message so the model reads it as external
+/// context about what already happened, rather than as its own earlier claim.
+async fn compact_messages(
+    client: &LlamaClient,
+    cfg: &AppConfig,
+    model: &str,
+    messages: &mut Vec<Value>,
+    plan: MessageCompaction,
+) {
+    let mut source = String::new();
+    for message in &messages[plan.range.clone()] {
+        let role = message_role(message);
+        let content = message["content"].as_str().unwrap_or_default();
+        let tools = message["tool_calls"]
+            .as_array()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter_map(|call| call["function"]["name"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|names| !names.is_empty())
+            .map(|names| format!(" [tools: {names}]"))
+            .unwrap_or_default();
+        source.push_str(&format!(
+            "{role}{tools}: {}\n\n",
+            content.chars().take(4_000).collect::<String>()
+        ));
+        if source.len() >= 32_000 {
+            source.push_str("\n[older content truncated]");
+            break;
+        }
+    }
+
+    let request = vec![
+        json!({"role": "system", "content":
+            "Summarize the conversation state for another tool-using turn. Preserve the \
+             user's goal, decisions taken, files inspected or changed, tool results, errors, \
+             and unfinished work. Be concise and factual."}),
+        json!({"role": "user", "content": source.clone()}),
+    ];
+    let summary = match client.chat(cfg, model, request, 0.2).await {
+        Ok(response) if !response.content.trim().is_empty() => response.content,
+        // A failed summary must not lose the history outright: keep a truncated
+        // transcript rather than pretending those rounds never happened.
+        _ => format!(
+            "Compacted earlier rounds (model summary unavailable):\n{}",
+            source
+        ),
+    };
+    let summary: String = summary.chars().take(MAX_SUMMARY_BYTES).collect();
+
+    messages.splice(
+        plan.range,
+        [json!({
+            "role": "user",
+            "content": format!("[compacted earlier tool rounds]\n{summary}"),
+        })],
+    );
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ToolMeta {
@@ -50,6 +193,7 @@ struct ToolMeta {
     aliases: &'static [&'static str],
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tool_loop(
     client: &LlamaClient,
     cfg: &AppConfig,
@@ -66,6 +210,7 @@ pub async fn run_tool_loop(
     config_state: Option<Arc<RwLock<AppConfig>>>,
     agent_depth: u32,
     local_web: bool,
+    turn: &TurnStream,
 ) -> String {
     run_tool_loop_internal(
         client,
@@ -85,8 +230,108 @@ pub async fn run_tool_loop(
         local_web,
         None,
         AgentProfile::Root,
+        turn,
     )
     .await
+}
+
+/// One model round, streamed when the provider can do it.
+///
+/// Falls back to the buffered call for wire protocols with no streaming tool
+/// format, so nothing regresses where streaming is impossible. A mid-stream
+/// failure keeps whatever already reached the user instead of discarding the
+/// round: partial text the browser has already drawn is worth more than a
+/// clean error nobody can act on.
+async fn stream_model_round(
+    client: &LlamaClient,
+    cfg: &AppConfig,
+    model: &str,
+    messages: Vec<Value>,
+    schemas: Vec<Value>,
+    turn: &TurnStream,
+) -> anyhow::Result<LlamaResponse> {
+    let opened = client
+        .chat_stream_with_tools(
+            cfg,
+            model,
+            messages.clone(),
+            0.3,
+            schemas.clone(),
+            Some(json!("auto")),
+        )
+        .await;
+    let mut stream = match opened {
+        Ok(stream) => stream,
+        Err(error) => {
+            info!("Streaming round unavailable, using the buffered call: {error}");
+            return client
+                .chat_with_tools(cfg, model, messages, 0.3, schemas, Some(json!("auto")))
+                .await;
+        }
+    };
+
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    let mut failure = None;
+
+    loop {
+        let next = tokio::select! {
+            biased;
+            // Cancellation wins the race deliberately: an interrupt that waits
+            // for the next token is not an interrupt.
+            _ = turn.cancel_token().cancelled() => None,
+            next = stream.next() => next,
+        };
+        let Some(event) = next else { break };
+        match event {
+            Ok(ChatStreamEvent::Text(text)) => {
+                content.push_str(&text);
+                turn.emit(Event::Token { text }).await;
+            }
+            Ok(ChatStreamEvent::Reasoning(text)) => {
+                turn.emit(Event::Reasoning { text }).await;
+            }
+            Ok(ChatStreamEvent::ToolCalls(calls)) => tool_calls = calls,
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+
+    if let Some(error) = failure {
+        if content.trim().is_empty() && tool_calls.is_empty() {
+            return Err(error);
+        }
+        warn!("Streaming round ended early, keeping partial output: {error}");
+    }
+
+    Ok(LlamaResponse {
+        content,
+        tool_calls,
+    })
+}
+
+/// One line the user can judge without reading JSON. A progress row is only as
+/// useful as this string.
+fn summarize_call(name: &str, args: &Map<String, Value>) -> String {
+    let text = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("?");
+    match name {
+        "Bash" => short_command(text("command"), 120),
+        "Sudo" => format!("sudo {}", short_command(text("command"), 110)),
+        "Read" => format!("read {}", text("path")),
+        "Write" => format!("write {}", text("path")),
+        "Edit" => format!("edit {}", text("path")),
+        "Glob" => format!("glob {}", text("pattern")),
+        "Grep" => format!("grep {:?}", text("pattern")),
+        "WebSearch" => format!("search {:?}", text("query")),
+        "WebFetch" => format!("fetch {}", text("url")),
+        "Agent" => format!("delegate: {}", text("description")),
+        "Skill" => format!("skill {}", text("name")),
+        "Config" => format!("config {}", text("setting")),
+        "TaskOutput" => format!("read output {}", text("taskId")),
+        other => other.to_string(),
+    }
 }
 
 async fn run_tool_loop_internal(
@@ -107,6 +352,7 @@ async fn run_tool_loop_internal(
     local_web: bool,
     agent_id: Option<&str>,
     agent_profile: AgentProfile,
+    turn: &TurnStream,
 ) -> String {
     let runtime_aware_system_prompt = append_memory_block(
         &build_runtime_aware_system_prompt(system_prompt, runtime_profile),
@@ -122,7 +368,8 @@ async fn run_tool_loop_internal(
         json!({"role": "system", "content": runtime_aware_system_prompt}),
         json!({"role": "user", "content": user_prompt}),
     ];
-    let max_steps = cfg.tool_loop_max_steps.max(1);
+    // `0` means unlimited; anything else is a safety valve, not a work limit.
+    let step_cap = cfg.tool_loop_max_steps;
     let schemas = openai_tool_schemas()
         .into_iter()
         .filter(|schema| {
@@ -137,11 +384,13 @@ async fn run_tool_loop_internal(
     let mut structured_output_only = false;
     let mut tool_observations = Vec::new();
     let mut exhausted_steps = true;
+    let session_key = session_key
+        .map(normalize_ws)
+        .filter(|item| !item.is_empty())
+        .unwrap_or_else(|| "default".into());
     let tool_ctx = ToolContext {
-        session_key: session_key
-            .map(normalize_ws)
-            .filter(|item| !item.is_empty())
-            .unwrap_or_else(|| "default".into()),
+        approval_scope: approval_scope_for(&session_key, agent_id),
+        session_key,
         agent_depth,
         agent_id: agent_id.map(str::to_string),
         agent_profile,
@@ -151,30 +400,69 @@ async fn run_tool_loop_internal(
             .map(str::to_string),
     };
 
-    for _ in 0..max_steps {
-        let response = match client
-            .chat_with_tools(
-                cfg,
-                model,
-                messages.clone(),
-                0.3,
-                schemas.clone(),
-                Some(json!("auto")),
-            )
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                warn!("Tool loop unavailable, falling back to plain chat: {err}");
-                return match client.chat(cfg, model, messages, 0.3).await {
-                    Ok(response) if !response.content.trim().is_empty() => {
-                        enforce_final_answer(&response.content, runtime_profile, &tool_observations)
-                    }
-                    Ok(_) => "[Empty response]".into(),
-                    Err(err) => format!("[LLM error: {err}]"),
-                };
+    let mut step = 0u32;
+    loop {
+        step += 1;
+        // A fixed round cap ends useful work mid-task, which is why the
+        // terminal agent does not have one. What actually has to be bounded is
+        // context, not rounds: an unbounded loop grows `messages` until the
+        // provider rejects the request with an error that never mentions why.
+        // So the loop runs free and these two budgets end it instead.
+        if step_cap > 0 && step > step_cap {
+            break;
+        }
+        match plan_message_compaction(&messages, MAX_LOOP_CONTEXT_BYTES, COMPACTION_KEEP_RECENT) {
+            Some(plan) => {
+                let freed = plan.freed_bytes;
+                info!(
+                    "Compacting {} message(s) after {} round(s)",
+                    plan.range.len(),
+                    step - 1
+                );
+                compact_messages(client, cfg, model, &mut messages, plan).await;
+                turn.emit(Event::Compacted {
+                    freed_tokens: (freed / 4) as i64,
+                })
+                .await;
             }
-        };
+            // Over budget with nothing safe to fold — the recent rounds alone
+            // fill the window. Stop and synthesise instead of sending a request
+            // the provider will reject.
+            None if context_bytes(&messages) > MAX_LOOP_CONTEXT_BYTES => {
+                warn!("Context budget exceeded with nothing safe to compact");
+                break;
+            }
+            None => {}
+        }
+        if turn.is_cancelled() {
+            exhausted_steps = false;
+            break;
+        }
+        let response =
+            match stream_model_round(client, cfg, model, messages.clone(), schemas.clone(), turn)
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    warn!("Tool loop unavailable, falling back to plain chat: {err}");
+                    return match client.chat(cfg, model, messages, 0.3).await {
+                        Ok(response) if !response.content.trim().is_empty() => {
+                            enforce_final_answer(
+                                &response.content,
+                                runtime_profile,
+                                &tool_observations,
+                            )
+                        }
+                        Ok(_) => "[Empty response]".into(),
+                        Err(err) => format!("[LLM error: {err}]"),
+                    };
+                }
+            };
+        if turn.is_cancelled() {
+            final_content = response.content;
+            exhausted_steps = false;
+            break;
+        }
 
         let mut normalized_calls = response
             .tool_calls
@@ -226,10 +514,11 @@ async fn run_tool_loop_internal(
         let parallel_agent_batch =
             parsed_calls.len() > 1 && parsed_calls.iter().all(|(name, _, _)| name == "Agent");
         let executions = if parallel_agent_batch {
-            join_all(parsed_calls.iter().map(|(name, args, _)| {
-                execute_tool_call(
+            join_all(parsed_calls.iter().map(|(name, args, call_id)| {
+                execute_reported_call(
                     name,
                     args,
+                    call_id,
                     cfg,
                     paths,
                     client,
@@ -241,16 +530,25 @@ async fn run_tool_loop_internal(
                     runtime,
                     config_state.clone(),
                     local_web,
+                    turn,
                 )
             }))
             .await
         } else {
             let mut results = Vec::with_capacity(parsed_calls.len());
-            for (name, args, _) in &parsed_calls {
+            for (name, args, call_id) in &parsed_calls {
+                if turn.is_cancelled() {
+                    // Report the rest as skipped rather than silently dropping
+                    // them: the model still needs a result for every call it
+                    // made, or the next request is malformed.
+                    results.push(Err(anyhow!("interrupted by the user")));
+                    continue;
+                }
                 results.push(
-                    execute_tool_call(
+                    execute_reported_call(
                         name,
                         args,
+                        call_id,
                         cfg,
                         paths,
                         client,
@@ -262,6 +560,7 @@ async fn run_tool_loop_internal(
                         runtime,
                         config_state.clone(),
                         local_web,
+                        turn,
                     )
                     .await,
                 );
@@ -484,13 +783,89 @@ impl AgentProfile {
 
 #[derive(Debug)]
 struct ToolContext {
+    /// The conversation. Durable state — tasks, todos, subagent registrations —
+    /// is filed under this so a subagent's work still shows up in the chat that
+    /// started it.
     session_key: String,
+    /// Who is waiting on an approval dialog. Distinct from `session_key`
+    /// because `PendingApprovals` allows one outstanding request per scope, so
+    /// sharing it would make concurrent subagents cancel each other's prompts.
+    approval_scope: String,
     agent_depth: u32,
     agent_id: Option<String>,
     agent_profile: AgentProfile,
     memory_block: Option<String>,
 }
 
+/// One outstanding approval is allowed per scope. The conversation is the right
+/// unit for that when a single agent is working, but a fan-out of subagents
+/// runs several tool loops against one conversation at once — so each subagent
+/// gets its own scope, keyed by the task id it already owns.
+fn approval_scope_for(session_key: &str, agent_id: Option<&str>) -> String {
+    match agent_id {
+        Some(agent_id) => format!("{session_key}#{agent_id}"),
+        None => session_key.to_string(),
+    }
+}
+
+/// Runs one tool call and brackets it with the progress events the browser
+/// draws. Wrapping rather than emitting inside `execute_tool_call` keeps the
+/// dispatcher free of presentation concerns and guarantees that every started
+/// row also gets an ended row, including on the error paths.
+#[allow(clippy::too_many_arguments)]
+async fn execute_reported_call(
+    name: &str,
+    args: &Map<String, Value>,
+    call_id: &str,
+    cfg: &AppConfig,
+    paths: &AppPaths,
+    client: &LlamaClient,
+    model: &str,
+    tool_ctx: &ToolContext,
+    runtime_profile: &RuntimeProfile,
+    pending_questions: &PendingQuestions,
+    pending_approvals: &PendingApprovals,
+    runtime: &RuntimeHandles,
+    config_state: Option<Arc<RwLock<AppConfig>>>,
+    local_web: bool,
+    turn: &TurnStream,
+) -> anyhow::Result<Value> {
+    turn.emit(Event::ToolCallStarted {
+        call_id: call_id.to_string(),
+        name: name.to_string(),
+        summary: summarize_call(name, args),
+    })
+    .await;
+
+    let started = std::time::Instant::now();
+    let outcome = execute_tool_call(
+        name,
+        args,
+        cfg,
+        paths,
+        client,
+        model,
+        tool_ctx,
+        runtime_profile,
+        pending_questions,
+        pending_approvals,
+        runtime,
+        config_state,
+        local_web,
+        turn,
+    )
+    .await;
+
+    turn.emit(Event::ToolCallEnded {
+        call_id: call_id.to_string(),
+        ok: outcome.is_ok(),
+        duration_ms: started.elapsed().as_millis() as u64,
+    })
+    .await;
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_call(
     name: &str,
     args: &Map<String, Value>,
@@ -505,6 +880,7 @@ async fn execute_tool_call(
     runtime: &RuntimeHandles,
     config_state: Option<Arc<RwLock<AppConfig>>>,
     local_web: bool,
+    turn: &TurnStream,
 ) -> anyhow::Result<Value> {
     info!("Tool call: {name} [scope={}]", tool_ctx.session_key);
     if !tool_ctx.agent_profile.allows(name) {
@@ -531,6 +907,7 @@ async fn execute_tool_call(
                 runtime,
                 config_state.clone(),
                 local_web,
+                turn,
             )
             .await
         }
@@ -540,7 +917,7 @@ async fn execute_tool_call(
             authorize_standard(
                 cfg,
                 pending_approvals,
-                &tool_ctx.session_key,
+                &tool_ctx.approval_scope,
                 "Write",
                 &required_string(args, "path")?,
                 "The tool will create or overwrite a workspace file.",
@@ -553,7 +930,7 @@ async fn execute_tool_call(
             authorize_standard(
                 cfg,
                 pending_approvals,
-                &tool_ctx.session_key,
+                &tool_ctx.approval_scope,
                 "Edit",
                 &required_string(args, "path")?,
                 "The tool will modify an existing workspace file.",
@@ -571,7 +948,9 @@ async fn execute_tool_call(
                 args,
                 runtime,
                 &tool_ctx.session_key,
+                &tool_ctx.approval_scope,
                 pending_approvals,
+                turn,
             )
             .await
         }
@@ -580,9 +959,10 @@ async fn execute_tool_call(
                 cfg,
                 paths,
                 args,
-                &tool_ctx.session_key,
+                &tool_ctx.approval_scope,
                 pending_approvals,
                 local_web,
+                turn,
             )
             .await
         }
@@ -973,6 +1353,7 @@ fn resolve_agent_provider(
     Ok((agent_cfg, provider_id, model))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tool_agent(
     cfg: &AppConfig,
     paths: &AppPaths,
@@ -986,6 +1367,7 @@ async fn tool_agent(
     runtime: &RuntimeHandles,
     config_state: Option<Arc<RwLock<AppConfig>>>,
     local_web: bool,
+    turn: &TurnStream,
 ) -> anyhow::Result<Value> {
     let prompt = required_string(args, "prompt")?;
     let description = value_string(args, "description").unwrap_or_else(|| "Delegated task".into());
@@ -1168,6 +1550,11 @@ async fn tool_agent(
     }
 
     let system_prompt = build_agent_system_prompt(&description, &subagent_type);
+    // A subagent keeps the parent's cancellation but not its event sink: its
+    // tokens belong to a separate conversation and would otherwise interleave
+    // into the answer the user is watching. Its progress is already visible
+    // through the task APIs.
+    let subagent_turn = turn.without_sink();
     let response = tokio::select! {
         reply = Box::pin(run_tool_loop_internal(
             client,
@@ -1187,6 +1574,7 @@ async fn tool_agent(
             local_web,
             Some(&task_id),
             agent_profile,
+            &subagent_turn,
         )) => Some(reply),
         _ = cancel_rx => None,
     };
@@ -1255,8 +1643,10 @@ pub async fn launch_background_subagent(
     args.insert("model".into(), json!(model.unwrap_or("inherit")));
     args.insert("run_in_background".into(), json!(true));
     args.insert("isolation".into(), json!("local"));
+    let session_key = normalize_ws(scope_key);
     let tool_ctx = ToolContext {
-        session_key: normalize_ws(scope_key),
+        approval_scope: approval_scope_for(&session_key, None),
+        session_key,
         agent_depth: 0,
         agent_id: None,
         agent_profile: AgentProfile::Root,
@@ -1275,6 +1665,7 @@ pub async fn launch_background_subagent(
         runtime,
         config_state,
         local_web,
+        &TurnStream::detached(),
     )
     .await
 }
@@ -1454,13 +1845,16 @@ fn web_sandbox_policy(cfg: &AppConfig, cwd: PathBuf, timeout_seconds: u64) -> Sa
     policy
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tool_bash(
     cfg: &AppConfig,
     paths: &AppPaths,
     args: &Map<String, Value>,
     runtime: &RuntimeHandles,
     scope_key: &str,
+    approval_scope: &str,
     pending_approvals: &PendingApprovals,
+    turn: &TurnStream,
 ) -> anyhow::Result<Value> {
     let command = required_string(args, "command")?;
     validate_bash_command(&command)?;
@@ -1478,7 +1872,7 @@ async fn tool_bash(
     authorize_standard(
         cfg,
         pending_approvals,
-        scope_key,
+        approval_scope,
         "Bash",
         &command,
         "The command runs with your normal OS account and may modify files or start processes.",
@@ -1494,9 +1888,12 @@ async fn tool_bash(
         &policy,
         "bash",
         &["-lc".into(), command.clone()],
-        &CancellationToken::new(),
+        turn.cancel_token(),
     )
     .await?;
+    if output.cancelled {
+        bail!("Bash was interrupted by the user")
+    }
     Ok(json!({
         "command": command,
         "cwd": cwd.to_string_lossy(),
@@ -1508,6 +1905,7 @@ async fn tool_bash(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tool_sudo(
     cfg: &AppConfig,
     paths: &AppPaths,
@@ -1515,6 +1913,7 @@ async fn tool_sudo(
     scope_key: &str,
     pending_approvals: &PendingApprovals,
     local_web: bool,
+    turn: &TurnStream,
 ) -> anyhow::Result<Value> {
     if !local_web {
         bail!("Sudo is disabled when WebTool listens on a non-loopback address")
@@ -1544,7 +1943,7 @@ async fn tool_sudo(
         bail!("Sudo was denied by the user")
     }
 
-    let cancel = CancellationToken::new();
+    let cancel = turn.cancel_token().clone();
     ensure_web_sudo_authenticated(pending_approvals, scope_key, &command, &cancel).await?;
     let secs = value_u64(args, "timeout").unwrap_or(60).clamp(1, 600);
     let mut policy = SandboxPolicy::full_access(cwd.clone());
@@ -2392,6 +2791,9 @@ async fn run_background_agent(
     local_web: bool,
 ) {
     let system_prompt = build_agent_system_prompt(&description, &subagent_type);
+    // A background agent outlives the request that started it, so it has no
+    // browser stream to report into; `cancel_rx` below is its stop signal.
+    let background_turn = TurnStream::detached();
     let response = tokio::select! {
         reply = Box::pin(run_tool_loop_internal(
             &client,
@@ -2411,6 +2813,7 @@ async fn run_background_agent(
             local_web,
             Some(&task_id),
             agent_profile,
+            &background_turn,
         )) => Some(reply),
         _ = &mut cancel_rx => None,
     };
@@ -3480,6 +3883,263 @@ mod tests {
         let saved = AppConfig::load(&paths.config_file).unwrap();
         assert_eq!(saved.history_window, 11);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_tool_loop_is_not_bounded_by_a_round_count_out_of_the_box() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(
+            cfg.tool_loop_max_steps, 0,
+            "a fixed round cap ends useful work mid-task; the loop is bounded \
+             by context and by the user's interrupt instead"
+        );
+
+        // `normalize` runs on every load and on every Config tool write. A
+        // clamp of `1..=64` here would quietly turn "unlimited" into a
+        // one-round limit, which is worse than the cap it replaced.
+        cfg.normalize();
+        assert_eq!(
+            cfg.tool_loop_max_steps, 0,
+            "normalize must not clamp the unlimited sentinel up to 1"
+        );
+    }
+
+    #[test]
+    fn an_explicit_round_cap_survives_normalization_and_stays_bounded() {
+        let mut cfg = AppConfig::default();
+        cfg.tool_loop_max_steps = 12;
+        cfg.normalize();
+        assert_eq!(cfg.tool_loop_max_steps, 12);
+
+        cfg.tool_loop_max_steps = 9_000;
+        cfg.normalize();
+        assert_eq!(cfg.tool_loop_max_steps, 64, "the upper bound still applies");
+    }
+
+    #[test]
+    fn context_budget_measures_the_whole_conversation() {
+        let messages = vec![
+            json!({"role": "system", "content": "x".repeat(1_000)}),
+            json!({"role": "user", "content": "y".repeat(1_000)}),
+        ];
+        let measured = context_bytes(&messages);
+        assert!(measured > 2_000, "both messages must count: {measured}");
+        assert!(
+            measured < MAX_LOOP_CONTEXT_BYTES,
+            "an ordinary exchange must not trip the budget"
+        );
+    }
+
+    /// A conversation shaped like the loop actually builds one: seed, then
+    /// rounds of `assistant(tool_calls)` followed by their tool results.
+    fn conversation(rounds: usize, filler: usize) -> Vec<Value> {
+        let mut messages = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "user", "content": "the original request"}),
+        ];
+        for index in 0..rounds {
+            messages.push(json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": format!("call_{index}"),
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": "{}"},
+                }],
+            }));
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("call_{index}"),
+                "content": "x".repeat(filler),
+            }));
+        }
+        messages
+    }
+
+    #[test]
+    fn compaction_never_orphans_a_tool_result() {
+        // keep_recent lands mid-round on purpose: the cut must walk back off
+        // the tool result, or the next request carries a dangling tool call.
+        for keep_recent in 1..12 {
+            let messages = conversation(10, 4_000);
+            let Some(plan) = plan_message_compaction(&messages, 1_000, keep_recent) else {
+                continue;
+            };
+            assert_ne!(
+                message_role(&messages[plan.range.end]),
+                "tool",
+                "keep_recent={keep_recent} left a tool result as the first surviving message"
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_the_system_prompt_and_the_original_request() {
+        let messages = conversation(10, 4_000);
+        let plan = plan_message_compaction(&messages, 1_000, COMPACTION_KEEP_RECENT).unwrap();
+        assert_eq!(
+            plan.range.start, 2,
+            "the seed is pinned: summarise the goal away and the model solves a different problem"
+        );
+        assert!(plan.freed_bytes > 0);
+    }
+
+    #[test]
+    fn compaction_does_not_run_while_the_conversation_fits() {
+        let messages = conversation(2, 10);
+        assert_eq!(
+            plan_message_compaction(&messages, MAX_LOOP_CONTEXT_BYTES, COMPACTION_KEEP_RECENT),
+            None
+        );
+    }
+
+    #[test]
+    fn compaction_declines_when_only_recent_rounds_remain() {
+        // Everything is inside the keep-recent window, so there is nothing safe
+        // to fold; the caller must stop rather than truncate blindly.
+        let messages = conversation(2, 200_000);
+        assert_eq!(plan_message_compaction(&messages, 1_000, 6), None);
+    }
+
+    #[test]
+    fn compaction_always_makes_progress() {
+        // Folding one message into one summary would let the loop spin forever.
+        for rounds in 1..8 {
+            let messages = conversation(rounds, 8_000);
+            if let Some(plan) = plan_message_compaction(&messages, 1_000, COMPACTION_KEEP_RECENT) {
+                assert!(
+                    plan.range.len() >= 2,
+                    "rounds={rounds} folded {} message(s), which frees nothing",
+                    plan.range.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn context_budget_stops_a_loop_that_keeps_growing() {
+        let huge = vec![json!({"role": "tool", "content": "z".repeat(MAX_LOOP_CONTEXT_BYTES)})];
+        assert!(context_bytes(&huge) > MAX_LOOP_CONTEXT_BYTES);
+    }
+
+    #[test]
+    fn tool_summaries_are_readable_without_parsing_json() {
+        let args = Map::from_iter([("command".into(), json!("cargo test --lib"))]);
+        assert_eq!(summarize_call("Bash", &args), "cargo test --lib");
+
+        let args = Map::from_iter([("path".into(), json!("src/main.rs"))]);
+        assert_eq!(summarize_call("Edit", &args), "edit src/main.rs");
+
+        // An unmapped tool still names itself rather than rendering "?".
+        assert_eq!(summarize_call("TaskList", &Map::new()), "TaskList");
+    }
+
+    /// Waits for `expected` approval requests to register, so the assertions
+    /// below never depend on task scheduling order.
+    async fn wait_for_pending(pending: &PendingApprovals, expected: usize) -> Value {
+        for _ in 0..200 {
+            let view = pending.public_view().await;
+            let count = view["requests"].as_array().map_or(0, |items| items.len());
+            if count >= expected {
+                return view;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        panic!("only saw fewer than {expected} pending approval(s)");
+    }
+
+    #[test]
+    fn subagents_get_their_own_approval_scope_but_share_the_conversation() {
+        assert_eq!(approval_scope_for("chat_7", None), "chat_7");
+        assert_eq!(approval_scope_for("chat_7", Some("a1")), "chat_7#a1");
+        assert_ne!(
+            approval_scope_for("chat_7", Some("a1")),
+            approval_scope_for("chat_7", Some("a2"))
+        );
+        // The WhatsApp prefix decides which channel an approval is shown on,
+        // so it has to survive the suffix.
+        assert_eq!(
+            source_channel_for_scope(&approval_scope_for("wa_123", Some("a1"))),
+            "whatsapp"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_subagents_do_not_reject_each_others_approvals() {
+        let pending = PendingApprovals::default();
+        let handles: Vec<_> = ["a1", "a2"]
+            .into_iter()
+            .map(|agent| {
+                let pending = pending.clone();
+                let scope = approval_scope_for("chat_7", Some(agent));
+                tokio::spawn(async move {
+                    pending
+                        .request_standard(&scope, "Write", "src/lib.rs", "writes a file", "/ws")
+                        .await
+                })
+            })
+            .collect();
+
+        let view = wait_for_pending(&pending, 2).await;
+        for request in view["requests"].as_array().unwrap() {
+            pending
+                .answer(
+                    request["id"].as_str().unwrap(),
+                    crate::web_approvals::ApprovalAnswerPayload {
+                        decision: "allow".into(),
+                        credential: None,
+                        remember: false,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        for handle in handles {
+            assert!(
+                handle.await.unwrap().unwrap(),
+                "a fan-out of subagents must not have one prompt reject the other"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_agent_still_gets_one_prompt_at_a_time() {
+        let pending = PendingApprovals::default();
+        let scope = approval_scope_for("chat_7", None);
+        let worker = {
+            let pending = pending.clone();
+            let scope = scope.clone();
+            tokio::spawn(async move {
+                pending
+                    .request_standard(&scope, "Bash", "cargo test", "runs tests", "/ws")
+                    .await
+            })
+        };
+        wait_for_pending(&pending, 1).await;
+
+        // Same scope, still serialized: one agent must not stack dialogs.
+        let second = pending
+            .request_standard(&scope, "Bash", "rm -rf build", "deletes files", "/ws")
+            .await;
+        assert!(matches!(
+            second,
+            Err(crate::web_approvals::PendingApprovalError::AlreadyPending)
+        ));
+
+        let view = pending.public_view().await;
+        pending
+            .answer(
+                view["request"]["id"].as_str().unwrap(),
+                crate::web_approvals::ApprovalAnswerPayload {
+                    decision: "deny".into(),
+                    credential: None,
+                    remember: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!worker.await.unwrap().unwrap());
     }
 
     #[test]

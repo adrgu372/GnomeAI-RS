@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -126,6 +127,22 @@ fn model(id: &str) -> ModelInfo {
 }
 
 pub type TokenStream = Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Send>>;
+
+/// One piece of a streamed model round.
+///
+/// Text and reasoning arrive as deltas so an interface can draw them while the
+/// model is still writing. Tool calls deliberately do not: a half-assembled
+/// argument object is not something the tool loop can act on, so fragments are
+/// joined here and emitted once, complete.
+#[derive(Debug, Clone)]
+pub enum ChatStreamEvent {
+    Text(String),
+    Reasoning(String),
+    /// Emitted at most once, after the upstream stream ends.
+    ToolCalls(Vec<Value>),
+}
+
+pub type ChatEventStream = Pin<Box<dyn Stream<Item = anyhow::Result<ChatStreamEvent>> + Send>>;
 
 impl LlamaClient {
     pub fn new() -> Self {
@@ -336,6 +353,100 @@ impl LlamaClient {
             );
         }
         Err(last_error.unwrap_or_else(|| anyhow!("llama-server streaming request failed")))
+    }
+
+    /// Streaming counterpart of [`Self::chat_with_tools`].
+    ///
+    /// Returns an error for anything that cannot carry OpenAI-style streaming
+    /// tool calls — the Anthropic wire protocol, and endpoints that only expose
+    /// the bare `/completion` route. Callers are expected to fall back to the
+    /// buffered `chat_with_tools`, so no provider loses functionality by this
+    /// method existing.
+    pub async fn chat_stream_with_tools(
+        &self,
+        cfg: &AppConfig,
+        model: &str,
+        messages: Vec<Value>,
+        temperature: f64,
+        tools: Vec<Value>,
+        tool_choice: Option<Value>,
+    ) -> anyhow::Result<ChatEventStream> {
+        // Checked before the protocol split so both wire formats agree: vision
+        // turns never reach the tool loop, they take the buffered path.
+        if messages_have_images(&messages) {
+            bail!("image input uses the buffered vision path");
+        }
+        if cfg.provider_protocol == "anthropic" {
+            return self
+                .anthropic_chat_stream_with_tools(cfg, model, messages, temperature, tools)
+                .await;
+        }
+        ensure_web_provider_supported(cfg)?;
+        let needs_tools = !tools.is_empty();
+        let mut last_error = None;
+
+        for url in candidate_chat_urls(cfg) {
+            // Tool calling only exists on the chat route.
+            if url.ends_with("/completion") {
+                continue;
+            }
+
+            let mut payload = json!({
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "stream": true,
+            });
+            set_openai_token_limit(cfg, &mut payload);
+            if needs_tools {
+                payload["tools"] = json!(tools);
+                if let Some(choice) = tool_choice.clone() {
+                    payload["tool_choice"] = choice;
+                }
+            }
+
+            let response = self
+                .http
+                .post(&url)
+                .headers(headers(cfg)?)
+                .json(&payload)
+                .send()
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(err) => {
+                    last_error = Some(err.into());
+                    continue;
+                }
+            };
+            let response = match self
+                .retry_openrouter_free(cfg, &url, &mut payload, response, needs_tools, false)
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    last_error = Some(err);
+                    continue;
+                }
+            };
+            if response.status().as_u16() == 404 {
+                continue;
+            }
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                last_error = Some(anyhow!(
+                    "{url} returned HTTP {status}: {}",
+                    body.chars().take(800).collect::<String>()
+                ));
+                continue;
+            }
+
+            return Ok(Box::pin(stream_events_from_response(response)));
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| anyhow!("no streaming chat endpoint accepted the tool request")))
     }
 
     async fn chat_inner(
@@ -549,6 +660,56 @@ impl LlamaClient {
         }
         Ok(Box::pin(stream_anthropic_tokens(response)))
     }
+
+    /// Anthropic's own streaming format, carrying tool calls.
+    ///
+    /// Shares the request shape with [`Self::anthropic_chat`] so a streamed
+    /// round and a buffered one cannot drift into sending different tools.
+    async fn anthropic_chat_stream_with_tools(
+        &self,
+        cfg: &AppConfig,
+        model: &str,
+        messages: Vec<Value>,
+        temperature: f64,
+        tools: Vec<Value>,
+    ) -> anyhow::Result<ChatEventStream> {
+        let (system, messages) = anthropic_messages(&messages);
+        let mut payload = json!({
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": cfg.llama_max_tokens,
+            "stream": true,
+        });
+        if !system.is_empty() {
+            payload["system"] = json!(system);
+        }
+        let tools = tools
+            .iter()
+            .filter_map(anthropic_tool_schema)
+            .collect::<Vec<_>>();
+        if !tools.is_empty() {
+            payload["tools"] = Value::Array(tools);
+        }
+
+        let response = self
+            .http
+            .post(&anthropic_messages_url(cfg))
+            .headers(anthropic_headers(cfg)?)
+            .json(&payload)
+            .send()
+            .await
+            .context("Anthropic streaming request failed")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            bail!(
+                "Anthropic returned {status}: {}",
+                body.chars().take(800).collect::<String>()
+            );
+        }
+        Ok(Box::pin(stream_anthropic_events_from_response(response)))
+    }
 }
 
 fn ensure_web_provider_supported(cfg: &AppConfig) -> anyhow::Result<()> {
@@ -570,6 +731,274 @@ fn set_openai_token_limit(cfg: &AppConfig, payload: &mut Value) {
         "max_tokens"
     };
     payload[key] = json!(cfg.llama_max_tokens);
+}
+
+/// Read an OpenAI-style SSE response into text deltas plus one assembled batch
+/// of tool calls.
+///
+/// SSE frames are separated by a blank line; anything short of that is a
+/// partial frame and stays in the buffer. Tool-call fragments key off `index`
+/// because that is the only field repeated on every fragment — `id` and `name`
+/// arrive once and then never again.
+fn stream_events_from_response(
+    response: reqwest::Response,
+) -> impl Stream<Item = anyhow::Result<ChatStreamEvent>> + Send {
+    try_stream! {
+        let mut chunks = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut assembler = ToolCallAssembler::default();
+
+        'outer: while let Some(chunk) = chunks.next().await {
+            buffer.push_str(&String::from_utf8_lossy(&chunk?));
+
+            while let Some((position, delimiter)) = sse_frame_boundary(&buffer) {
+                let frame: String = buffer.drain(..position + delimiter).collect();
+
+                for line in frame.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with(':') {
+                        continue;
+                    }
+                    let data = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if data == "[DONE]" {
+                        break 'outer;
+                    }
+                    // A malformed frame is not worth aborting a live answer for.
+                    let Ok(payload) = serde_json::from_str::<Value>(data) else {
+                        continue;
+                    };
+
+                    for token in extract_stream_tokens(&payload) {
+                        if !token.is_empty() {
+                            yield ChatStreamEvent::Text(token);
+                        }
+                    }
+
+                    let Some(choice) = payload["choices"].get(0) else {
+                        continue;
+                    };
+                    let delta = &choice["delta"];
+
+                    // Reasoning models expose thinking under different keys.
+                    for key in ["reasoning_content", "reasoning"] {
+                        if let Some(text) = delta[key].as_str() {
+                            if !text.is_empty() {
+                                yield ChatStreamEvent::Reasoning(text.to_string());
+                            }
+                        }
+                    }
+
+                    assembler.absorb(delta);
+                }
+            }
+        }
+
+        let calls = assembler.finish();
+        if !calls.is_empty() {
+            yield ChatStreamEvent::ToolCalls(calls);
+        }
+    }
+}
+
+/// Joins streamed `tool_calls` fragments back into whole calls.
+///
+/// `index` is the only field repeated on every fragment; `id` and `name` arrive
+/// once and then never again, and `arguments` is a JSON string split across an
+/// arbitrary number of chunks. Anything that assumes otherwise silently
+/// produces calls with truncated arguments.
+#[derive(Default)]
+struct ToolCallAssembler {
+    pending: HashMap<u64, PartialToolCall>,
+}
+
+impl ToolCallAssembler {
+    fn absorb(&mut self, delta: &Value) {
+        let Some(calls) = delta["tool_calls"].as_array() else {
+            return;
+        };
+        for call in calls {
+            let index = call["index"].as_u64().unwrap_or(0);
+            let entry = self.pending.entry(index).or_default();
+            if let Some(id) = call["id"].as_str() {
+                if !id.is_empty() {
+                    entry.id = id.to_string();
+                }
+            }
+            if let Some(name) = call["function"]["name"].as_str() {
+                if !name.is_empty() {
+                    entry.name = name.to_string();
+                }
+            }
+            if let Some(arguments) = call["function"]["arguments"].as_str() {
+                entry.arguments.push_str(arguments);
+            }
+        }
+    }
+
+    /// Anthropic announces a tool call up front with its id and name, then
+    /// streams the arguments separately as `input_json_delta` fragments.
+    fn start_block(&mut self, index: u64, id: &str, name: &str, input: &Value) {
+        let entry = self.pending.entry(index).or_default();
+        if !id.is_empty() {
+            entry.id = id.to_string();
+        }
+        if !name.is_empty() {
+            entry.name = name.to_string();
+        }
+        // A non-empty `input` here means the whole argument object arrived at
+        // once and no fragments will follow.
+        if input.as_object().is_some_and(|object| !object.is_empty()) {
+            entry.arguments = input.to_string();
+        }
+    }
+
+    fn push_arguments(&mut self, index: u64, fragment: &str) {
+        self.pending
+            .entry(index)
+            .or_default()
+            .arguments
+            .push_str(fragment);
+    }
+
+    /// Emits in index order: the model chose that order, and for sequential
+    /// edits to the same file it matters.
+    fn finish(self) -> Vec<Value> {
+        let mut assembled: Vec<(u64, PartialToolCall)> = self.pending.into_iter().collect();
+        assembled.sort_by_key(|(index, _)| *index);
+        assembled
+            .into_iter()
+            .filter(|(_, call)| !call.name.is_empty())
+            .map(|(_, call)| call.into_value())
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl PartialToolCall {
+    fn into_value(self) -> Value {
+        let id = if self.id.is_empty() {
+            format!("call_{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
+        } else {
+            self.id
+        };
+        let arguments = if self.arguments.trim().is_empty() {
+            "{}".to_string()
+        } else {
+            self.arguments
+        };
+        json!({
+            "id": id,
+            "type": "function",
+            "function": { "name": self.name, "arguments": arguments },
+        })
+    }
+}
+
+/// Read an Anthropic SSE response into text deltas plus assembled tool calls.
+///
+/// The shape differs from OpenAI enough to need its own reader: a tool call is
+/// announced by `content_block_start` carrying its id and name, and only then
+/// are the arguments streamed as `input_json_delta` fragments under the same
+/// block index.
+fn stream_anthropic_events_from_response(
+    response: reqwest::Response,
+) -> impl Stream<Item = anyhow::Result<ChatStreamEvent>> + Send {
+    try_stream! {
+        let mut chunks = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut assembler = ToolCallAssembler::default();
+
+        'outer: while let Some(chunk) = chunks.next().await {
+            buffer.push_str(&String::from_utf8_lossy(&chunk?));
+
+            while let Some((position, delimiter)) = sse_frame_boundary(&buffer) {
+                let frame: String = buffer.drain(..position + delimiter).collect();
+
+                for line in frame.lines() {
+                    let Some(data) = line.trim().strip_prefix("data:") else {
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_str::<Value>(data.trim()) else {
+                        continue;
+                    };
+
+                    match value["type"].as_str().unwrap_or_default() {
+                        "content_block_start"
+                            if value["content_block"]["type"] == "tool_use" =>
+                        {
+                            assembler.start_block(
+                                value["index"].as_u64().unwrap_or(0),
+                                value["content_block"]["id"].as_str().unwrap_or_default(),
+                                value["content_block"]["name"].as_str().unwrap_or_default(),
+                                &value["content_block"]["input"],
+                            );
+                        }
+                        "content_block_delta" => {
+                            let delta = &value["delta"];
+                            match delta["type"].as_str().unwrap_or_default() {
+                                "text_delta" => {
+                                    if let Some(text) = delta["text"].as_str() {
+                                        if !text.is_empty() {
+                                            yield ChatStreamEvent::Text(text.to_string());
+                                        }
+                                    }
+                                }
+                                "thinking_delta" => {
+                                    if let Some(text) = delta["thinking"].as_str() {
+                                        if !text.is_empty() {
+                                            yield ChatStreamEvent::Reasoning(text.to_string());
+                                        }
+                                    }
+                                }
+                                "input_json_delta" => {
+                                    if let Some(fragment) = delta["partial_json"].as_str() {
+                                        assembler.push_arguments(
+                                            value["index"].as_u64().unwrap_or(0),
+                                            fragment,
+                                        );
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Surfaced rather than swallowed: a mid-stream refusal
+                        // or overload otherwise looks like an empty answer.
+                        "error" => {
+                            let message = value["error"]["message"]
+                                .as_str()
+                                .unwrap_or("unknown Anthropic stream error");
+                            Err(anyhow!("Anthropic stream error: {message}"))?;
+                        }
+                        "message_stop" => break 'outer,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let calls = assembler.finish();
+        if !calls.is_empty() {
+            yield ChatStreamEvent::ToolCalls(calls);
+        }
+    }
+}
+
+fn sse_frame_boundary(buffer: &str) -> Option<(usize, usize)> {
+    match (buffer.find("\n\n"), buffer.find("\r\n\r\n")) {
+        (Some(lf), Some(crlf)) if crlf < lf => Some((crlf, 4)),
+        (Some(lf), _) => Some((lf, 2)),
+        (None, Some(crlf)) => Some((crlf, 4)),
+        (None, None) => None,
+    }
 }
 
 fn stream_tokens_from_response(
@@ -1156,6 +1585,234 @@ mod tests {
         let line = r#"data: {"content":"lo"}"#;
         let tokens = stream_tokens_from_line(line).unwrap();
         assert_eq!(tokens, vec!["lo"]);
+    }
+
+    #[test]
+    fn assembles_tool_call_arguments_split_across_fragments() {
+        let mut assembler = ToolCallAssembler::default();
+        for fragment in [
+            json!({"tool_calls":[{"index":0,"id":"call_a","function":{"name":"Bash"}}]}),
+            json!({"tool_calls":[{"index":0,"function":{"arguments":"{\"comm"}}]}),
+            json!({"tool_calls":[{"index":0,"function":{"arguments":"and\":\"ls\"}"}}]}),
+        ] {
+            assembler.absorb(&fragment);
+        }
+
+        let calls = assembler.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "call_a");
+        assert_eq!(calls[0]["function"]["name"], "Bash");
+        // The whole argument object, not just the last fragment.
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"command":"ls"}"#);
+    }
+
+    #[test]
+    fn keeps_parallel_tool_calls_in_index_order() {
+        let mut assembler = ToolCallAssembler::default();
+        // Deliberately out of order on the wire.
+        assembler.absorb(
+            &json!({"tool_calls":[{"index":1,"id":"b","function":{"name":"Write","arguments":"{}"}}]}),
+        );
+        assembler.absorb(
+            &json!({"tool_calls":[{"index":0,"id":"a","function":{"name":"Read","arguments":"{}"}}]}),
+        );
+
+        let calls = assembler.finish();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["function"]["name"], "Read");
+        assert_eq!(calls[1]["function"]["name"], "Write");
+    }
+
+    #[test]
+    fn drops_nameless_fragments_and_defaults_empty_arguments() {
+        let mut assembler = ToolCallAssembler::default();
+        // Index 1 never receives a name: a provider hiccup, not a call.
+        assembler.absorb(&json!({"tool_calls":[{"index":1,"function":{"arguments":"{}"}}]}));
+        assembler.absorb(&json!({"tool_calls":[{"index":0,"function":{"name":"TaskList"}}]}));
+
+        let calls = assembler.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "TaskList");
+        assert_eq!(calls[0]["function"]["arguments"], "{}");
+        assert!(
+            calls[0]["id"].as_str().is_some_and(|id| !id.is_empty()),
+            "a call with no upstream id still needs one for the tool result to match"
+        );
+    }
+
+    #[test]
+    fn assembles_anthropic_tool_calls_from_block_start_and_json_fragments() {
+        let mut assembler = ToolCallAssembler::default();
+        // Anthropic names the call up front, then streams its arguments.
+        assembler.start_block(0, "toolu_1", "Bash", &json!({}));
+        assembler.push_arguments(0, "{\"comm");
+        assembler.push_arguments(0, "and\":\"ls\"}");
+
+        let calls = assembler.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "toolu_1");
+        assert_eq!(calls[0]["function"]["name"], "Bash");
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"command":"ls"}"#);
+    }
+
+    #[test]
+    fn anthropic_input_delivered_whole_is_not_duplicated() {
+        // When `content_block_start` already carries the arguments, no
+        // `input_json_delta` follows; concatenating both would produce
+        // unparseable JSON.
+        let mut assembler = ToolCallAssembler::default();
+        assembler.start_block(0, "toolu_2", "Read", &json!({"path": "src/main.rs"}));
+
+        let calls = assembler.finish();
+        assert_eq!(calls.len(), 1);
+        let arguments = calls[0]["function"]["arguments"].as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(arguments).unwrap()["path"],
+            "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn anthropic_parallel_tool_blocks_keep_their_own_arguments() {
+        let mut assembler = ToolCallAssembler::default();
+        assembler.start_block(0, "toolu_a", "Read", &json!({}));
+        assembler.start_block(1, "toolu_b", "Grep", &json!({}));
+        // Fragments interleave across block indices on the wire.
+        assembler.push_arguments(0, "{\"path\":");
+        assembler.push_arguments(1, "{\"pattern\":");
+        assembler.push_arguments(0, "\"a.rs\"}");
+        assembler.push_arguments(1, "\"fn main\"}");
+
+        let calls = assembler.finish();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"path":"a.rs"}"#);
+        assert_eq!(
+            calls[1]["function"]["arguments"],
+            r#"{"pattern":"fn main"}"#
+        );
+    }
+
+    /// Drives the real reader over a real socket, so frame splitting and event
+    /// dispatch are covered and not just the assembler underneath them.
+    #[tokio::test]
+    async fn anthropic_stream_yields_text_then_assembled_tool_calls() {
+        use axum::{Router, routing::post};
+
+        // A faithful slice of the wire format, deliberately split so one tool
+        // call's arguments straddle two SSE frames.
+        const BODY: &str = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Ma uit.\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"Grep\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"fn main\\\"}\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/v1/messages", post(|| async { BODY }));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.provider_protocol = "anthropic".into();
+        cfg.llama_base_url = format!("http://{addr}");
+        cfg.llama_api_key = "test-key".into();
+
+        let mut stream = LlamaClient::new()
+            .chat_stream_with_tools(
+                &cfg,
+                "claude-sonnet-5",
+                vec![json!({"role": "user", "content": "cauta"})],
+                0.3,
+                vec![json!({"type": "function", "function": {
+                    "name": "Grep",
+                    "description": "search",
+                    "parameters": {"type": "object", "properties": {}},
+                }})],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut calls = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                ChatStreamEvent::Text(chunk) => text.push_str(&chunk),
+                ChatStreamEvent::Reasoning(chunk) => reasoning.push_str(&chunk),
+                ChatStreamEvent::ToolCalls(batch) => calls = batch,
+            }
+        }
+
+        assert_eq!(text, "Ma uit.");
+        assert_eq!(reasoning, "hmm");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "toolu_9");
+        assert_eq!(calls[0]["function"]["name"], "Grep");
+        assert_eq!(
+            calls[0]["function"]["arguments"], r#"{"pattern":"fn main"}"#,
+            "arguments split across frames must be rejoined"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_surfaces_a_mid_stream_error() {
+        use axum::{Router, routing::post};
+
+        const BODY: &str = concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+            "data: {\"type\":\"error\",\"error\":{\"message\":\"overloaded_error\"}}\n\n",
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/v1/messages", post(|| async { BODY }));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.provider_protocol = "anthropic".into();
+        cfg.llama_base_url = format!("http://{addr}");
+        cfg.llama_api_key = "test-key".into();
+
+        let mut stream = LlamaClient::new()
+            .chat_stream_with_tools(
+                &cfg,
+                "claude-sonnet-5",
+                vec![json!({"role": "user", "content": "hi"})],
+                0.3,
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut failed = false;
+        while let Some(event) = stream.next().await {
+            if let Err(error) = event {
+                // An overload must not read as an empty answer.
+                assert!(error.to_string().contains("overloaded_error"), "{error}");
+                failed = true;
+            }
+        }
+        assert!(failed, "the stream error must reach the caller");
+        server.abort();
+    }
+
+    #[test]
+    fn splits_sse_frames_on_both_line_endings() {
+        assert_eq!(sse_frame_boundary("data: a\n\ndata: b"), Some((7, 2)));
+        assert_eq!(sse_frame_boundary("data: a\r\n\r\ndata: b"), Some((7, 4)));
+        // A partial frame stays in the buffer.
+        assert_eq!(sse_frame_boundary("data: a\n"), None);
     }
 
     #[test]

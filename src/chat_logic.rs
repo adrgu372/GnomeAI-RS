@@ -18,6 +18,7 @@ use crate::{
     skills,
     storage::{AppPaths, ChatMessage, build_context},
     tools::run_tool_loop,
+    turn_stream::TurnStream,
     vision::{
         SYSTEM_PROMPT, build_image_vision_messages, find_extracted_content, find_image_path,
         generate_image_response, supports_images,
@@ -32,7 +33,6 @@ pub enum StreamResponsePlan {
     },
     Fallback(String),
 }
-
 pub async fn resolve_model(
     client: &LlamaClient,
     cfg: &AppConfig,
@@ -52,6 +52,7 @@ pub async fn resolve_model(
     (preferred.to_string(), models)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_chat_response_with_uploads(
     client: &LlamaClient,
     cfg: &AppConfig,
@@ -68,6 +69,7 @@ pub async fn generate_chat_response_with_uploads(
     runtime: &RuntimeHandles,
     config_state: Option<Arc<RwLock<AppConfig>>>,
     local_web: bool,
+    turn: &TurnStream,
 ) -> String {
     let memory_block =
         load_memory_block(memory_state.clone(), cfg, query, history, session_key).await;
@@ -124,10 +126,12 @@ pub async fn generate_chat_response_with_uploads(
         runtime,
         config_state,
         local_web,
+        turn,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_streaming_response_with_uploads(
     client: &LlamaClient,
     cfg: &AppConfig,
@@ -144,6 +148,7 @@ pub async fn prepare_streaming_response_with_uploads(
     runtime: &RuntimeHandles,
     config_state: Option<Arc<RwLock<AppConfig>>>,
     local_web: bool,
+    turn: &TurnStream,
 ) -> StreamResponsePlan {
     let memory_block =
         load_memory_block(memory_state.clone(), cfg, query, history, session_key).await;
@@ -227,11 +232,13 @@ pub async fn prepare_streaming_response_with_uploads(
             runtime,
             config_state,
             local_web,
+            turn,
         )
         .await,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_standard_chat_response(
     client: &LlamaClient,
     cfg: &AppConfig,
@@ -248,6 +255,7 @@ pub async fn generate_standard_chat_response(
     runtime: &RuntimeHandles,
     config_state: Option<Arc<RwLock<AppConfig>>>,
     local_web: bool,
+    turn: &TurnStream,
 ) -> String {
     let ctx = build_context(history, cfg.history_window);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -310,6 +318,7 @@ web results; otherwise omit the date.\n\n",
         config_state,
         0,
         local_web,
+        turn,
     )
     .await
 }
@@ -386,22 +395,4 @@ fn combine_context_blocks(first: Option<String>, second: Option<String>) -> Opti
         (None, Some(second)) => Some(second),
         (None, None) => None,
     }
-}
-
-pub fn chunk_text_for_sse(text: &str, size: usize) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        current.push(ch);
-        if current.len() >= size {
-            chunks.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
 }

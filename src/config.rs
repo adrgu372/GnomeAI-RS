@@ -35,6 +35,9 @@ pub struct AppConfig {
     pub llama_api_mode: String,
     pub llama_timeout: u64,
     pub llama_max_tokens: u32,
+    /// Safety valve for the WebTool tool loop. `0` runs until the model stops
+    /// asking for tools, like the terminal agent; the loop is bounded by its
+    /// context budget and by the user's interrupt, not by a round count.
     pub tool_loop_max_steps: u32,
     pub agent_max_depth: u32,
     /// Maximum number of local/remote subagents that may execute at once.
@@ -119,7 +122,7 @@ impl Default for AppConfig {
             llama_api_mode: "chat".into(),
             llama_timeout: 120,
             llama_max_tokens: 4_096,
-            tool_loop_max_steps: 6,
+            tool_loop_max_steps: 0,
             agent_max_depth: 3,
             agent_max_concurrent: 4,
             remote_agent_api_url: String::new(),
@@ -238,7 +241,12 @@ impl AppConfig {
             self.provider_protocol = "openai".into();
         }
         self.firecrawl_api_url = self.firecrawl_api_url.trim().trim_end_matches('/').into();
-        self.tool_loop_max_steps = self.tool_loop_max_steps.clamp(1, 64);
+        // `0` is meaningful here: it runs the loop until the model stops asking
+        // for tools, the way the terminal agent does. Clamping it up to 1 would
+        // silently turn the setting into a one-round limit.
+        if self.tool_loop_max_steps > 0 {
+            self.tool_loop_max_steps = self.tool_loop_max_steps.min(64);
+        }
         self.agent_max_depth = self.agent_max_depth.clamp(1, 8);
         self.agent_max_concurrent = self.agent_max_concurrent.clamp(1, 16);
         self.memory_max_facts_in_prompt = self.memory_max_facts_in_prompt.clamp(1, 20);

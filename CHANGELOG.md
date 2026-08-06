@@ -1,3 +1,31 @@
+# GnomeAI-RS 1.2.1 - 2026-08-06
+
+- Replaced simulated WebTool response chunking with real token-by-token
+  streaming for OpenAI-compatible and Anthropic providers, including reliable
+  assembly of fragmented and parallel tool calls.
+- Added live reasoning and tool lifecycle events to WebTool. The final saved
+  answer remains the authoritative post-consistency-check response.
+- Added server-side turn tracking and a functional interrupt endpoint. Stopping
+  a WebTool response now cancels the running model/tool turn instead of merely
+  closing the browser connection.
+- Removed the default tool-round ceiling. Agent loops now continue until the
+  model finishes, the context budget stops them, or the user interrupts.
+- Added context compaction that preserves the system prompt, original request,
+  and complete assistant-tool-result groups.
+- Isolated approval scopes for parallel subagents while keeping task identity
+  attached to the parent conversation, preventing unrelated approval dialogs
+  from rejecting one another.
+- Propagated real cancellation into Bash and Sudo execution and report
+  cancelled commands as failures rather than successful runs.
+- Fixed the terminal composer to wrap long lines, keep byte-accurate cursor
+  placement, grow to eight rows, and scroll while keeping the cursor visible.
+- Made WebTool startup resilient so a failed workspace request no longer
+  prevents chats and other independent sections from loading.
+- Updated package metadata to 1.2.1 and restored the corresponding Firecrawl
+  AGPL source archive required by the Debian bundle.
+
+---
+
 # GnomeAI-RS 1.2.0 - 2026-08-02
 
 - Added native Rust, Claude Code-style subagent orchestration: every subagent

@@ -2287,9 +2287,116 @@ fn unquote_path(value: &str) -> &str {
 // Draw
 // ---------------------------------------------------------------------------
 
+/// Visual rows the composer may occupy before it starts scrolling instead of
+/// growing. Past this it would eat the transcript.
+const COMPOSER_MAX_ROWS: u16 = 8;
+
+/// The composer laid out as it is drawn.
+///
+/// Height, rendering and the caret all read from here. Deriving them
+/// separately is what put the caret past the right edge: the box was sized by
+/// counting `\n`, while the text was word-wrapped, so every row a long line
+/// wrapped onto fell outside the border.
+struct WrappedComposer {
+    /// Byte ranges into the composer text, one per visual row. Every byte
+    /// belongs to exactly one row, which is what keeps the caret exact.
+    rows: Vec<std::ops::Range<usize>>,
+    cursor_row: u16,
+    cursor_col: u16,
+}
+
+/// Break one hard line into visual rows of at most `width` characters.
+///
+/// Breaks at the last space that fits; a word longer than the row is split
+/// mid-word, because refusing to split it would overflow the border again.
+fn wrap_line(line: &str, width: usize) -> Vec<std::ops::Range<usize>> {
+    if line.is_empty() {
+        return vec![0..0];
+    }
+    let mut rows = Vec::new();
+    let mut row_start = 0usize;
+    let mut last_break: Option<usize> = None;
+    let mut columns = 0usize;
+
+    for (offset, character) in line.char_indices() {
+        if columns == width {
+            // Keep the space on the row it ended, so no byte is lost between
+            // rows and the caret mapping stays one-to-one.
+            let cut = last_break
+                .filter(|value| *value > row_start)
+                .unwrap_or(offset);
+            rows.push(row_start..cut);
+            row_start = cut;
+            last_break = None;
+            columns = line[row_start..offset].chars().count();
+        }
+        if character == ' ' {
+            last_break = Some(offset + character.len_utf8());
+        }
+        columns += 1;
+    }
+    rows.push(row_start..line.len());
+    rows
+}
+
+fn wrap_composer(text: &str, cursor: usize, width: u16) -> WrappedComposer {
+    let width = width.max(1) as usize;
+    let mut rows: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut cursor_row = 0u16;
+    let mut cursor_col = 0u16;
+    let mut located = false;
+    let mut line_start = 0usize;
+
+    for hard_line in text.split('\n') {
+        for row in wrap_line(hard_line, width) {
+            let start = line_start + row.start;
+            let end = line_start + row.end;
+            if !located && cursor >= start && cursor <= end {
+                cursor_row = rows.len() as u16;
+                cursor_col = text[start..cursor].chars().count() as u16;
+                located = true;
+            }
+            rows.push(start..end);
+        }
+        // Past the '\n' that `split` consumed.
+        line_start += hard_line.len() + 1;
+    }
+
+    // A caret sitting exactly where a full row ends belongs at the start of the
+    // next one, otherwise it is drawn on the border.
+    if cursor_col as usize >= width {
+        cursor_row += 1;
+        cursor_col = 0;
+        if rows.len() <= cursor_row as usize {
+            let end = text.len();
+            rows.push(end..end);
+        }
+    }
+
+    WrappedComposer {
+        rows,
+        cursor_row,
+        cursor_col,
+    }
+}
+
+/// The composer text as drawn, plus the byte length of the part the user
+/// actually typed — everything after it is the dimmed autosuggestion.
+fn composer_text(app: &App) -> (String, usize) {
+    let typed = app.composer.len();
+    match command_autosuggestion_suffix(app) {
+        Some(suffix) => (format!("{}{suffix}", app.composer), typed),
+        None => (app.composer.clone(), typed),
+    }
+}
+
 fn draw(f: &mut Frame, app: &mut App) {
     // Composer grows with content, capped so it never eats the transcript.
-    let composer_h = (app.composer.lines().count() as u16).clamp(1, 8) + 2;
+    let (text, _) = composer_text(app);
+    let rows = wrap_composer(&text, app.cursor, f.area().width.saturating_sub(2))
+        .rows
+        .len() as u16;
+    let composer_h = rows.clamp(1, COMPOSER_MAX_ROWS) + 2;
 
     let [transcript, status, composer] = Layout::vertical([
         Constraint::Min(3),
@@ -2796,24 +2903,44 @@ fn draw_composer(f: &mut Frame, app: &App, area: Rect) {
         Color::Cyan
     };
 
-    let content = if let Some(suffix) = command_autosuggestion_suffix(app) {
-        Text::from(Line::from(vec![
-            Span::raw(app.composer.as_str()),
-            Span::styled(
-                suffix,
-                Style::new().fg(if app.high_contrast {
-                    Color::Gray
-                } else {
-                    Color::DarkGray
-                }),
-            ),
-        ]))
+    let (text, typed) = composer_text(app);
+    let inner_width = area.width.saturating_sub(2);
+    let inner_height = area.height.saturating_sub(2);
+    let wrapped = wrap_composer(&text, app.cursor, inner_width);
+    let suggestion = Style::new().fg(if app.high_contrast {
+        Color::Gray
     } else {
-        Text::raw(app.composer.as_str())
-    };
+        Color::DarkGray
+    });
+
+    // The rows are already wrapped, so the paragraph must not wrap them again.
+    let lines: Vec<Line> = wrapped
+        .rows
+        .iter()
+        .map(|row| {
+            let (start, end) = (row.start, row.end);
+            if end <= typed {
+                Line::from(Span::raw(text[start..end].to_string()))
+            } else if start >= typed {
+                Line::from(Span::styled(text[start..end].to_string(), suggestion))
+            } else {
+                // The autosuggestion begins partway through this row.
+                Line::from(vec![
+                    Span::raw(text[start..typed].to_string()),
+                    Span::styled(text[typed..end].to_string(), suggestion),
+                ])
+            }
+        })
+        .collect();
+
+    // Past the cap the composer scrolls instead of growing, so keep the caret
+    // on screen rather than letting it run off the bottom.
+    let scroll = wrapped
+        .cursor_row
+        .saturating_sub(inner_height.saturating_sub(1));
 
     f.render_widget(
-        Paragraph::new(content).wrap(Wrap { trim: false }).block(
+        Paragraph::new(Text::from(lines)).scroll((scroll, 0)).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::new().fg(border)),
@@ -2821,12 +2948,10 @@ fn draw_composer(f: &mut Frame, app: &App, area: Rect) {
         area,
     );
 
-    // Cursor position, naive: fine until you need wrapped multiline editing,
-    // at which point compute the wrapped offset instead.
-    let before = &app.composer[..app.cursor];
-    let row = before.matches('\n').count() as u16;
-    let col = before.rsplit('\n').next().unwrap_or("").chars().count() as u16;
-    f.set_cursor_position((area.x + 1 + col, area.y + 1 + row));
+    f.set_cursor_position((
+        area.x + 1 + wrapped.cursor_col,
+        area.y + 1 + wrapped.cursor_row - scroll,
+    ));
 }
 
 fn draw_completions(f: &mut Frame, app: &App, composer: Rect) {
@@ -3418,9 +3543,194 @@ fn export_conversation(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn rows_as_text<'a>(text: &'a str, wrapped: &WrappedComposer) -> Vec<&'a str> {
+        wrapped.rows.iter().map(|row| &text[row.clone()]).collect()
+    }
+
+    #[test]
+    fn a_long_line_without_newlines_grows_into_rows() {
+        // The reported bug: the box was sized by counting `\n`, so this stayed
+        // one row tall and everything after the first row fell outside it.
+        let text = "x".repeat(45);
+        let wrapped = wrap_composer(&text, text.len(), 20);
+        assert_eq!(rows_as_text(&text, &wrapped).len(), 3);
+    }
+
+    #[test]
+    fn the_caret_stays_inside_the_box_on_a_long_line() {
+        let text = "x".repeat(45);
+        let wrapped = wrap_composer(&text, text.len(), 20);
+        assert!(
+            wrapped.cursor_col < 20,
+            "caret at column {} is drawn on the border",
+            wrapped.cursor_col
+        );
+        assert_eq!(wrapped.cursor_row, 2);
+        assert_eq!(wrapped.cursor_col, 5);
+    }
+
+    #[test]
+    fn a_caret_at_a_full_row_boundary_moves_to_the_next_row() {
+        let text = "x".repeat(20);
+        let wrapped = wrap_composer(&text, text.len(), 20);
+        assert_eq!((wrapped.cursor_row, wrapped.cursor_col), (1, 0));
+        assert_eq!(
+            wrapped.rows.len(),
+            2,
+            "the caret needs a row to sit on, so the box grows"
+        );
+    }
+
+    #[test]
+    fn wrapping_prefers_spaces_but_splits_an_oversized_word() {
+        let text = "hello world";
+        let wrapped = wrap_composer(text, 0, 6);
+        assert_eq!(rows_as_text(text, &wrapped), vec!["hello ", "world"]);
+
+        let long = "supercalifragilistic";
+        let wrapped = wrap_composer(long, 0, 6);
+        assert_eq!(rows_as_text(long, &wrapped)[0], "superc");
+    }
+
+    #[test]
+    fn explicit_newlines_still_start_rows() {
+        let text = "one\ntwo\n";
+        let wrapped = wrap_composer(text, text.len(), 40);
+        assert_eq!(rows_as_text(text, &wrapped), vec!["one", "two", ""]);
+        assert_eq!((wrapped.cursor_row, wrapped.cursor_col), (2, 0));
+    }
+
+    #[test]
+    fn every_byte_belongs_to_exactly_one_row() {
+        // The caret maps a byte offset onto a row, so a gap or an overlap here
+        // shows up as a caret that drifts as you type.
+        for text in ["", "short", &"x".repeat(45), "hello world again", "a\n\nb"] {
+            let wrapped = wrap_composer(text, 0, 7);
+            assert_eq!(
+                wrapped.rows[0].start, 0,
+                "first row skips bytes in {text:?}"
+            );
+            for pair in wrapped.rows.windows(2) {
+                let gap = pair[1].start - pair[0].end;
+                // 0 within a hard line, 1 across the `\n` that was consumed.
+                assert!(gap <= 1, "gap or overlap of {gap} bytes in {text:?}");
+            }
+            assert_eq!(
+                wrapped.rows.last().unwrap().end,
+                text.len(),
+                "rows stop short of the end in {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_caret_is_reachable_at_every_offset() {
+        let text = "hello world, o linie ceva mai lunga";
+        for cursor in 0..=text.len() {
+            if !text.is_char_boundary(cursor) {
+                continue;
+            }
+            let wrapped = wrap_composer(text, cursor, 10);
+            assert!(
+                (wrapped.cursor_row as usize) < wrapped.rows.len(),
+                "cursor {cursor} landed on row {} of {} rows",
+                wrapped.cursor_row,
+                wrapped.rows.len()
+            );
+            assert!(wrapped.cursor_col < 10);
+        }
+    }
+
+    #[test]
+    fn a_zero_width_composer_does_not_panic() {
+        let wrapped = wrap_composer("abc", 3, 0);
+        assert!(!wrapped.rows.is_empty());
+    }
+
+    struct Rendered {
+        lines: Vec<String>,
+        width: u16,
+        height: u16,
+        cursor: (u16, u16),
+    }
+
+    /// Renders the whole UI the way `run` does, so assertions look at what is
+    /// actually on screen rather than at the layout maths behind it.
+    fn render(app: &mut App, width: u16, height: u16) -> Rendered {
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let cursor = terminal.get_cursor_position().unwrap().into();
+        let buffer = terminal.backend().buffer();
+        let lines = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        Rendered {
+            lines,
+            width,
+            height,
+            cursor,
+        }
+    }
+
+    #[tokio::test]
+    async fn typing_past_the_edge_grows_the_composer_instead_of_scrolling_sideways() {
+        let (ops, _receiver) = mpsc::channel(8);
+        let mut app = App::new();
+        type_text(&mut app, &"x".repeat(45), &ops).await;
+
+        let screen = render(&mut app, 24, 20);
+
+        // 45 characters at 22 usable columns is three rows, all of which have
+        // to be inside the border rather than clipped away to the first one.
+        // Only rows inside the composer border count: the banner above it has
+        // its own text. The last row holds a single character (22 + 22 + 1).
+        let with_text = screen
+            .lines
+            .iter()
+            .filter(|line| line.starts_with('│') && line.contains('x'))
+            .count();
+        assert_eq!(
+            with_text,
+            3,
+            "composer drew {with_text} row(s) of text:\n{}",
+            screen.lines.join("\n")
+        );
+
+        // And the caret is inside the box, not out on the border.
+        let (cursor_x, cursor_y) = screen.cursor;
+        assert!(
+            cursor_x >= 1 && cursor_x < screen.width - 1,
+            "caret column {cursor_x} is on the border"
+        );
+        assert!(
+            cursor_y < screen.height - 1,
+            "caret row {cursor_y} is on the border"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_composer_taller_than_the_cap_scrolls_to_keep_the_caret_visible() {
+        let (ops, _receiver) = mpsc::channel(8);
+        let mut app = App::new();
+        // Far more rows than COMPOSER_MAX_ROWS at this width.
+        type_text(&mut app, &"y".repeat(24 * 15), &ops).await;
+
+        let screen = render(&mut app, 24, 24);
+        let (_, cursor_y) = screen.cursor;
+        assert!(
+            cursor_y < screen.height - 1,
+            "caret at row {cursor_y} fell outside a capped composer"
+        );
     }
 
     /// Type text into the composer through the real key handler.

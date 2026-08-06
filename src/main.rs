@@ -24,6 +24,7 @@ mod storage;
 mod tasks;
 mod tools;
 mod transcribe;
+mod turn_stream;
 mod uploads;
 mod vision;
 mod web_approvals;
@@ -67,13 +68,14 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     chat_logic::{
-        StreamResponsePlan, chunk_text_for_sse, generate_chat_response_with_uploads,
+        StreamResponsePlan, generate_chat_response_with_uploads,
         prepare_streaming_response_with_uploads, resolve_model,
     },
     config::AppConfig,
     generation::{detect_format, generate_document},
     llama::LlamaClient,
     memory_engine::{DreamHandle, MemoryEngine, spawn_dream_worker},
+    protocol::Event as TurnEvent,
     provider_catalog::{
         AuthKind, PROVIDERS, ProviderSelection, ProviderSettingsStore, WireProtocol, preset,
     },
@@ -85,6 +87,7 @@ use crate::{
         save_chat,
     },
     tasks as workflow_tasks,
+    turn_stream::{LiveTurns, TurnStream, WebEvent},
     uploads::{
         ensure_upload_capacity, read_file, sanitize_upload_filename, save_base64_media,
         transcribe_media, write_unique_private,
@@ -108,6 +111,8 @@ struct AppState {
     wa_seen: Arc<Mutex<SeenMessages>>,
     upload_lock: Arc<Mutex<()>>,
     api_token: Arc<str>,
+    /// The turn running per conversation, so `/interrupt` can find it.
+    turns: LiveTurns,
     workspace: Arc<RwLock<WebWorkspace>>,
     local_web: bool,
     /// Broadcasts complete WhatsApp status snapshots to browser SSE clients.
@@ -252,6 +257,7 @@ async fn web_main() -> anyhow::Result<()> {
         wa_seen: Arc::new(Mutex::new(SeenMessages::default())),
         upload_lock: Arc::new(Mutex::new(())),
         api_token: Arc::from(api_token),
+        turns: LiveTurns::default(),
         workspace: Arc::new(RwLock::new(WebWorkspace {
             current: startup_workspace,
             history: workspace_history,
@@ -353,6 +359,7 @@ async fn web_main() -> anyhow::Result<()> {
         .route("/api/generated/{filename}", get(api_serve_generated))
         .route("/api/generate/{cid}", post(api_generate))
         .route("/api/chat/stream/{cid}/{mid}", get(api_stream))
+        .route("/api/chats/{cid}/interrupt", post(api_interrupt))
         .route("/api/log", post(api_log))
         .route("/api/whatsapp/status", get(api_whatsapp_status))
         .route("/api/whatsapp/events", get(api_whatsapp_events))
@@ -1566,77 +1573,121 @@ struct StreamQuery {
     model: Option<String>,
 }
 
+/// The live turn, as the browser sees it.
+///
+/// The work runs in a spawned task rather than inline in the stream body so
+/// that events reach the browser while tools are still executing. Inline, the
+/// tool loop would have to finish before the first `yield`, which is exactly
+/// the behaviour this replaces.
 async fn api_stream(
     State(state): State<AppState>,
     AxumPath((cid, _mid)): AxumPath<(String, String)>,
     Query(params): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let state_clone = state.clone();
-    Sse::new(stream! {
-        let stream_client = state_clone.llama.clone();
-        let result = async move {
-            let cfg = state_clone.config.read().await.clone();
-            let chat = load_chat(&state_clone.paths, &cid)?;
-            let execution_paths = runtime_paths(&state_clone).await;
-            let runtime_profile = RuntimeProfile::detect(&execution_paths);
-            let (model, known_models) = resolve_model(
-                &state_clone.llama,
-                &cfg,
-                params.model.as_deref(),
-            ).await;
-            let plan = prepare_streaming_response_with_uploads(
-                &state_clone.llama,
-                &cfg,
-                &execution_paths,
-                Some(state_clone.memory.clone()),
-                &runtime_profile,
-                &model,
-                &known_models,
-                &params.query,
-                &chat.messages,
-                Some(&cid),
-                &state_clone.pending_questions,
-                &state_clone.pending_approvals,
-                &state_clone.runtime,
-                Some(state_clone.config.clone()),
-                state_clone.local_web,
-            ).await;
-            Ok::<_, anyhow::Error>((cfg, model, plan))
-        }.await;
+    let (turn_id, cancel) = state.turns.begin(&cid).await;
+    let (turn, mut events) = TurnStream::new(cancel);
 
-        match result {
-            Ok((cfg, model, StreamResponsePlan::Direct { messages, temperature })) => {
-                match stream_client.chat_stream(&cfg, &model, messages, temperature).await {
-                    Ok(mut tokens) => {
-                        while let Some(token) = tokens.next().await {
-                            match token {
-                                Ok(token) if !token.is_empty() => {
-                                    yield Ok(Event::default().data(json!({"token": token}).to_string()));
-                                }
-                                Ok(_) => {}
-                                Err(err) => {
-                                    yield Ok(Event::default().data(json!({"token": format!("[Stream error: {err}]")}).to_string()));
-                                    break;
-                                }
-                            }
-                        }
+    let worker_state = state.clone();
+    let worker_turn = turn.clone();
+    let worker_cid = cid.clone();
+    let worker = tokio::spawn(async move {
+        let cfg = worker_state.config.read().await.clone();
+        let chat = load_chat(&worker_state.paths, &worker_cid)?;
+        let execution_paths = runtime_paths(&worker_state).await;
+        let runtime_profile = RuntimeProfile::detect(&execution_paths);
+        let (model, known_models) =
+            resolve_model(&worker_state.llama, &cfg, params.model.as_deref()).await;
+        let plan = prepare_streaming_response_with_uploads(
+            &worker_state.llama,
+            &cfg,
+            &execution_paths,
+            Some(worker_state.memory.clone()),
+            &runtime_profile,
+            &model,
+            &known_models,
+            &params.query,
+            &chat.messages,
+            Some(&worker_cid),
+            &worker_state.pending_questions,
+            &worker_state.pending_approvals,
+            &worker_state.runtime,
+            Some(worker_state.config.clone()),
+            worker_state.local_web,
+            &worker_turn,
+        )
+        .await;
+
+        let answer = match plan {
+            // Vision and uploaded-file turns have no tool loop, so their text
+            // is streamed straight from the provider here.
+            StreamResponsePlan::Direct {
+                messages,
+                temperature,
+            } => {
+                let mut tokens = worker_state
+                    .llama
+                    .chat_stream(&cfg, &model, messages, temperature)
+                    .await?;
+                let mut answer = String::new();
+                loop {
+                    let next = tokio::select! {
+                        biased;
+                        _ = worker_turn.cancel_token().cancelled() => None,
+                        next = tokens.next() => next,
+                    };
+                    let Some(token) = next else { break };
+                    let token = token?;
+                    if token.is_empty() {
+                        continue;
                     }
-                    Err(err) => {
-                        yield Ok(Event::default().data(json!({"token": format!("[Stream error: {err}]")}).to_string()));
-                    }
+                    answer.push_str(&token);
+                    worker_turn.emit(TurnEvent::Token { text: token }).await;
                 }
+                answer
             }
-            Ok((_cfg, _model, StreamResponsePlan::Fallback(reply))) => {
-                for chunk in chunk_text_for_sse(&reply, 120) {
-                    yield Ok(Event::default().data(json!({"token": chunk}).to_string()));
-                }
+            // The tool loop already streamed its tokens through `worker_turn`.
+            StreamResponsePlan::Fallback(reply) => reply,
+        };
+
+        worker_turn
+            .emit_web(WebEvent::Answer {
+                text: answer.clone(),
+            })
+            .await;
+        Ok::<String, anyhow::Error>(answer)
+    });
+
+    Sse::new(stream! {
+        while let Some(event) = events.recv().await {
+            yield Ok(Event::default().data(event.to_string()));
+        }
+        // The sender is dropped when the worker ends, so this never blocks on
+        // a turn that is still running.
+        match worker.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                yield Ok(Event::default().data(
+                    json!({"event": "error", "message": error.to_string(), "fatal": true})
+                        .to_string(),
+                ));
             }
-            Err(err) => {
-                yield Ok(Event::default().data(json!({"token": format!("[Error: {err}]")}).to_string()));
+            Err(error) => {
+                yield Ok(Event::default().data(
+                    json!({"event": "error", "message": format!("turn failed: {error}"), "fatal": true})
+                        .to_string(),
+                ));
             }
         }
+        state.turns.finish(&cid, turn_id).await;
         yield Ok(Event::default().data("[DONE]"));
     })
+}
+
+async fn api_interrupt(
+    State(state): State<AppState>,
+    AxumPath(cid): AxumPath<String>,
+) -> Json<Value> {
+    Json(json!({"ok": true, "interrupted": state.turns.cancel(&cid).await}))
 }
 
 async fn api_log(Json(payload): Json<Value>) -> Json<Value> {
@@ -1969,6 +2020,9 @@ async fn api_whatsapp_inbound(
         &state.runtime,
         Some(state.config.clone()),
         state.local_web,
+        // WhatsApp delivers one finished message; there is nothing to stream
+        // progress into and no browser connection to interrupt.
+        &TurnStream::detached(),
     )
     .await;
     append_msg(

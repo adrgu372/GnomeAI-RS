@@ -2,7 +2,7 @@
 //!
 //! One turn is: call the model, stream it out, dispatch whatever tools it
 //! asked for, persist, verify if anything changed on disk, repeat until the
-//! model stops asking for tools or a budget runs out.
+//! model stops asking for tools or the user interrupts.
 //!
 //! Four things that are easy to get wrong and expensive to fix later:
 //!
@@ -62,7 +62,6 @@ pub struct Agent {
     pub session_id: String,
     pub model: String,
     pub approval: ApprovalPolicy,
-    pub max_rounds: usize,
     pub context_budget: i64,
     pub workspace: PathBuf,
     pub verify_policy: SandboxPolicy,
@@ -83,7 +82,6 @@ impl Agent {
         session_id: String,
         model: String,
         approval: ApprovalPolicy,
-        max_rounds: usize,
         context_budget: i64,
         workspace: PathBuf,
         verify_policy: SandboxPolicy,
@@ -98,7 +96,6 @@ impl Agent {
             session_id,
             model,
             approval,
-            max_rounds,
             context_budget,
             workspace,
             verify_policy,
@@ -166,16 +163,10 @@ impl Agent {
             return Ok(());
         }
 
-        let mut round = 0usize;
         let mut usage_in = 0i64;
         let mut usage_out = 0i64;
 
         loop {
-            round += 1;
-            if round > self.max_rounds {
-                self.emit_error("round budget exhausted", false).await;
-                break;
-            }
             if cancel.is_cancelled() {
                 let _ = self.events.send(Event::Interrupted).await;
                 break;
@@ -669,16 +660,6 @@ impl Agent {
         Ok(out)
     }
 
-    async fn emit_error(&self, message: &str, fatal: bool) {
-        let _ = self
-            .events
-            .send(Event::Error {
-                message: message.to_string(),
-                fatal,
-            })
-            .await;
-    }
-
     fn clone_handle(&self) -> Self {
         Self {
             provider: self.provider.clone(),
@@ -687,7 +668,6 @@ impl Agent {
             session_id: self.session_id.clone(),
             model: self.model.clone(),
             approval: self.approval,
-            max_rounds: self.max_rounds,
             context_budget: self.context_budget,
             workspace: self.workspace.clone(),
             verify_policy: self.verify_policy.clone(),

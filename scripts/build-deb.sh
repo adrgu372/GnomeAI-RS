@@ -8,6 +8,7 @@ control_file="$project_root/packaging/debian/control"
 version="$(sed -n 's/^Version: //p' "$control_file" | head -n 1)"
 architecture="$(sed -n 's/^Architecture: //p' "$control_file" | head -n 1)"
 output_dir="${GNOMEAI_OUTPUT_DIR:-$project_root/dist}"
+binary_dir="${GNOMEAI_BIN_DIR:-$project_root/target/release}"
 codex_version="0.145.0"
 codex_target="x86_64-unknown-linux-musl"
 codex_tar_sha256="11239480f8e3efd1430f23bbe91c1a397856b8bbe6185ccbaee2382d25e03df2"
@@ -18,8 +19,8 @@ if [[ "${GNOMEAI_SKIP_BUILD:-0}" != "1" ]]; then
 fi
 
 for binary in gnomef-rs gnomef-web; do
-    if [[ ! -x "$project_root/target/release/$binary" ]]; then
-        echo "Missing release binary: target/release/$binary" >&2
+    if [[ ! -x "$binary_dir/$binary" ]]; then
+        echo "Missing binary: $binary_dir/$binary" >&2
         exit 1
     fi
 done
@@ -46,8 +47,8 @@ if [[ -d skills ]]; then
     cp -a skills/. "$package_root/usr/share/gnomeai-rs/skills/"
 fi
 
-install -m 0755 target/release/gnomef-rs "$package_root/usr/lib/gnomeai-rs/gnomef-rs"
-install -m 0755 target/release/gnomef-web "$package_root/usr/lib/gnomeai-rs/gnomef-web"
+install -m 0755 "$binary_dir/gnomef-rs" "$package_root/usr/lib/gnomeai-rs/gnomef-rs"
+install -m 0755 "$binary_dir/gnomef-web" "$package_root/usr/lib/gnomeai-rs/gnomef-web"
 if command -v strip >/dev/null 2>&1; then
     strip --strip-unneeded \
         "$package_root/usr/lib/gnomeai-rs/gnomef-rs" \

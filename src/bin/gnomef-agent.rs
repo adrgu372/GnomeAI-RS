@@ -215,7 +215,6 @@ async fn async_main() -> Result<()> {
         session_id,
         model,
         approval_for(cli.sandbox),
-        24,
         96_000,
         workspace,
         policy.clone(),

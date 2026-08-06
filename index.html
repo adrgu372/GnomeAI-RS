@@ -293,6 +293,37 @@
     .agent-status[data-status="failed"] { color: var(--red); border-color: #5b3038; }
     .agent-output { max-height: 160px; margin: 9px 0 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #aeb9c9; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
+    /* live tool steps inside a streaming answer */
+    .steps { display: grid; gap: 4px; margin: 0 0 9px; }
+    .step {
+      display: grid; grid-template-columns: 14px auto 1fr auto; align-items: center; gap: 8px;
+      padding: 5px 9px; border: 1px solid var(--line); border-radius: 9px; background: #0b1017;
+      color: var(--muted); font-size: 12.5px;
+    }
+    .step-name { color: #c4cedd; font-weight: 600; }
+    .step-summary {
+      min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .step-time { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+    .step-icon { width: 9px; height: 9px; margin-left: 2px; border-radius: 50%; background: var(--muted); }
+    .step[data-status="running"] { border-color: #65502e; }
+    .step[data-status="running"] .step-icon { background: var(--orange); animation: step-pulse 1.1s ease-in-out infinite; }
+    .step[data-status="done"] .step-icon { background: var(--green); }
+    .step[data-status="failed"] { border-color: #5b3038; }
+    .step[data-status="failed"] .step-icon { background: var(--red); }
+    @keyframes step-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+    @media (prefers-reduced-motion: reduce) {
+      .step[data-status="running"] .step-icon { animation: none; }
+    }
+    .reasoning { margin: 0 0 9px; color: var(--muted); font-size: 12.5px; }
+    .reasoning summary { cursor: pointer; }
+    .reasoning pre {
+      max-height: 220px; margin: 7px 0 0; overflow: auto; padding: 9px; white-space: pre-wrap;
+      overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 9px; background: #0b1017;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
     /* toast */
     #toast {
       position: fixed; left: 50%; bottom: 26px; z-index: 80; transform: translateX(-50%);
@@ -961,7 +992,19 @@
       send.classList.toggle("stop", sending);
     }
 
-    function stopStreaming() {
+    /* Closing the EventSource only hides the work: the tool loop, its shell
+       commands and its subagents keep running on the server. Tell the backend
+       first, then tear down the connection. */
+    async function stopStreaming() {
+      const chatId = state.activeChat;
+      if (chatId) {
+        try {
+          await api(`/api/chats/${encodeURIComponent(chatId)}/interrupt`, { method: "POST" });
+        } catch (error) {
+          console.error(error);
+          toast("Nu am putut opri turul pe server.");
+        }
+      }
       if (state.stream) {
         state.stream.close();
         state.stream = null;
@@ -994,6 +1037,7 @@
       }
 
       const output = addMessage("assistant", "", "streaming");
+      const steps = { output, rows: new Map() };
       let reply = "";
       const chatAtStart = state.activeChat;
       const streamUrl = `/api/chat/stream/${encodeURIComponent(chatAtStart)}/${Date.now()}` +
@@ -1029,19 +1073,106 @@
 
       source.onmessage = (event) => {
         if (event.data === "[DONE]") { finish(); return; }
+        let data;
         try {
-          const data = JSON.parse(event.data);
-          if (data.token) {
-            reply += data.token;
-            output.body.textContent = reply;
-            scrollMessages();
-          }
+          data = JSON.parse(event.data);
         } catch {
           reply += event.data;
           output.body.textContent = reply;
+          return;
         }
+        handleTurnEvent(data, output, steps, (text) => { reply = text; });
+        if (data.event === "token") {
+          reply += data.text || "";
+          output.body.textContent = reply;
+        }
+        scrollMessages();
       };
       source.onerror = () => finish("conexiunea de streaming s-a închis");
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* live turn events                                                    */
+    /*                                                                     */
+    /* The backend streams the same event vocabulary the terminal agent    */
+    /* uses, tagged by `event`. Tokens are a preview; `answer` carries the */
+    /* text that actually gets stored, because the consistency layer can   */
+    /* rewrite claims the tool results do not support.                     */
+    /* ------------------------------------------------------------------ */
+
+    function handleTurnEvent(data, output, steps, setReply) {
+      switch (data.event) {
+        case "tool_call_started":
+          upsertStep(steps, data.call_id, data.name, data.summary, "running");
+          break;
+        case "tool_call_ended":
+          finishStep(steps, data.call_id, data.ok, data.duration_ms);
+          break;
+        case "reasoning":
+          appendReasoning(output, data.text || "");
+          break;
+        case "compacted": {
+          const freed = Number(data.freed_tokens) || 0;
+          upsertStep(steps, `compacted-${Date.now()}`, "Context",
+            `rundele vechi au fost rezumate (~${freed} tokeni eliberați)`, "done");
+          break;
+        }
+        case "answer":
+          setReply(data.text || "");
+          break;
+        case "error":
+          upsertStep(steps, `error-${Date.now()}`, "Eroare", data.message || "", "failed");
+          break;
+        default:
+          break;
+      }
+    }
+
+    function stepContainer(output) {
+      if (output.steps) return output.steps;
+      const container = document.createElement("div");
+      container.className = "steps";
+      output.wrapper.insertBefore(container, output.body);
+      output.steps = container;
+      return container;
+    }
+
+    function upsertStep(steps, callId, name, summary, status) {
+      const container = stepContainer(steps.output);
+      let row = steps.rows.get(callId);
+      if (!row) {
+        row = document.createElement("div");
+        row.className = "step";
+        row.innerHTML = `<span class="step-icon"></span><span class="step-name"></span><span class="step-summary"></span><span class="step-time"></span>`;
+        container.append(row);
+        steps.rows.set(callId, row);
+      }
+      row.dataset.status = status;
+      row.querySelector(".step-name").textContent = name || "";
+      row.querySelector(".step-summary").textContent = summary || "";
+      scrollMessages();
+    }
+
+    function finishStep(steps, callId, ok, durationMs) {
+      const row = steps.rows.get(callId);
+      if (!row) return;
+      row.dataset.status = ok ? "done" : "failed";
+      if (typeof durationMs === "number") {
+        row.querySelector(".step-time").textContent =
+          durationMs >= 1000 ? `${(durationMs / 1000).toFixed(1)}s` : `${durationMs}ms`;
+      }
+    }
+
+    function appendReasoning(output, text) {
+      if (!text) return;
+      if (!output.reasoning) {
+        const box = document.createElement("details");
+        box.className = "reasoning";
+        box.innerHTML = `<summary>Raționament</summary><pre></pre>`;
+        output.wrapper.insertBefore(box, output.body);
+        output.reasoning = box.querySelector("pre");
+      }
+      output.reasoning.textContent += text;
     }
 
     function wireCodeCopyButtons() {
@@ -2153,19 +2284,37 @@
     wireDragAndDrop();
     wirePaste();
 
+    /* Boot each area independently.
+       One shared try/catch used to abandon the rest of the sequence on the
+       first failure, so a single unavailable endpoint left the conversation
+       list empty and the app looking broken — most visibly when the running
+       server predates a route the page calls. Degrade the part that failed,
+       keep the rest. */
     (async () => {
-      try {
-        await loadProviders();
-        await loadWorkspace();
-        await loadChats();
-        startWhatsAppEvents();
-        startApprovalPolling();
-        $("#connectionState").textContent = `${$("#connectionState").textContent} · conectat`;
-        $("#prompt").focus();
-      } catch (error) {
-        $("#connectionState").textContent = `Eroare: ${error.message}`;
-        $("#connectionState").style.color = "var(--red)";
+      const failures = [];
+      for (const [label, load] of [
+        ["Provideri", loadProviders],
+        ["Folder", loadWorkspace],
+        ["Conversații", loadChats],
+      ]) {
+        try {
+          await load();
+        } catch (error) {
+          console.error(label, error);
+          failures.push(`${label}: ${error.message}`);
+        }
       }
+      startWhatsAppEvents();
+      startApprovalPolling();
+
+      const banner = $("#connectionState");
+      if (failures.length) {
+        banner.textContent = `Eroare: ${failures.join(" · ")}`;
+        banner.style.color = "var(--red)";
+      } else {
+        banner.textContent = `${banner.textContent} · conectat`;
+      }
+      $("#prompt").focus();
     })();
   </script>
 </body>

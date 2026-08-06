@@ -31,7 +31,8 @@ Highlights:
 
 * textual tool calls emitted by local model templates are executed instead of
   being displayed as final answers;
-* tool loops synthesize a final answer when their round limit is reached;
+* tool loops run until the model stops asking for tools or the user
+  interrupts — there is no round limit to exhaust;
 * WhatsApp bridge processes exit when their WebTool parent disappears;
 * the bundled eToro app skill is included in Debian packages;
 * WebTool recognizes `omni` models and OpenRouter image-input metadata for
