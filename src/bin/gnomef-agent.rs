@@ -30,7 +30,11 @@ mod protocol;
 mod provider;
 #[path = "../provider_catalog.rs"]
 mod provider_catalog;
+#[cfg(target_os = "linux")]
 #[path = "../sandbox.rs"]
+mod sandbox;
+#[cfg(target_os = "macos")]
+#[path = "../sandbox_macos.rs"]
 mod sandbox;
 #[path = "../skills.rs"]
 mod skills;
@@ -81,8 +85,8 @@ struct ActiveTurn {
 }
 
 fn main() -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        bail!("gnomef-agent currently requires Linux");
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        bail!("gnomef-agent currently supports Linux and macOS");
     }
 
     // This must run before Tokio creates worker threads. The helper re-execs a
