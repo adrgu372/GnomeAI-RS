@@ -1,3 +1,17 @@
+# GnomeAI-RS 1.2.3 - 2026-08-08
+
+- Replaced the raw macOS DMG folder with a real `.pkg` installer contained in
+  the DMG.
+- Added three Spotlight/Launchpad applications and three `/usr/local/bin`
+  commands for Agent, compatibility Agent, and WebTool launches.
+- Added Developer ID Application/Installer signing and Apple notarization
+  support, including stapled tickets for both the package and DMG.
+- Removed the hard-coded release name that relabeled a 1.2.1 build as 1.2.2;
+  release tags must now match the Cargo package version.
+- Corrected the macOS WebTool URL from port 8788 to 8787.
+
+---
+
 # GnomeAI-RS 1.2.1 - 2026-08-06
 
 - Replaced simulated WebTool response chunking with real token-by-token
