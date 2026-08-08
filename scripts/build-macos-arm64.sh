@@ -94,6 +94,15 @@ EOF
 
 mkdir -p "$output_dir"
 archive="$output_dir/${package_name}.tar.gz"
+dmg="$output_dir/${package_name}.dmg"
 tar -C "$build_root" -czf "$archive" "$package_name"
-shasum -a 256 "$archive"
+hdiutil create \
+    -volname "GnomeAI-RS ${version}" \
+    -srcfolder "$package_root" \
+    -ov \
+    -format UDZO \
+    "$dmg"
+
+shasum -a 256 "$archive" "$dmg"
 echo "$archive"
+echo "$dmg"
