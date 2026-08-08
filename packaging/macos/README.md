@@ -46,8 +46,10 @@ The GitHub Actions workflow uses these repository secrets:
 - `APP_STORE_CONNECT_KEY_ID`: API key ID;
 - `APP_STORE_CONNECT_ISSUER_ID`: API issuer ID.
 
-The workflow builds unsigned/ad-hoc artifacts for pull requests. Pushes and
-version tags are signed and notarized when all secrets are configured. A tag
+The workflow builds ad-hoc-signed artifacts when Apple credentials are absent,
+including for version tags. Such a release is published with a prominent
+Gatekeeper warning and first-open instructions. When all secrets are
+configured, artifacts are instead Developer ID signed and notarized. A tag
 must exactly match the Cargo package version, for example `v1.2.3`.
 
 Apple's requirements and command-line notarization workflow are documented in
