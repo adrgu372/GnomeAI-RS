@@ -39,11 +39,6 @@ jobs:
           version="$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "gnomef-rs") | .version')"
           test "${GITHUB_REF_NAME}" = "v${version}"
-          test -n "$MACOS_SIGNING_P12"
-          test -n "$MACOS_SIGNING_P12_PASSWORD"
-          test -n "$APP_STORE_CONNECT_KEY_P8"
-          test -n "$APP_STORE_CONNECT_KEY_ID"
-          test -n "$APP_STORE_CONNECT_ISSUER_ID"
       - name: Release build
         run: cargo build --release --locked
       - name: Import Developer ID identities
@@ -88,6 +83,40 @@ jobs:
         env:
           GNOMEAI_SKIP_BUILD: "1"
         run: bash scripts/build-macos-arm64.sh
+      - name: Create macOS release notice
+        run: |
+          notice="dist/macos-release-notice.md"
+          if [[ -n "${GNOMEAI_NOTARY_KEY:-}" ]]; then
+            cat > "$notice" <<'EOF'
+          ## macOS security
+
+          This macOS build is signed with a Developer ID certificate and notarized by Apple.
+          EOF
+          elif [[ -n "${GNOMEAI_APP_SIGN_IDENTITY:-}" ]]; then
+            cat > "$notice" <<'EOF'
+          ## Important macOS security notice
+
+          This macOS build is Developer ID signed, but it is **not notarized by Apple**. Gatekeeper may ask for confirmation when it is opened for the first time.
+          EOF
+          else
+            cat > "$notice" <<'EOF'
+          ## Important macOS security notice
+
+          This macOS build is ad-hoc signed and is **not signed with a paid Apple Developer ID certificate or notarized by Apple**. The project does not currently pay for Apple Developer Program membership, so Gatekeeper will identify the developer as unverified and may block the installer on first open. This is expected for this release.
+
+          To install it:
+
+          1. Open the DMG and double-click `Install GnomeAI-RS.pkg` once.
+          2. If macOS blocks it, open **System Settings → Privacy & Security**, scroll to **Security**, then click **Open Anyway** and confirm.
+          3. If an installed app is blocked on first launch, Control-click it in `/Applications`, choose **Open**, then confirm **Open**.
+
+          Only bypass Gatekeeper when the files came from this official GitHub release. Download the DMG, PKG, and SHA-256 file into the same directory and verify them with:
+
+          ```bash
+          shasum -a 256 -c GnomeAI-RS-*-macos-arm64.sha256
+          ```
+          EOF
+          fi
       - name: Upload macOS arm64 packages
         uses: actions/upload-artifact@v4
         with:
@@ -96,6 +125,7 @@ jobs:
             dist/GnomeAI-RS-*-macos-arm64.pkg
             dist/GnomeAI-RS-*-macos-arm64.dmg
             dist/GnomeAI-RS-*-macos-arm64.sha256
+            dist/macos-release-notice.md
           if-no-files-found: error
 
   publish-macos-release:
@@ -114,6 +144,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          release_notice="$(cat dist/macos-release-notice.md)"
           gh release create "$GITHUB_REF_NAME" \
             dist/GnomeAI-RS-*-macos-arm64.pkg \
             dist/GnomeAI-RS-*-macos-arm64.dmg \
@@ -121,4 +152,5 @@ jobs:
             --repo "${{ github.repository }}" \
             --verify-tag \
             --title "GnomeAI-RS ${GITHUB_REF_NAME} — macOS Apple Silicon" \
+            --notes "$release_notice" \
             --generate-notes
