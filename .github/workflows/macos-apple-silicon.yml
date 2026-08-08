@@ -1,0 +1,39 @@
+name: macOS Apple Silicon
+
+on:
+  pull_request:
+  push:
+    branches:
+      - macos-apple-silicon
+  workflow_dispatch:
+
+jobs:
+  build-macos-arm64:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: whatsapp/package-lock.json
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Tests
+        run: cargo test --locked
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Package Apple Silicon release
+        env:
+          GNOMEAI_SKIP_BUILD: "1"
+        run: bash scripts/build-macos-arm64.sh
+      - name: Upload macOS arm64 package
+        uses: actions/upload-artifact@v4
+        with:
+          name: GnomeAI-RS-macos-arm64
+          path: dist/GnomeAI-RS-*-macos-arm64.tar.gz
+          if-no-files-found: error
