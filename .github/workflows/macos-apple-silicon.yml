@@ -4,7 +4,7 @@ on:
   pull_request:
   push:
     branches:
-      - macos-apple-silicon
+      - main
   workflow_dispatch:
 
 jobs:
@@ -31,9 +31,28 @@ jobs:
         env:
           GNOMEAI_SKIP_BUILD: "1"
         run: bash scripts/build-macos-arm64.sh
-      - name: Upload macOS arm64 package
+      - name: Upload macOS arm64 packages
         uses: actions/upload-artifact@v4
         with:
           name: GnomeAI-RS-macos-arm64
-          path: dist/GnomeAI-RS-*-macos-arm64.tar.gz
+          path: |
+            dist/GnomeAI-RS-*-macos-arm64.tar.gz
+            dist/GnomeAI-RS-*-macos-arm64.dmg
           if-no-files-found: error
+
+  publish-v1-2-1-dmg:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-macos-arm64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download validated macOS package
+        uses: actions/download-artifact@v4
+        with:
+          name: GnomeAI-RS-macos-arm64
+          path: dist
+      - name: Publish DMG to v1.2.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload v1.2.1 dist/GnomeAI-RS-*-macos-arm64.dmg --repo ${{ github.repository }} --clobber
