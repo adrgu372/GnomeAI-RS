@@ -17,6 +17,10 @@ mod provider_catalog;
 mod questions;
 mod runtime;
 mod runtime_profile;
+#[cfg(target_os = "linux")]
+mod sandbox;
+#[cfg(target_os = "macos")]
+#[path = "sandbox_macos.rs"]
 mod sandbox;
 mod search;
 mod skills;

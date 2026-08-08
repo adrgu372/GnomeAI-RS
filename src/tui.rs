@@ -1489,6 +1489,7 @@ fn write_clipboard(text: &str) -> std::io::Result<&'static str> {
     use std::io::Write;
 
     for (program, arguments, label) in [
+        ("/usr/bin/pbcopy", &[][..], "pbcopy"),
         (
             "/usr/bin/wl-copy",
             &["--type", "text/plain;charset=utf-8"][..],
@@ -3310,9 +3311,74 @@ async fn clipboard_command(program: &str, args: &[&str]) -> Option<Vec<u8>> {
     output.status.success().then_some(output.stdout)
 }
 
-/// Read an image from Wayland or X11 without blocking Tokio's worker thread.
-/// The temporary file is registered in `App` and removed after submit or exit.
+#[cfg(target_os = "macos")]
+async fn clipboard_image_macos() -> std::result::Result<Option<PendingImage>, String> {
+    let dir = std::env::temp_dir().join("gnomef-paste");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let path = dir.join(format!("paste-{}.png", uuid::Uuid::new_v4()));
+    let script = r#"
+on run argv
+  set outFile to POSIX file (item 1 of argv)
+  try
+    set imageData to the clipboard as «class PNGf»
+    set fileRef to open for access outFile with write permission
+    set eof fileRef to 0
+    write imageData to fileRef
+    close access fileRef
+    return "image/png"
+  on error
+    try
+      close access outFile
+    end try
+    return ""
+  end try
+end run
+"#;
+    let output = tokio::time::timeout(
+        CLIPBOARD_COMMAND_TIMEOUT,
+        tokio::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(script)
+            .arg(path.as_os_str())
+            .output(),
+    )
+    .await
+    .map_err(|_| "macOS clipboard read timed out".to_string())?
+    .map_err(|error| format!("cannot run osascript: {error}"))?;
+    if !output.status.success() || !path.exists() {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Ok(None);
+    }
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|error| format!("cannot inspect clipboard image: {error}"))?;
+    if metadata.len() == 0 {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Ok(None);
+    }
+    if metadata.len() as usize > MAX_CLIPBOARD_IMAGE_BYTES {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(format!(
+            "clipboard image is too large ({} MiB; limit {} MiB)",
+            metadata.len() / (1024 * 1024),
+            MAX_CLIPBOARD_IMAGE_BYTES / (1024 * 1024),
+        ));
+    }
+    Ok(Some(PendingImage {
+        path,
+        media_type: "image/png".into(),
+    }))
+}
+
+/// Read an image from the native clipboard without blocking Tokio's worker thread.
+/// The temporary file is registered in App and removed after submit or exit.
 async fn clipboard_image() -> std::result::Result<Option<PendingImage>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return clipboard_image_macos().await;
+    }
     let candidates = [
         ("wl-paste", vec!["--list-types"], vec!["--type"]),
         (
