@@ -40,7 +40,7 @@ jobs:
             dist/GnomeAI-RS-*-macos-arm64.dmg
           if-no-files-found: error
 
-  publish-v1-2-1-dmg:
+  publish-v1-2-2-dmg:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build-macos-arm64
     runs-on: ubuntu-latest
@@ -52,7 +52,15 @@ jobs:
         with:
           name: GnomeAI-RS-macos-arm64
           path: dist
-      - name: Publish DMG to v1.2.1
+      - name: Publish macOS-only v1.2.2 release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload v1.2.1 dist/GnomeAI-RS-*-macos-arm64.dmg --repo ${{ github.repository }} --clobber
+        run: |
+          dmg="$(find dist -maxdepth 1 -type f -name 'GnomeAI-RS-*-macos-arm64.dmg' -print -quit)"
+          test -n "$dmg"
+          cp "$dmg" dist/GnomeAI-RS-1.2.2-macos-arm64.dmg
+          gh release create v1.2.2 dist/GnomeAI-RS-1.2.2-macos-arm64.dmg \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "GnomeAI-RS v1.2.2 — macOS Apple Silicon" \
+            --notes "macOS Apple Silicon release. This release contains only the DMG package; the Linux .deb remains unchanged in v1.2.1."
