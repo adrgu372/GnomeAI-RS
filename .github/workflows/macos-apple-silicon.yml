@@ -4,7 +4,7 @@ on:
   pull_request:
   push:
     branches:
-      - macos-apple-silicon
+      - main
   workflow_dispatch:
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
           if-no-files-found: error
 
   publish-v1-2-1-dmg:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/macos-apple-silicon'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build-macos-arm64
     runs-on: ubuntu-latest
     permissions:
