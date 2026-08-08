@@ -4,8 +4,21 @@ Open-source personal AI agent in Rust: coding-agent TUI, self-hosted WebTool,
 optional WhatsApp assistant, multiple model providers, persistent memory,
 installable skills, and explicit execution permissions.
 
-Current release: **1.2.0**. See the release notes below for the complete
+Current release: **1.2.3**. See the release notes below for the complete
 list of changes.
+
+## Release Notes - 1.2.3
+
+Version **1.2.3** replaces the raw macOS disk image with a real installer. The
+DMG contains a `.pkg` that adds GnomeAI-RS, GnomeAI-RS Agent, and GnomeAI-RS
+Web to Applications/Launchpad, plus the three corresponding terminal commands.
+The release workflow also supports Developer ID signing and Apple notarization
+so configured public releases do not require per-binary Gatekeeper approval.
+
+See [`packaging/macos/README.md`](packaging/macos/README.md) for local build,
+signing, notarization, and GitHub secret setup.
+
+---
 
 ## Release Notes - 1.2.0
 
