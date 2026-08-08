@@ -47,7 +47,11 @@ impl SandboxPolicy {
     pub fn isolated_workspace_write(cwd: impl Into<PathBuf>) -> Self {
         let cwd = cwd.into();
         let home = dirs_home();
-        let mut writable = vec![cwd.clone(), PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
+        let mut writable = vec![
+            cwd.clone(),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/private/tmp"),
+        ];
         if let Some(h) = &home {
             writable.push(h.join(".cargo/registry"));
             writable.push(h.join(".cargo/git"));
@@ -78,9 +82,15 @@ impl SandboxPolicy {
             timeout_ms: 120_000,
             max_output_bytes: 4 * 1024 * 1024,
             env_allowlist: vec![
-                "PATH".into(), "HOME".into(), "LANG".into(), "LC_ALL".into(),
-                "TERM".into(), "TMPDIR".into(), "CARGO_HOME".into(),
-                "RUSTUP_HOME".into(), "CARGO_TARGET_DIR".into(),
+                "PATH".into(),
+                "HOME".into(),
+                "LANG".into(),
+                "LC_ALL".into(),
+                "TERM".into(),
+                "TMPDIR".into(),
+                "CARGO_HOME".into(),
+                "RUSTUP_HOME".into(),
+                "CARGO_TARGET_DIR".into(),
             ],
             env_extra: Vec::new(),
         }
@@ -209,7 +219,10 @@ pub fn sandboxed_command(
     program: &str,
     args: &[String],
 ) -> Result<Command> {
-    let strict = matches!(policy.mode, SandboxMode::ReadOnly | SandboxMode::IsolatedWorkspaceWrite);
+    let strict = matches!(
+        policy.mode,
+        SandboxMode::ReadOnly | SandboxMode::IsolatedWorkspaceWrite
+    );
     let mut cmd = if strict {
         let sandbox_exec = Path::new("/usr/bin/sandbox-exec");
         if !sandbox_exec.is_file() {
@@ -254,11 +267,14 @@ fn build_profile(policy: &SandboxPolicy) -> String {
          (allow sysctl-read)\n\
          (allow mach-lookup)\n\
          (allow signal (target same-sandbox))\n\
-         (allow file-read-metadata)\n"
+         (allow file-read-metadata)\n",
     );
 
     for path in &policy.readable {
-        profile.push_str(&format!("(allow file-read* (subpath {}))\n", sbpl_string(path)));
+        profile.push_str(&format!(
+            "(allow file-read* (subpath {}))\n",
+            sbpl_string(path)
+        ));
     }
     for path in &policy.writable {
         // Writes also need reads for compilers, editors and atomic renames.
@@ -268,7 +284,9 @@ fn build_profile(policy: &SandboxPolicy) -> String {
         ));
     }
     for device in ["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"] {
-        profile.push_str(&format!("(allow file-read* file-write* (literal \"{device}\"))\n"));
+        profile.push_str(&format!(
+            "(allow file-read* file-write* (literal \"{device}\"))\n"
+        ));
     }
     if policy.allow_network {
         profile.push_str("(allow network*)\n");
@@ -314,7 +332,9 @@ where
     }
     let mut text = String::from_utf8_lossy(&buf).into_owned();
     if truncated {
-        text.push_str(&format!("\n\n[... output truncated, {total} bytes total ...]"));
+        text.push_str(&format!(
+            "\n\n[... output truncated, {total} bytes total ...]"
+        ));
     }
     Ok((text, truncated))
 }
