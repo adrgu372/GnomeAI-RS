@@ -9,25 +9,14 @@ use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
 
 use crate::protocol::SecretString;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct PendingApprovals {
     inner: Arc<Mutex<HashMap<String, PendingApproval>>>,
-    events: broadcast::Sender<Value>,
-}
-
-impl Default for PendingApprovals {
-    fn default() -> Self {
-        let (events, _) = broadcast::channel(64);
-        Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
-            events,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,12 +88,6 @@ impl fmt::Display for PendingApprovalError {
 impl std::error::Error for PendingApprovalError {}
 
 impl PendingApprovals {
-    /// Subscribe to newly registered public approval requests. The event never
-    /// contains credentials; it is the same sanitized object WebTool polls.
-    pub fn subscribe(&self) -> broadcast::Receiver<Value> {
-        self.events.subscribe()
-    }
-
     pub async fn public_view(&self) -> Value {
         let guard = self.inner.lock().await;
         let mut requests = guard
@@ -121,33 +104,6 @@ impl PendingApprovals {
             "request": requests.first(),
             "requests": requests,
         })
-    }
-
-    /// Return requests owned by one conversation, including its subagents.
-    /// A boundary check on `#` prevents similarly-prefixed chat ids from
-    /// seeing or answering one another's approvals.
-    pub async fn public_for_conversation(&self, conversation_scope: &str) -> Vec<Value> {
-        if conversation_scope.trim().is_empty() {
-            return Vec::new();
-        }
-        let guard = self.inner.lock().await;
-        let mut requests = guard
-            .values()
-            .filter(|pending| {
-                pending.scope == conversation_scope
-                    || pending
-                        .scope
-                        .strip_prefix(conversation_scope)
-                        .is_some_and(|suffix| suffix.starts_with('#'))
-            })
-            .map(|pending| pending.public.clone())
-            .collect::<Vec<_>>();
-        requests.sort_by(|left, right| {
-            left.get("createdAt")
-                .and_then(Value::as_str)
-                .cmp(&right.get("createdAt").and_then(Value::as_str))
-        });
-        requests
     }
 
     pub async fn request_standard(
@@ -263,7 +219,6 @@ impl PendingApprovals {
         public["source"] = json!(source);
         public["createdAt"] = json!(Utc::now().to_rfc3339());
         let (sender, receiver) = oneshot::channel();
-        let event = public.clone();
         {
             let mut guard = self.inner.lock().await;
             if guard.values().any(|pending| pending.scope == scope) {
@@ -279,10 +234,6 @@ impl PendingApprovals {
                 },
             );
         }
-        // WebTool continues to poll `public_view`; subscribers are used by
-        // conversational channels such as WhatsApp to surface the request as
-        // soon as the tool loop blocks.
-        let _ = self.events.send(event);
 
         match tokio::time::timeout(Duration::from_secs(timeout_seconds), receiver).await {
             Ok(Ok(answer)) => Ok(answer),
@@ -353,63 +304,5 @@ mod tests {
         let (secret, remember) = request.await.unwrap().unwrap().unwrap();
         assert_eq!(secret.expose(), "secret-value");
         assert!(remember);
-    }
-
-    #[tokio::test]
-    async fn conversation_view_includes_subagents_but_not_similar_chat_ids() {
-        let pending = PendingApprovals::default();
-        let worker = pending.clone();
-        let request = tokio::spawn(async move {
-            worker
-                .request_standard("wa_chat#a1", "Bash", "cargo test", "runs tests", "/project")
-                .await
-        });
-        tokio::task::yield_now().await;
-
-        let requests = pending.public_for_conversation("wa_chat").await;
-        assert_eq!(requests.len(), 1);
-        assert!(pending.public_for_conversation("wa_cha").await.is_empty());
-
-        pending
-            .answer(
-                requests[0]["id"].as_str().unwrap(),
-                ApprovalAnswerPayload {
-                    decision: "deny".into(),
-                    credential: None,
-                    remember: false,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(!request.await.unwrap().unwrap());
-    }
-
-    #[tokio::test]
-    async fn new_requests_are_broadcast_without_private_answers() {
-        let pending = PendingApprovals::default();
-        let mut events = pending.subscribe();
-        let worker = pending.clone();
-        let request = tokio::spawn(async move {
-            worker
-                .request_standard("wa_chat", "Edit", "src/main.rs", "edits a file", "/project")
-                .await
-        });
-
-        let event = events.recv().await.unwrap();
-        assert_eq!(event["source"], "whatsapp");
-        assert_eq!(event["kind"], "approval");
-        assert!(!event.to_string().contains("credential"));
-        pending
-            .answer(
-                event["id"].as_str().unwrap(),
-                ApprovalAnswerPayload {
-                    decision: "allow".into(),
-                    credential: None,
-                    remember: false,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(request.await.unwrap().unwrap());
     }
 }

@@ -1,12 +1,11 @@
 # Unreleased
 
-- WhatsApp tool approvals are now conversational: each pending operation is
-  posted into its originating chat and a direct statement such as `aprob
-  comanda`, `execută comanda`, or `nu aprob` resumes or rejects the blocked
-  tool call without starting a second model turn.
-- Concurrent subagent approvals can be selected by their displayed approval
-  ID. Sudo passwords remain restricted to the masked local WebTool dialog and
-  are never accepted through WhatsApp.
+- Allowed WhatsApp chats now treat the inbound request itself as authorization
+  for standard user-level tools. Writes, edits, Bash commands, and delegated
+  subagent work no longer block on an unattended WebTool approval dialog.
+- `read-only` remains enforced. WhatsApp sudo can reuse an active ticket or a
+  valid credential saved in the desktop keyring; otherwise it returns a clear
+  error without opening a local password prompt.
 
 ---
 

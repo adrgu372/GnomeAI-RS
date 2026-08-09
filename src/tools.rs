@@ -358,8 +358,13 @@ async fn run_tool_loop_internal(
         &build_runtime_aware_system_prompt(system_prompt, runtime_profile),
         memory_block,
     );
+    let channel_execution_policy = if session_key.is_some_and(is_whatsapp_scope) {
+        "WhatsApp authorization: this turn came from an allowed WhatsApp chat. The user's inbound message itself authorizes the standard user-level tool calls needed to fulfill it, so execute them without waiting for a desktop confirmation. Read-only mode still blocks mutations. Sudo may proceed only with an existing sudo ticket or a valid credential already stored in the local keyring; if neither is available, fail clearly instead of opening a desktop prompt."
+    } else {
+        "WebTool authorization: obey the selected execution mode and request local confirmation whenever normal mode requires it."
+    };
     let runtime_aware_system_prompt = format!(
-        "{runtime_aware_system_prompt}\n\nSelected workspace: {}\nShared WebTool/WhatsApp execution mode: {}.\n{}\nWhen a tool is needed, call it through the native tool-calling API. Never print a tool call as markdown such as `**WebSearch** (query: ...)`. After receiving tool results, answer the user directly instead of announcing another intermediate step.",
+        "{runtime_aware_system_prompt}\n\nSelected workspace: {}\nShared WebTool/WhatsApp execution mode: {}.\n{channel_execution_policy}\n{}\nWhen a tool is needed, call it through the native tool-calling API. Never print a tool call as markdown such as `**WebSearch** (query: ...)`. After receiving tool results, answer the user directly instead of announcing another intermediate step.",
         paths.workspace_dir.display(),
         cfg.web_sandbox_mode,
         agent_profile.guidance(),
@@ -1807,6 +1812,11 @@ async fn authorize_standard(
     match web_sandbox_mode(cfg) {
         SandboxMode::ReadOnly => bail!("{tool} is disabled in read-only mode"),
         SandboxMode::FullAccess => Ok(()),
+        SandboxMode::Normal | SandboxMode::IsolatedWorkspaceWrite
+            if is_whatsapp_scope(scope_key) =>
+        {
+            Ok(())
+        }
         SandboxMode::Normal | SandboxMode::IsolatedWorkspaceWrite => {
             let approved = pending_approvals
                 .request_standard(
@@ -1930,21 +1940,31 @@ async fn tool_sudo(
     if !cwd.is_dir() {
         bail!("cwd is not a directory: {}", cwd.display());
     }
-    let approved = pending_approvals
-        .request_standard(
-            scope_key,
-            "Sudo",
-            &command,
-            "This command will run as root. Full-access never bypasses this confirmation.",
-            &paths.workspace_dir.to_string_lossy(),
-        )
-        .await?;
-    if !approved {
-        bail!("Sudo was denied by the user")
+    let whatsapp_origin = is_whatsapp_scope(scope_key);
+    if !whatsapp_origin {
+        let approved = pending_approvals
+            .request_standard(
+                scope_key,
+                "Sudo",
+                &command,
+                "This command will run as root. Full-access never bypasses this confirmation.",
+                &paths.workspace_dir.to_string_lossy(),
+            )
+            .await?;
+        if !approved {
+            bail!("Sudo was denied by the user")
+        }
     }
 
     let cancel = turn.cancel_token().clone();
-    ensure_web_sudo_authenticated(pending_approvals, scope_key, &command, &cancel).await?;
+    ensure_web_sudo_authenticated(
+        pending_approvals,
+        scope_key,
+        &command,
+        &cancel,
+        !whatsapp_origin,
+    )
+    .await?;
     let secs = value_u64(args, "timeout").unwrap_or(60).clamp(1, 600);
     let mut policy = SandboxPolicy::full_access(cwd.clone());
     policy.allow_privilege_escalation = true;
@@ -1979,6 +1999,7 @@ async fn ensure_web_sudo_authenticated(
     scope_key: &str,
     command: &str,
     cancel: &CancellationToken,
+    allow_interactive_prompt: bool,
 ) -> anyhow::Result<()> {
     if validate_sudo(None, cancel).await? {
         return Ok(());
@@ -1991,6 +2012,12 @@ async fn ensure_web_sudo_authenticated(
             Ok(None) => {}
             Err(error) => warn!("desktop keyring lookup failed: {error}"),
         }
+    }
+
+    if !allow_interactive_prompt {
+        bail!(
+            "Sudo from WhatsApp requires an active sudo ticket or a valid credential already saved in the desktop keyring; authenticate locally once and enable keyring storage"
+        )
     }
 
     let mut message = None;
@@ -3687,8 +3714,12 @@ fn normalize_ws(text: &str) -> String {
         .to_string()
 }
 
+fn is_whatsapp_scope(scope_key: &str) -> bool {
+    scope_key.starts_with("wa_") || scope_key.starts_with("whatsapp_")
+}
+
 fn source_channel_for_scope(scope_key: &str) -> &'static str {
-    if scope_key.starts_with("wa_") || scope_key.starts_with("whatsapp_") {
+    if is_whatsapp_scope(scope_key) {
         "whatsapp"
     } else {
         "webtool"
@@ -4062,6 +4093,63 @@ mod tests {
             source_channel_for_scope(&approval_scope_for("wa_123", Some("a1"))),
             "whatsapp"
         );
+    }
+
+    #[tokio::test]
+    async fn whatsapp_standard_tools_never_register_a_desktop_approval() {
+        let test_root = std::env::temp_dir().join(format!(
+            "gnomeai-whatsapp-approval-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let mut paths = AppPaths::new(test_root.clone()).unwrap();
+        paths.workspace_dir = test_root.clone();
+        let pending = PendingApprovals::default();
+        let cfg = AppConfig::default();
+
+        authorize_standard(
+            &cfg,
+            &pending,
+            "wa_40700000000_s_whatsapp_net#a1",
+            "Bash",
+            "find /home/user -name '*.jpg'",
+            "may inspect user files",
+            &paths,
+        )
+        .await
+        .unwrap();
+
+        let view = pending.public_view().await;
+        assert_eq!(view["pending"], false);
+        assert!(view["requests"].as_array().unwrap().is_empty());
+        std::fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_still_blocks_whatsapp_mutations_without_prompting() {
+        let test_root = std::env::temp_dir().join(format!(
+            "gnomeai-whatsapp-read-only-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let mut paths = AppPaths::new(test_root.clone()).unwrap();
+        paths.workspace_dir = test_root.clone();
+        let pending = PendingApprovals::default();
+        let mut cfg = AppConfig::default();
+        cfg.web_sandbox_mode = "read-only".into();
+
+        let result = authorize_standard(
+            &cfg,
+            &pending,
+            "wa_40700000000_s_whatsapp_net",
+            "Write",
+            "result.txt",
+            "writes a file",
+            &paths,
+        )
+        .await;
+
+        assert!(result.unwrap_err().to_string().contains("read-only"));
+        assert_eq!(pending.public_view().await["pending"], false);
+        std::fs::remove_dir_all(test_root).unwrap();
     }
 
     #[tokio::test]

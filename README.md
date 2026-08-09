@@ -1103,8 +1103,9 @@ symlink escapes are rejected.
 WebTool and WhatsApp use the same execution mode from `web_sandbox_mode`:
 
 - `read-only` blocks file mutations, Bash, and sudo;
-- `normal` asks before every file write/edit or shell command; WhatsApp turns
-  can answer their own request declaratively in the same chat;
+- `normal` asks locally for WebTool writes/edits and shell commands; an inbound
+  request from an allowed WhatsApp chat is itself the authorization for its
+  standard user-level tool calls, so it does not wait for the desktop;
 - `full-access` skips standard user-level confirmations, but never grants root.
 
 Root execution is exposed only by the dedicated `Sudo` tool. It asks once for
@@ -1398,13 +1399,12 @@ same memory and model-provider configuration as WebTool.
 WhatsApp turns run through the same workspace-aware native tool loop as
 WebTool. Provider, model, memory, skills, workspace, Web Search and sandbox
 mode are shared live. `/workspace`, `/sandbox`, and the expanded `/status`
-report that state. If a WhatsApp turn proposes a write, shell command, or sudo
-operation, the request is sent into the WhatsApp conversation and also appears
-in the local WebTool. Replying directly with wording such as `aprob comanda`,
-`execută comanda`, or `nu aprob` resumes or rejects the exact blocked tool call;
-the reply does not start a second model turn. If several subagents have pending
-requests, name the displayed approval ID, for example `aprob approval_ab12cd`.
-Sudo credentials remain local and never enter the WhatsApp transcript.
+report that state. Messages accepted from the self-chat or configured JID
+allowlist directly authorize standard writes, edits, Bash commands, and the
+same work delegated to subagents; no approval dialog is opened on the desktop.
+`read-only` remains enforced. Sudo can use an active ticket or a credential
+already stored in the desktop keyring; otherwise it fails in WhatsApp with a
+clear authentication error instead of opening an unattended local prompt.
 
 ## Notes
 
