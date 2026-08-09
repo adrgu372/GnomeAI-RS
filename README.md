@@ -1108,12 +1108,15 @@ WebTool and WhatsApp use the same execution mode from `web_sandbox_mode`:
   standard user-level tool calls, so it does not wait for the desktop;
 - `full-access` skips standard user-level confirmations, but never grants root.
 
-Root execution is exposed only by the dedicated `Sudo` tool. It asks once for
-the exact root command even in `full-access`, then requests a masked password
-only if the existing sudo ticket/keyring credential is unavailable. Generic
-Bash runs through the native helper with `no_new_privs`, so it cannot reuse a
-sudo ticket. Sudo and filesystem browsing are disabled when WebTool binds to a
-non-loopback address.
+Root execution is exposed only by the dedicated `Sudo` tool. WebTool asks once
+for the exact root command even in `full-access`, then requests a masked
+password only if the existing sudo ticket/keyring credential is unavailable.
+For an allowed WhatsApp request, the inbound message authorizes the command;
+sudo may reuse only an active ticket or a credential already stored in the
+local keyring and never opens a new desktop prompt. Generic Bash runs through
+the native helper with `no_new_privs`, so it cannot reuse a sudo ticket. Sudo
+and filesystem browsing are disabled when WebTool binds to a non-loopback
+address.
 
 ### Subagents
 

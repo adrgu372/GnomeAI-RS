@@ -4087,8 +4087,8 @@ mod tests {
             approval_scope_for("chat_7", Some("a1")),
             approval_scope_for("chat_7", Some("a2"))
         );
-        // The WhatsApp prefix decides which channel an approval is shown on,
-        // so it has to survive the suffix.
+        // The WhatsApp prefix drives implicit authorization and task source
+        // attribution, so it has to survive the subagent suffix.
         assert_eq!(
             source_channel_for_scope(&approval_scope_for("wa_123", Some("a1"))),
             "whatsapp"
