@@ -1103,7 +1103,8 @@ symlink escapes are rejected.
 WebTool and WhatsApp use the same execution mode from `web_sandbox_mode`:
 
 - `read-only` blocks file mutations, Bash, and sudo;
-- `normal` asks locally before every file write/edit or shell command;
+- `normal` asks before every file write/edit or shell command; WhatsApp turns
+  can answer their own request declaratively in the same chat;
 - `full-access` skips standard user-level confirmations, but never grants root.
 
 Root execution is exposed only by the dedicated `Sudo` tool. It asks once for
@@ -1398,8 +1399,12 @@ WhatsApp turns run through the same workspace-aware native tool loop as
 WebTool. Provider, model, memory, skills, workspace, Web Search and sandbox
 mode are shared live. `/workspace`, `/sandbox`, and the expanded `/status`
 report that state. If a WhatsApp turn proposes a write, shell command, or sudo
-operation, its approval appears in the local WebTool and is labeled as a
-WhatsApp request; credentials never enter the WhatsApp transcript.
+operation, the request is sent into the WhatsApp conversation and also appears
+in the local WebTool. Replying directly with wording such as `aprob comanda`,
+`execută comanda`, or `nu aprob` resumes or rejects the exact blocked tool call;
+the reply does not start a second model turn. If several subagents have pending
+requests, name the displayed approval ID, for example `aprob approval_ab12cd`.
+Sudo credentials remain local and never enter the WhatsApp transcript.
 
 ## Notes
 
