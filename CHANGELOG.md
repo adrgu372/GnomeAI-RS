@@ -1,3 +1,14 @@
+# GnomeAI-RS 1.2.4 - 2026-08-09
+
+- Allowed WhatsApp chats now treat the inbound request itself as authorization
+  for standard user-level tools. Writes, edits, Bash commands, and delegated
+  subagent work no longer block on an unattended WebTool approval dialog.
+- `read-only` remains enforced. WhatsApp sudo can reuse an active ticket or a
+  valid credential saved in the desktop keyring; otherwise it returns a clear
+  error without opening a local password prompt.
+
+---
+
 # GnomeAI-RS 1.2.3 - 2026-08-08
 
 - Replaced the raw macOS DMG folder with a real `.pkg` installer contained in

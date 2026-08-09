@@ -4,8 +4,21 @@ Open-source personal AI agent in Rust: coding-agent TUI, self-hosted WebTool,
 optional WhatsApp assistant, multiple model providers, persistent memory,
 installable skills, and explicit execution permissions.
 
-Current release: **1.2.3**. See the release notes below for the complete
+Current release: **1.2.4**. See the release notes below for the complete
 list of changes.
+
+## Release Notes - 1.2.4
+
+Version **1.2.4** makes an accepted request from the WhatsApp self-chat or an
+explicitly allowed JID sufficient authorization for standard user-level tools.
+Writes, edits, Bash commands, and delegated subagent work now execute without
+opening an approval dialog on the unattended desktop. `read-only` remains
+blocking, while WhatsApp sudo may use only an active ticket or a credential
+already saved in the local keyring and never opens a password popup.
+
+WebTool and TUI approval behavior is unchanged.
+
+---
 
 ## Release Notes - 1.2.3
 
@@ -1103,15 +1116,20 @@ symlink escapes are rejected.
 WebTool and WhatsApp use the same execution mode from `web_sandbox_mode`:
 
 - `read-only` blocks file mutations, Bash, and sudo;
-- `normal` asks locally before every file write/edit or shell command;
+- `normal` asks locally for WebTool writes/edits and shell commands; an inbound
+  request from an allowed WhatsApp chat is itself the authorization for its
+  standard user-level tool calls, so it does not wait for the desktop;
 - `full-access` skips standard user-level confirmations, but never grants root.
 
-Root execution is exposed only by the dedicated `Sudo` tool. It asks once for
-the exact root command even in `full-access`, then requests a masked password
-only if the existing sudo ticket/keyring credential is unavailable. Generic
-Bash runs through the native helper with `no_new_privs`, so it cannot reuse a
-sudo ticket. Sudo and filesystem browsing are disabled when WebTool binds to a
-non-loopback address.
+Root execution is exposed only by the dedicated `Sudo` tool. WebTool asks once
+for the exact root command even in `full-access`, then requests a masked
+password only if the existing sudo ticket/keyring credential is unavailable.
+For an allowed WhatsApp request, the inbound message authorizes the command;
+sudo may reuse only an active ticket or a credential already stored in the
+local keyring and never opens a new desktop prompt. Generic Bash runs through
+the native helper with `no_new_privs`, so it cannot reuse a sudo ticket. Sudo
+and filesystem browsing are disabled when WebTool binds to a non-loopback
+address.
 
 ### Subagents
 
@@ -1397,9 +1415,12 @@ same memory and model-provider configuration as WebTool.
 WhatsApp turns run through the same workspace-aware native tool loop as
 WebTool. Provider, model, memory, skills, workspace, Web Search and sandbox
 mode are shared live. `/workspace`, `/sandbox`, and the expanded `/status`
-report that state. If a WhatsApp turn proposes a write, shell command, or sudo
-operation, its approval appears in the local WebTool and is labeled as a
-WhatsApp request; credentials never enter the WhatsApp transcript.
+report that state. Messages accepted from the self-chat or configured JID
+allowlist directly authorize standard writes, edits, Bash commands, and the
+same work delegated to subagents; no approval dialog is opened on the desktop.
+`read-only` remains enforced. Sudo can use an active ticket or a credential
+already stored in the desktop keyring; otherwise it fails in WhatsApp with a
+clear authentication error instead of opening an unattended local prompt.
 
 ## Notes
 

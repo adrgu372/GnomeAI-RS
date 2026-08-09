@@ -2275,7 +2275,7 @@ async fn handle_whatsapp_command(state: &AppState, chat_id: &str, command: &str)
         "/sandbox" => {
             let cfg = state.config.read().await;
             Some(format!(
-                "🛡️ Mod comun: {}\nAprobările pentru scrieri/comenzi și autentificarea sudo se fac local în WebTool.",
+                "🛡️ Mod comun: {}\nCererile acceptate din WhatsApp autorizează direct scrierile și comenzile standard. Read-only rămâne blocant; sudo folosește numai un ticket activ sau keyring-ul local.",
                 cfg.web_sandbox_mode
             ))
         }
