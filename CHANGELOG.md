@@ -1,3 +1,15 @@
+# Unreleased
+
+- WhatsApp tool approvals are now conversational: each pending operation is
+  posted into its originating chat and a direct statement such as `aprob
+  comanda`, `execută comanda`, or `nu aprob` resumes or rejects the blocked
+  tool call without starting a second model turn.
+- Concurrent subagent approvals can be selected by their displayed approval
+  ID. Sudo passwords remain restricted to the masked local WebTool dialog and
+  are never accepted through WhatsApp.
+
+---
+
 # GnomeAI-RS 1.2.3 - 2026-08-08
 
 - Replaced the raw macOS DMG folder with a real `.pkg` installer contained in
