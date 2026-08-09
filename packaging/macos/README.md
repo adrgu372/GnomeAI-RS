@@ -50,7 +50,7 @@ The workflow builds ad-hoc-signed artifacts when Apple credentials are absent,
 including for version tags. Such a release is published with a prominent
 Gatekeeper warning and first-open instructions. When all secrets are
 configured, artifacts are instead Developer ID signed and notarized. A tag
-must exactly match the Cargo package version, for example `v1.2.3`.
+must exactly match the Cargo package version, for example `v1.2.4`.
 
 Apple's requirements and command-line notarization workflow are documented in
 [Notarizing macOS software before distribution](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)

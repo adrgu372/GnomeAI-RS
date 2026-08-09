@@ -1,4 +1,4 @@
-# Unreleased
+# GnomeAI-RS 1.2.4 - 2026-08-09
 
 - Allowed WhatsApp chats now treat the inbound request itself as authorization
   for standard user-level tools. Writes, edits, Bash commands, and delegated

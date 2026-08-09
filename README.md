@@ -4,8 +4,21 @@ Open-source personal AI agent in Rust: coding-agent TUI, self-hosted WebTool,
 optional WhatsApp assistant, multiple model providers, persistent memory,
 installable skills, and explicit execution permissions.
 
-Current release: **1.2.3**. See the release notes below for the complete
+Current release: **1.2.4**. See the release notes below for the complete
 list of changes.
+
+## Release Notes - 1.2.4
+
+Version **1.2.4** makes an accepted request from the WhatsApp self-chat or an
+explicitly allowed JID sufficient authorization for standard user-level tools.
+Writes, edits, Bash commands, and delegated subagent work now execute without
+opening an approval dialog on the unattended desktop. `read-only` remains
+blocking, while WhatsApp sudo may use only an active ticket or a credential
+already saved in the local keyring and never opens a password popup.
+
+WebTool and TUI approval behavior is unchanged.
+
+---
 
 ## Release Notes - 1.2.3
 
