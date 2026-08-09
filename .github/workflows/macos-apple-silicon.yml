@@ -195,14 +195,34 @@ jobs:
           if-no-files-found: error
 
   publish-release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      always() &&
+      needs.build-macos-arm64.result == 'success' &&
+      needs.build-debian-amd64.result == 'success' &&
+      (needs.tag-release.result == 'success' || needs.tag-release.result == 'skipped') &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+       (github.event_name == 'push' &&
+        github.ref == 'refs/heads/main' &&
+        startsWith(github.event.head_commit.message, 'Release v')))
     needs:
+      - tag-release
       - build-macos-arm64
       - build-debian-amd64
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+      - name: Resolve the validated release tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            release_tag="$GITHUB_REF_NAME"
+          else
+            version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+            release_tag="v${version}"
+          fi
+          test -n "$release_tag"
+          echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
       - name: Download validated macOS package
         uses: actions/download-artifact@v4
         with:
@@ -218,7 +238,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           release_notice="$(cat dist/macos-release-notice.md)"
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
             dist/GnomeAI-RS-*-macos-arm64.pkg \
             dist/GnomeAI-RS-*-macos-arm64.dmg \
             dist/GnomeAI-RS-*-macos-arm64.sha256 \
@@ -226,6 +246,6 @@ jobs:
             dist/gnomeai-rs_*_amd64.deb.sha256 \
             --repo "${{ github.repository }}" \
             --verify-tag \
-            --title "GnomeAI-RS ${GITHUB_REF_NAME}" \
+            --title "GnomeAI-RS ${RELEASE_TAG}" \
             --notes "$release_notice" \
             --generate-notes
