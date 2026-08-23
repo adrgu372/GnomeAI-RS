@@ -382,32 +382,46 @@ pub async fn send_whatsapp_message(cfg: &AppConfig, chat_jid: &str, text: &str) 
     }
 }
 
-pub fn self_whatsapp_jid(paths: &AppPaths) -> String {
+pub fn self_whatsapp_jids(paths: &AppPaths) -> Vec<String> {
     let creds_path = whatsapp_auth_file(paths);
     let Ok(raw) = std::fs::read_to_string(creds_path) else {
-        return String::new();
+        return Vec::new();
     };
     let Ok(creds) = serde_json::from_str::<Value>(&raw) else {
-        return String::new();
+        return Vec::new();
     };
-    let me = creds
-        .get("me")
-        .and_then(Value::as_object)
-        .and_then(|me| me.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let phone = me
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .split('@')
-        .next()
-        .unwrap_or("");
-    if phone.is_empty() {
-        String::new()
-    } else {
-        format!("{phone}@s.whatsapp.net")
+    let Some(me) = creds.get("me").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut identities = Vec::new();
+    for key in ["id", "lid"] {
+        let Some(raw_jid) = me.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((user, server)) = raw_jid.trim().split_once('@') else {
+            continue;
+        };
+        let user = user.split(':').next().unwrap_or("").trim();
+        let server = server.trim().to_ascii_lowercase();
+        if user.is_empty() || server.is_empty() {
+            continue;
+        }
+        let jid = format!("{user}@{server}");
+        if !identities.contains(&jid) {
+            identities.push(jid);
+        }
     }
+    identities
+}
+
+pub fn self_whatsapp_jid(paths: &AppPaths) -> String {
+    let identities = self_whatsapp_jids(paths);
+    identities
+        .iter()
+        .find(|jid| jid.ends_with("@s.whatsapp.net"))
+        .or_else(|| identities.first())
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub fn qr_svg(qr_data: &str) -> anyhow::Result<String> {
@@ -520,8 +534,8 @@ mod tests {
     }
 
     #[test]
-    fn bundled_node_is_resolved_next_to_webtool_binary() {
-        let candidates = bundled_node_candidates(Path::new("/usr/lib/gnomeai-rs/gnomef-web"));
+    fn bundled_node_is_resolved_next_to_native_helper() {
+        let candidates = bundled_node_candidates(Path::new("/usr/lib/gnomeai-rs/gnomef-whatsapp"));
         assert_eq!(
             candidates[0],
             PathBuf::from("/usr/lib/gnomeai-rs/node/bin/node")

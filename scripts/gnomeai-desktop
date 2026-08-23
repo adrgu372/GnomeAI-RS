@@ -1,0 +1,107 @@
+#!/bin/sh
+set -eu
+
+need_xdotool() {
+    if ! command -v xdotool >/dev/null 2>&1; then
+        echo "xdotool is required for desktop input. On a Wayland-only session, use an X11 session or configure a compatible virtual-input backend." >&2
+        exit 127
+    fi
+}
+
+find_a11y_helper() {
+    if [ -n "${GNOMEAI_A11Y_HELPER:-}" ] && [ -x "$GNOMEAI_A11Y_HELPER" ]; then
+        printf '%s\n' "$GNOMEAI_A11Y_HELPER"
+        return 0
+    fi
+    script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    for candidate in \
+        /usr/lib/gnomeai-rs/gnomeai-desktop-a11y \
+        "$script_dir/gnomeai-desktop-a11y" \
+        "$script_dir/../lib/gnomeai-rs/gnomeai-desktop-a11y" \
+        "$script_dir/../target/release/gnomeai-desktop-a11y"
+    do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    echo "GnomeAI semantic desktop helper is missing; reinstall GnomeAI-RS." >&2
+    return 127
+}
+
+action=${1:-}
+case "$action" in
+    inspect|activate|set_text|focus)
+        a11y_helper=$(find_a11y_helper)
+        exec "$a11y_helper" "$@"
+        ;;
+    observe)
+        output=${2:-}
+        if [ -z "$output" ]; then
+            echo "usage: gnomeai-desktop observe OUTPUT.png" >&2
+            exit 2
+        fi
+        mkdir -p -- "$(dirname -- "$output")"
+        if command -v gnome-screenshot >/dev/null 2>&1; then
+            gnome-screenshot -f "$output"
+        elif command -v grim >/dev/null 2>&1; then
+            grim "$output"
+        elif command -v scrot >/dev/null 2>&1; then
+            scrot "$output"
+        elif command -v import >/dev/null 2>&1; then
+            import -window root "$output"
+        else
+            echo "No screenshot backend found. Install gnome-screenshot, grim, scrot, or ImageMagick." >&2
+            exit 127
+        fi
+        ;;
+    click|double_click)
+        need_xdotool
+        x=${2:-}
+        y=${3:-}
+        button=${4:-1}
+        xdotool mousemove --sync "$x" "$y"
+        if [ "$action" = "double_click" ]; then
+            xdotool click --repeat 2 --delay 110 "$button"
+        else
+            xdotool click "$button"
+        fi
+        ;;
+    move)
+        need_xdotool
+        xdotool mousemove --sync "${2:-}" "${3:-}"
+        ;;
+    type)
+        need_xdotool
+        xdotool type --clearmodifiers --delay 12 "${2:-}"
+        ;;
+    key)
+        need_xdotool
+        xdotool key --clearmodifiers "${2:-}"
+        ;;
+    scroll)
+        need_xdotool
+        amount=${2:-0}
+        case "$amount" in
+            -*) button=4; count=${amount#-} ;;
+            *) button=5; count=$amount ;;
+        esac
+        if [ "$count" -gt 0 ]; then
+            xdotool click --repeat "$count" --delay 45 "$button"
+        fi
+        ;;
+    focus_window)
+        need_xdotool
+        pattern=${2:-}
+        window=$(xdotool search --limit 1 --name "$pattern" | head -n 1)
+        if [ -z "$window" ]; then
+            echo "No desktop window matched: $pattern" >&2
+            exit 1
+        fi
+        xdotool windowactivate --sync "$window"
+        ;;
+    *)
+        echo "usage: gnomeai-desktop inspect|activate|set_text|focus|observe|click|double_click|move|type|key|scroll|focus_window ..." >&2
+        exit 2
+        ;;
+esac

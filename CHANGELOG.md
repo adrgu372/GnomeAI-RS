@@ -1,3 +1,93 @@
+# GnomeAI-RS 2.0.0 - 2026-08-23
+
+GnomeAI-RS 2.0 replaces the terminal/browser-first product with a polished
+native graphical application while preserving the Rust agent core and adding
+distributed execution for weak Linux computers.
+
+## Native graphical application
+
+- Replaced the former HTML page as the primary interface with a native
+  `eframe`/`egui` desktop application. The packaged launcher opens no terminal
+  and no browser window.
+- Added a Codex-inspired workspace: conversation sidebar, searchable
+  transcript, streaming messages, expandable reasoning/tool cards, diff and
+  verification views, and a full-width bottom composer.
+- The composer accepts focus from any empty point inside the bar, renders
+  Romanian diacritics, wraps long text and grows automatically to eight rows.
+- Added drag-and-drop and native file pickers. Attachments support images,
+  PDF, DOCX/XLSX/PPTX and their macro/ODF variants, plain text/data files, and
+  a broad set of source-code formats.
+- Conversations now receive automatic titles and can be renamed, forked or
+  deleted directly from the sidebar.
+- Settings, provider, model, WhatsApp, skills, memory, diagnostics and devices
+  open as compact, resizable native windows with consistent close controls.
+
+## Providers, accounts and multimodal input
+
+- Added native provider and model selectors for OpenAI-compatible and
+  Anthropic APIs, plus subscription-backed OpenAI Account (Codex app-server)
+  and Anthropic Account (Claude Code) sessions.
+- API keys and valid account sessions are reused across launches; users only
+  need to authenticate again when credentials change or expire.
+- Account providers can select explicit supported models instead of being
+  restricted to `default`.
+- Relaxed model-name heuristics for vision and added safe multipart-to-text
+  fallback when an OpenAI-compatible endpoint rejects `image_url` content.
+
+## WhatsApp and agent capabilities
+
+- Added native WhatsApp configuration, QR pairing, status, reconnect and test
+  messaging. Allowed chats share providers, memory, skills, file processing,
+  tools and paired nodes with the desktop app, including OpenAI and Anthropic
+  account-backed providers.
+- Added safe recovery for stale WhatsApp cryptographic sessions and clearer
+  handling of transient stream/USync errors.
+- Added installable `SKILL.md` packages and restored explicit workflow learning
+  through `learn_skill`. Learning and execution remain separate operations;
+  learned entrypoints can run locally or on a paired node.
+- Added autonomous Linux desktop navigation. Semantic AT-SPI inspection and
+  actions are preferred, with screenshot/coordinate input as a fallback.
+- Added persistent SQLite memory, Web Search/Firecrawl on demand, subagents,
+  task planning, sandbox modes, native approvals and a dedicated sudo path.
+
+## Hub and lightweight nodes
+
+- Added the native Hub/devices window and the init-agnostic `gnomeai-node`
+  client for Raspberry Pi, Void Linux and other low-power computers. Models,
+  credentials, memory and reasoning remain on the main PC; nodes connect
+  outbound and execute approved jobs.
+- Added separate enrollment/admin tokens and per-device root policies. Remote
+  root requires both local `--allow-root` enrollment and permission from the
+  main graphical app.
+- Added foreground/manual, runit, OpenRC and s6 deployment documentation with
+  no systemd dependency.
+- Added real cross-compiled node release packages: amd64 and arm64 `.deb` and
+  `.tar.gz`, plus Void `x86_64`, glibc `aarch64` and musl `aarch64-musl`
+  `.xbps` packages. Package builders validate ELF architecture before naming an
+  artifact and use `cross-rs` for the musl target.
+- Fixed the XBPS CA certificate dependency to use the valid
+  `ca-certificates>=0` expression.
+
+---
+
+# GnomeAI-RS 1.2.4-15 - 2026-08-23
+
+- Added an init-agnostic `gnomeai-node` client for Raspberry Pi and weak Linux
+  PCs, plus a native Hub/devices window in the main application.
+- Added separate node/admin credentials and per-device root policies; root
+  also requires local `--allow-root` opt-in.
+- Restored explicit workflow learning as managed SKILL.md packages with an
+  optional executable entrypoint that can run locally or on a paired node.
+- Added standalone `.deb` and `.tar.gz` node packaging for manual, runit,
+  OpenRC, s6 or other supervisors.
+- Node packaging now cross-compiles and verifies both amd64 and arm64 ELF
+  binaries, and emits native Void Linux `.xbps` packages locally or through
+  the official Void OCI image on Debian hosts.
+- Added a distinct `aarch64-unknown-linux-musl` build and
+  `aarch64-musl.xbps` package for Void musl installations.
+- Fixed the XBPS CA certificate dependency to use a valid package expression
+  (`ca-certificates>=0`) so local repository installation can resolve it.
+
 # GnomeAI-RS 1.2.4 - 2026-08-09
 
 - Allowed WhatsApp chats now treat the inbound request itself as authorization

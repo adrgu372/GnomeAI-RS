@@ -15,8 +15,7 @@ use crate::config::AppConfig;
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {
-    /// Directory from which WebTool was launched. It is the project-scoped
-    /// root used for workspace skills; persistent state still lives in
+    /// Project-scoped working directory. Persistent state still lives in
     /// `app_dir`.
     pub workspace_dir: PathBuf,
     pub app_dir: PathBuf,
@@ -34,31 +33,12 @@ pub struct AppPaths {
     pub task_outputs_dir: PathBuf,
     pub generated_dir: PathBuf,
     pub store_dir: PathBuf,
-    pub index_file: PathBuf,
 }
 
 impl AppPaths {
     pub fn new(app_dir: PathBuf) -> anyhow::Result<Self> {
         let current_dir = std::env::current_dir().unwrap_or_else(|_| app_dir.clone());
         let asset_dir = std::env::var_os("GNOMEF_RS_ASSETS").map(PathBuf::from);
-        let index_file = [
-            asset_dir
-                .as_ref()
-                .map(|dir| dir.join("index.html"))
-                .unwrap_or_else(|| app_dir.join("index.html")),
-            app_dir.join("index.html"),
-            PathBuf::from("/usr/share/gnomeai-rs/index.html"),
-            app_dir
-                .parent()
-                .map(|parent| parent.join("index.html"))
-                .unwrap_or_else(|| app_dir.join("index.html")),
-            current_dir.join("index.html"),
-            current_dir.join("..").join("index.html"),
-        ]
-        .into_iter()
-        .find(|path| path.exists())
-        .map(|path| path.canonicalize().unwrap_or(path))
-        .unwrap_or_else(|| app_dir.join("index.html"));
         let whatsapp_bridge_file = [
             asset_dir
                 .as_ref()
@@ -95,7 +75,6 @@ impl AppPaths {
             task_outputs_dir: store_dir.join("task_outputs"),
             generated_dir: app_dir.join("generated"),
             store_dir,
-            index_file,
             app_dir,
         };
         paths.ensure_dirs()?;
@@ -297,40 +276,7 @@ pub fn delete_chat(paths: &AppPaths, cid: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        os::unix::fs::PermissionsExt,
-        sync::{LazyLock, Mutex},
-    };
-
-    static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    #[test]
-    fn resolves_repo_root_index_when_data_dir_is_external() {
-        let _guard = CWD_LOCK.lock().unwrap();
-        let original_cwd = std::env::current_dir().unwrap();
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let project_index = manifest_dir.join("index.html");
-        assert!(project_index.exists(), "missing project index.html");
-        let expected_index = project_index.canonicalize().unwrap_or(project_index);
-
-        let temp_dir = std::env::temp_dir().join(format!(
-            "gnomef-rs-storage-test-{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::env::set_current_dir(&manifest_dir).unwrap();
-        // Pin the asset directory: it outranks any system-wide install under
-        // /usr/share, which would otherwise make this test machine-dependent.
-        unsafe {
-            std::env::set_var("GNOMEF_RS_ASSETS", &manifest_dir);
-        }
-        let paths = AppPaths::new(temp_dir.clone()).unwrap();
-        unsafe {
-            std::env::remove_var("GNOMEF_RS_ASSETS");
-        }
-        assert_eq!(paths.index_file, expected_index);
-        let _ = std::env::set_current_dir(original_cwd);
-        let _ = fs::remove_dir_all(temp_dir);
-    }
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn state_directories_and_chats_are_private() {

@@ -86,6 +86,18 @@ pub struct AppConfig {
     pub memory_dream_max_seconds: u64,
     pub host: String,
     pub port: u16,
+    /// Lightweight execution-node Hub. It uses a dedicated listener so the
+    /// native UI/API can remain loopback-only.
+    pub node_hub_enabled: bool,
+    pub node_hub_bind: String,
+    pub node_hub_port: u16,
+    /// Persistent enrollment credential shared only with explicitly paired
+    /// nodes. Stored in the owner-only config file; never sent to a model.
+    pub node_hub_token: String,
+    /// Private control credential used only by the native UI and local tools.
+    /// Nodes never receive it, so a compromised node cannot queue work or
+    /// change another node's root policy.
+    pub node_hub_admin_token: String,
     /// Shared execution policy for WebTool and WhatsApp tool calls.
     /// Root access is never implied; the dedicated Sudo tool always asks.
     pub web_sandbox_mode: String,
@@ -152,6 +164,19 @@ impl Default for AppConfig {
             memory_dream_max_seconds: 120,
             host: "127.0.0.1".into(),
             port: 8787,
+            node_hub_enabled: false,
+            node_hub_bind: "0.0.0.0".into(),
+            node_hub_port: 39176,
+            node_hub_token: format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            ),
+            node_hub_admin_token: format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            ),
             web_sandbox_mode: "normal".into(),
             whatsapp_enabled: false,
             whatsapp_bridge_port: 8788,
@@ -289,6 +314,29 @@ impl AppConfig {
         self.memory_dream_max_facts = self.memory_dream_max_facts.clamp(20, 5000);
         self.memory_dream_max_llm_calls = self.memory_dream_max_llm_calls.min(20);
         self.memory_dream_max_seconds = self.memory_dream_max_seconds.clamp(10, 900);
+        self.node_hub_bind = self.node_hub_bind.trim().to_string();
+        if self.node_hub_bind.is_empty() {
+            self.node_hub_bind = "0.0.0.0".into();
+        }
+        if self.node_hub_port == 0 {
+            self.node_hub_port = 39176;
+        }
+        self.node_hub_token = self.node_hub_token.trim().to_string();
+        if self.node_hub_token.chars().count() < 32 {
+            self.node_hub_token = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+        }
+        self.node_hub_admin_token = self.node_hub_admin_token.trim().to_string();
+        if self.node_hub_admin_token.chars().count() < 32 {
+            self.node_hub_admin_token = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+        }
         self.web_sandbox_mode = self.web_sandbox_mode.trim().to_ascii_lowercase();
         if !matches!(
             self.web_sandbox_mode.as_str(),

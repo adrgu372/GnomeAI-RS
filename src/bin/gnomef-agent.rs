@@ -4,22 +4,31 @@ mod agent;
 mod app_dirs;
 #[path = "../apply_patch.rs"]
 mod apply_patch;
-#[path = "../banner.rs"]
-mod banner;
 #[path = "../codex_app_server.rs"]
 mod codex_app_server;
 #[path = "../config.rs"]
 mod config;
+#[path = "../desktop.rs"]
+mod desktop;
+#[cfg(target_os = "linux")]
+#[path = "../desktop_a11y.rs"]
+mod desktop_a11y;
 #[path = "../embeddings.rs"]
 mod embeddings;
 #[path = "../firecrawl.rs"]
 mod firecrawl;
+#[path = "../gui.rs"]
+mod gui;
 #[path = "../llama.rs"]
 mod llama;
 #[path = "../memory.rs"]
 mod memory;
 #[path = "../memory_engine.rs"]
 mod memory_engine;
+#[path = "../node_protocol.rs"]
+mod node_protocol;
+#[path = "../nodes.rs"]
+mod nodes;
 #[path = "../openrouter.rs"]
 mod openrouter;
 #[path = "../privilege.rs"]
@@ -46,8 +55,10 @@ mod store;
 mod tooling;
 #[path = "../coding_tools.rs"]
 mod tools;
-#[path = "../tui.rs"]
-mod tui;
+#[path = "../transcribe.rs"]
+mod transcribe;
+#[path = "../uploads.rs"]
+mod uploads;
 #[path = "../verify.rs"]
 mod verify;
 #[path = "../workspaces.rs"]
@@ -105,6 +116,9 @@ async fn async_main() -> Result<()> {
     let app_home = app_dirs::resolve_app_home(&launch_dir)?;
     let config_path = app_home.join("config.json");
     let config = AppConfig::load(&config_path)?;
+    // Save generated persistent secrets (notably node enrollment) before the
+    // background Hub process loads the same configuration.
+    config.save(&config_path)?;
     let store = Store::open(&app_home.join("store/agent.db"))?;
     let provider_settings = ProviderSettingsStore::new(app_home.join("store/providers.json"));
     let app_paths = storage::AppPaths::new(app_home.clone())?;
@@ -148,7 +162,7 @@ async fn async_main() -> Result<()> {
         )
     };
 
-    let (session_id, workspace, model) = if let Some(id) = cli.session {
+    let (session_id, workspace, mut model) = if let Some(id) = cli.session {
         let session = store
             .get_session(&id)?
             .with_context(|| format!("agent session `{id}` does not exist"))?;
@@ -186,8 +200,20 @@ async fn async_main() -> Result<()> {
     let provider = build_provider(&provider_selection, &workspace, policy.mode)?;
     let mut runtime_config = config;
     apply_selection_to_config(&provider_selection, &mut runtime_config);
+    let whatsapp_launch = gui::WhatsAppLaunchConfig::from_config(&runtime_config, &app_home);
     let config_state = Arc::new(RwLock::new(runtime_config));
     let models = fetch_model_ids(&config_state, &model).await;
+    if provider_selection.provider_id == "openai-account"
+        && !models.iter().any(|available| available == &model)
+    {
+        model = "default".to_string();
+        provider_selection.model = model.clone();
+        provider_settings.save(&provider_selection)?;
+        store.set_model(&session_id, &model)?;
+        let mut config = config_state.write().await;
+        config.default_model = model.clone();
+        config.save(&config_path)?;
+    }
     let dream = spawn_dream_worker(
         memory_engine.clone(),
         llama::LlamaClient::new(),
@@ -206,6 +232,7 @@ async fn async_main() -> Result<()> {
     tools::register_all(
         &mut registry,
         &workspace,
+        &app_paths.generated_dir,
         policy.clone(),
         config_state.clone(),
         output_store.clone(),
@@ -251,7 +278,11 @@ async fn async_main() -> Result<()> {
         privilege_tx,
         privilege_broker,
     ));
-    let ui_result = tui::run(op_tx, event_rx).await;
+    // The native event loop must stay on the process main thread. Tokio's
+    // worker threads continue to drive the agent core while eframe blocks
+    // here, and the GUI polls the same Op/Event channels the TUI used.
+    let ui_result = gui::run(op_tx.clone(), event_rx, whatsapp_launch);
+    let _ = op_tx.send(Op::Shutdown).await;
     let core_result = core.await.context("agent core task panicked")?;
 
     ui_result?;
@@ -331,6 +362,9 @@ async fn core_loop(
                 result = &mut turn.handle => {
                     report_turn_result(&events, result).await;
                     spawn_agent_memory_refresh(&core);
+                    // The first user turn assigns the automatic conversation
+                    // title; refresh the sidebar as soon as that turn lands.
+                    send_session_list(&core, &events).await;
                     let mut shutdown = false;
                     while let Some(op) = deferred.pop_front() {
                         match handle_idle_op(&mut core, op, &events).await? {
@@ -547,6 +581,71 @@ async fn handle_idle_op(
         Op::SetSandbox { mode } => {
             set_sandbox(core, &mode, events).await?;
         }
+        Op::SetWhatsApp {
+            enabled,
+            assistant_name,
+            has_own_number,
+            allowed_jids,
+        } => {
+            let (assistant_name, allowed_jids) = {
+                let mut config = core.config_state.write().await;
+                config.whatsapp_enabled = enabled;
+                config.whatsapp_assistant_name = assistant_name;
+                config.whatsapp_has_own_number = has_own_number;
+                config.whatsapp_allowed_jids = allowed_jids;
+                config.normalize();
+                config.save(&core.config_path)?;
+                (
+                    config.whatsapp_assistant_name.clone(),
+                    config.whatsapp_allowed_jids.clone(),
+                )
+            };
+            let _ = events
+                .send(Event::WhatsAppConfigChanged {
+                    enabled,
+                    assistant_name,
+                    has_own_number,
+                    allowed_jids,
+                })
+                .await;
+            notice(events, "WhatsApp settings saved").await;
+        }
+        Op::SetNodeHub {
+            enabled,
+            bind,
+            port,
+        } => match bind.trim().parse::<std::net::IpAddr>() {
+            Err(_) => {
+                recoverable_error(
+                    events,
+                    anyhow::anyhow!("adresa Hub trebuie să fie un IP valid, de exemplu 0.0.0.0"),
+                )
+                .await;
+            }
+            Ok(_) if port == 0 => {
+                recoverable_error(events, anyhow::anyhow!("portul Hub nu poate fi 0")).await;
+            }
+            Ok(_) => {
+                let (bind, port) = {
+                    let mut config = core.config_state.write().await;
+                    config.node_hub_enabled = enabled;
+                    config.node_hub_bind = bind;
+                    config.node_hub_port = port;
+                    config.normalize();
+                    config.save(&core.config_path)?;
+                    (config.node_hub_bind.clone(), config.node_hub_port)
+                };
+                let _ = events
+                    .send(Event::NodeHubConfigChanged {
+                        enabled,
+                        bind,
+                        port,
+                    })
+                    .await;
+                notice(events, "Node Hub settings saved; restart GnomeAI to apply the listener")
+                    .await;
+            }
+        },
         Op::ListSessions => {
             send_session_list(core, events).await;
         }
@@ -772,6 +871,16 @@ async fn set_model(core: &mut Core, model: String, events: &mpsc::Sender<Event>)
         notice(events, "model name cannot be empty").await;
         return Ok(());
     }
+    if core.provider_selection.provider_id == "openai-account"
+        && !core.models.iter().any(|available| available == model)
+    {
+        notice(
+            events,
+            "modelul nu este disponibil pentru contul OpenAI conectat; reîncarcă providerul și alege un model din listă",
+        )
+        .await;
+        return Ok(());
+    }
     core.agent.model = model.to_string();
     core.agent.store.set_model(&core.agent.session_id, model)?;
     core.provider_selection.model = model.to_string();
@@ -866,6 +975,7 @@ async fn set_sandbox(core: &mut Core, mode: &str, events: &mpsc::Sender<Event>) 
     tools::register_all(
         &mut registry,
         &core.agent.workspace,
+        &core.app_paths.generated_dir,
         policy.clone(),
         core.config_state.clone(),
         core.agent.output_store.clone(),
@@ -879,6 +989,11 @@ async fn set_sandbox(core: &mut Core, mode: &str, events: &mpsc::Sender<Event>) 
     core.agent.provider =
         build_provider(&core.provider_selection, &core.agent.workspace, policy.mode)?;
     core.policy = policy;
+    {
+        let mut config = core.config_state.write().await;
+        config.web_sandbox_mode = sandbox_name(mode).to_string();
+        config.save(&core.config_path)?;
+    }
     send_ready(
         &core.agent,
         &core.policy,
@@ -932,6 +1047,7 @@ async fn set_workspace(
     tools::register_all(
         &mut registry,
         &workspace,
+        &core.app_paths.generated_dir,
         policy.clone(),
         core.config_state.clone(),
         core.agent.output_store.clone(),
@@ -1016,14 +1132,31 @@ async fn send_session_list(core: &Core, events: &mpsc::Sender<Event>) {
     };
     let summaries = sessions
         .into_iter()
-        .map(|session| SessionSummary {
-            turns: core.agent.store.count_turns(&session.id).unwrap_or(0),
-            is_current: session.id == core.agent.session_id,
-            id: session.id,
-            title: session.title,
-            workspace: session.workspace,
-            model: session.model,
-            updated_at: session.updated_at,
+        .map(|session| {
+            // Backfill older untitled sessions from their first real user
+            // message so the sidebar is useful immediately after upgrading.
+            let title = session.title.or_else(|| {
+                let first = core
+                    .agent
+                    .store
+                    .live_turns(&session.id)
+                    .ok()?
+                    .into_iter()
+                    .find(|turn| turn.role == "user" && !turn.is_summary)?;
+                let visible = provider::user_content_for_display(&first.content);
+                let title = agent::automatic_session_title(&visible);
+                core.agent.store.rename_session(&session.id, &title).ok()?;
+                Some(title)
+            });
+            SessionSummary {
+                turns: core.agent.store.count_turns(&session.id).unwrap_or(0),
+                is_current: session.id == core.agent.session_id,
+                id: session.id,
+                title,
+                workspace: session.workspace,
+                model: session.model,
+                updated_at: session.updated_at,
+            }
         })
         .collect();
     let _ = events
@@ -1048,6 +1181,7 @@ async fn resume_session(core: &mut Core, id: &str, events: &mpsc::Sender<Event>)
         tools::register_all(
             &mut registry,
             &workspace,
+            &core.app_paths.generated_dir,
             policy.clone(),
             core.config_state.clone(),
             core.agent.output_store.clone(),
@@ -1562,8 +1696,21 @@ async fn send_ready(
     workspace_history: &WorkspaceHistory,
     models: &[String],
 ) {
-    let web_search_enabled = config_state.read().await.web_search_enabled;
-    let models = llama::normalize_model_ids(models.to_vec(), &agent.model);
+    let config = config_state.read().await;
+    let web_search_enabled = config.web_search_enabled;
+    let models = if config.provider_id == "openai-account" {
+        let metadata = models
+            .iter()
+            .map(|id| llama::ModelInfo {
+                id: id.clone(),
+                capabilities: Vec::new(),
+            })
+            .collect();
+        llama::codex_account_model_ids(metadata, &agent.model)
+    } else {
+        llama::normalize_model_ids(models.to_vec(), &agent.model)
+    };
+    drop(config);
     let _ = agent
         .event_sender()
         .send(Event::Ready {
@@ -1590,7 +1737,11 @@ async fn fetch_model_ids(config_state: &Arc<RwLock<AppConfig>>, active_model: &s
         .list_models(&cfg)
         .await
         .unwrap_or_else(|_| llama::known_models(&cfg.provider_id));
-    llama::model_ids(models, active_model)
+    if cfg.provider_id == "openai-account" {
+        llama::codex_account_model_ids(models, active_model)
+    } else {
+        llama::model_ids(models, active_model)
+    }
 }
 
 fn initialize_session(

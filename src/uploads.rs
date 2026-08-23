@@ -3,6 +3,7 @@ use std::{
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::{Context, anyhow, bail};
@@ -35,13 +36,13 @@ const VIDEO_EXTS: &[&str] = &[
 ];
 
 /// OOXML/ODF containers: ZIP archives whose text lives in XML parts.
-const OOXML_EXTS: &[&str] = &[
+pub const OOXML_EXTS: &[&str] = &[
     "docx", "xlsx", "pptx", "docm", "xlsm", "pptm", "odt", "ods", "odp",
 ];
 
 /// Extensions read as plain text. Source code is the bulk of it — the list
 /// exists so a known-good extension skips the binary heuristic below.
-const TEXT_EXTS: &[&str] = &[
+pub const TEXT_EXTS: &[&str] = &[
     // documents and data
     "txt",
     "md",
@@ -470,6 +471,55 @@ fn ooxml_text(path: &Path) -> anyhow::Result<String> {
         }
     }
     Ok(out.trim().to_string())
+}
+
+/// Extract readable text from a document selected in the native GUI.
+///
+/// The GUI runs outside the async request path, so this deliberately uses a
+/// synchronous `pdftotext` process for PDFs. Office containers and source
+/// files stay in-process and share the same size and binary checks as uploads.
+pub fn extract_text_attachment(path: &Path) -> anyhow::Result<String> {
+    let file_type = file_type_from_name(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(""),
+    );
+    match file_type.as_str() {
+        "pdf" => {
+            let output = Command::new("pdftotext")
+                .arg(path)
+                .arg("-")
+                .output()
+                .with_context(|| "PDF support requires the `poppler-utils` package")?;
+            if !output.status.success() {
+                let detail = String::from_utf8_lossy(&output.stderr);
+                bail!("cannot extract PDF text: {}", detail.trim());
+            }
+            Ok(String::from_utf8_lossy(&output.stdout)
+                .chars()
+                .take(MAX_EXTRACTED_CHARS)
+                .collect())
+        }
+        "docx" | "excel" | "slides" => ooxml_text(path),
+        "binary" => {
+            bail!("legacy binary Office files are unsupported; use PDF, DOCX, XLSX, PPTX, or text")
+        }
+        "image" | "audio" | "video" => {
+            bail!("this attachment type does not contain directly readable document text")
+        }
+        _ => {
+            let bytes =
+                fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+            if looks_binary(&bytes) {
+                bail!("the selected file appears to be binary")
+            }
+            Ok(String::from_utf8(bytes)
+                .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+                .chars()
+                .take(MAX_EXTRACTED_CHARS)
+                .collect())
+        }
+    }
 }
 
 /// The archive members that actually hold document text.

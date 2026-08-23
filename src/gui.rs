@@ -1,0 +1,4376 @@
+//! Native graphical interface for the coding agent.
+//!
+//! The GUI deliberately speaks the same `Op`/`Event` protocol as the former
+//! terminal interface. Agent execution, approvals, sessions, memory, skills,
+//! sandboxing and provider selection remain core concerns; this module only
+//! owns presentation and desktop input.
+
+use anyhow::{Result, anyhow};
+use base64::Engine as _;
+use eframe::egui::{
+    self, Align, Color32, FontFamily, FontId, Key, KeyboardShortcut, Layout, Margin, Modifiers,
+    RichText, ScrollArea, Sense, Stroke, TextEdit, Vec2,
+};
+use qrcode::{QrCode, types::Color as QrColor};
+use serde_json::Value;
+use std::collections::VecDeque;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant};
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
+
+use crate::config::AppConfig;
+use crate::protocol::{Decision, Event, Op, SecretString, SessionSummary};
+use crate::provider_catalog::{AuthKind, PROVIDERS};
+use crate::uploads::{
+    IMAGE_EXTS, OOXML_EXTS, TEXT_EXTS, extract_text_attachment, file_type_from_name,
+};
+
+const COMMANDS: &[(&str, &str)] = &[
+    ("/help", "Show commands and keyboard shortcuts"),
+    ("/new", "Start a fresh session"),
+    ("/sessions", "Open saved sessions"),
+    ("/resume", "Resume a session by ID"),
+    ("/fork", "Branch the current session"),
+    ("/compact", "Compact context now"),
+    ("/rollback", "Undo patches in this session"),
+    ("/workspace", "Choose a project folder"),
+    ("/cd", "Alias for /workspace"),
+    ("/provider", "Choose provider or account login"),
+    ("/model", "Choose the active model"),
+    ("/websearch", "Toggle web search"),
+    ("/whatsapp", "Open WhatsApp connection and settings"),
+    ("/nodes", "Manage paired lightweight devices"),
+    ("/sandbox", "Set read-only, normal or full-access"),
+    ("/skills", "List installed skills"),
+    ("/skill", "Use, inspect, install, update or remove a skill"),
+    ("/memory", "Show shared memory"),
+    ("/copy", "Copy the last assistant reply"),
+    ("/contrast", "Toggle high-contrast colors"),
+    ("/notify", "Toggle desktop notifications"),
+    ("/mouse", "Mouse input is always enabled in the GUI"),
+    ("/tokens", "Show session token use"),
+    ("/doctor", "Run diagnostics"),
+    ("/diff", "Show the accumulated diff"),
+    ("/export", "Export the transcript to Markdown"),
+    ("/clear", "Clear only the visible transcript"),
+    ("/quit", "Close GnomeAI-RS"),
+];
+
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+#[derive(Debug)]
+enum Block {
+    User(String),
+    Assistant(String),
+    Reasoning(String),
+    Tool {
+        call_id: String,
+        name: String,
+        summary: String,
+        output: String,
+        done: bool,
+        ok: bool,
+        ms: u64,
+    },
+    Diff(String),
+    Verify {
+        stage: String,
+        passed: bool,
+        summary: String,
+    },
+    Error(String),
+    Note(String),
+}
+
+impl Block {
+    fn searchable_text(&self) -> String {
+        match self {
+            Self::User(text)
+            | Self::Assistant(text)
+            | Self::Reasoning(text)
+            | Self::Diff(text)
+            | Self::Error(text)
+            | Self::Note(text) => text.clone(),
+            Self::Tool {
+                name,
+                summary,
+                output,
+                ..
+            } => format!("{name} {summary} {output}"),
+            Self::Verify { stage, summary, .. } => format!("{stage} {summary}"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct QueuedMessage {
+    text: String,
+    attachment: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct ApprovalDialog {
+    call_id: String,
+    command: String,
+    reason: String,
+    allow_always: bool,
+}
+
+#[derive(Debug)]
+struct PrivilegeDialog {
+    request_id: String,
+    command: String,
+    credential: String,
+    remember: bool,
+    keyring_available: bool,
+    attempt: u8,
+    message: Option<String>,
+}
+
+enum LoginUpdate {
+    DeviceCode {
+        verification_url: String,
+        user_code: String,
+    },
+    Finished {
+        provider_id: String,
+        result: std::result::Result<(), String>,
+    },
+}
+
+struct DeviceLoginDialog {
+    verification_url: String,
+    user_code: String,
+    browser_error: Option<String>,
+}
+
+pub struct WhatsAppLaunchConfig {
+    api_base: String,
+    bridge_base: String,
+    api_port: u16,
+    bridge_port: u16,
+    token: String,
+    enabled: bool,
+    assistant_name: String,
+    has_own_number: bool,
+    allowed_jids: Vec<String>,
+    log_file: PathBuf,
+    node_api_base: String,
+    node_admin_token: String,
+    node_enrollment_token: String,
+    node_enabled: bool,
+    node_bind: String,
+    node_port: u16,
+}
+
+impl WhatsAppLaunchConfig {
+    pub fn from_config(config: &AppConfig, app_home: &Path) -> Self {
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let (api_port, bridge_port) = native_service_ports(config);
+        Self {
+            api_base: format!("http://127.0.0.1:{api_port}"),
+            bridge_base: format!("http://127.0.0.1:{bridge_port}"),
+            api_port,
+            bridge_port,
+            token,
+            enabled: config.whatsapp_enabled,
+            assistant_name: config.whatsapp_assistant_name.clone(),
+            has_own_number: config.whatsapp_has_own_number,
+            allowed_jids: config.whatsapp_allowed_jids.clone(),
+            log_file: app_home.join("whatsapp_bridge.log"),
+            node_api_base: format!("http://127.0.0.1:{}", config.node_hub_port),
+            node_admin_token: config.node_hub_admin_token.clone(),
+            node_enrollment_token: config.node_hub_token.clone(),
+            node_enabled: config.node_hub_enabled,
+            node_bind: config.node_hub_bind.clone(),
+            node_port: config.node_hub_port,
+        }
+    }
+}
+
+struct WhatsAppService {
+    child: Option<Child>,
+    api_base: String,
+    bridge_base: String,
+    token: String,
+    launch_error: Option<String>,
+}
+
+impl WhatsAppService {
+    fn launch(config: &WhatsAppLaunchConfig) -> Self {
+        let mut service = Self {
+            child: None,
+            api_base: config.api_base.clone(),
+            bridge_base: config.bridge_base.clone(),
+            token: config.token.clone(),
+            launch_error: None,
+        };
+        match companion_executable("gnomef-whatsapp") {
+            Ok(executable) => match Command::new(&executable)
+                .env("GNOMEF_WEB_TOKEN", &config.token)
+                .env("GNOMEF_NATIVE_HELPER", "1")
+                .env("GNOMEF_NATIVE_API_PORT", config.api_port.to_string())
+                .env("GNOMEF_NATIVE_BRIDGE_PORT", config.bridge_port.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => service.child = Some(child),
+                Err(error) => {
+                    service.launch_error = Some(format!(
+                        "Nu pot porni serviciul WhatsApp {}: {error}",
+                        executable.display()
+                    ));
+                }
+            },
+            Err(error) => service.launch_error = Some(error),
+        }
+        service
+    }
+}
+
+fn native_service_ports(config: &AppConfig) -> (u16, u16) {
+    let api_listener = TcpListener::bind(("127.0.0.1", config.port))
+        .or_else(|_| TcpListener::bind(("127.0.0.1", 0)));
+    let api_port = api_listener
+        .as_ref()
+        .ok()
+        .and_then(|listener| listener.local_addr().ok())
+        .map(|address| address.port())
+        .unwrap_or(config.port);
+
+    // Keep the API listener alive while selecting the bridge port so the OS
+    // cannot hand the same ephemeral port to both services.
+    let bridge_listener = TcpListener::bind(("127.0.0.1", config.whatsapp_bridge_port))
+        .or_else(|_| TcpListener::bind(("127.0.0.1", 0)));
+    let bridge_port = bridge_listener
+        .as_ref()
+        .ok()
+        .and_then(|listener| listener.local_addr().ok())
+        .map(|address| address.port())
+        .unwrap_or(config.whatsapp_bridge_port);
+
+    (api_port, bridge_port)
+}
+
+impl Drop for WhatsAppService {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+enum WhatsAppReply {
+    Status(std::result::Result<Value, String>),
+    Action(std::result::Result<Value, String>),
+    Sent(std::result::Result<Value, String>),
+}
+
+enum NodeReply {
+    List(std::result::Result<Value, String>),
+    Policy(std::result::Result<Value, String>),
+}
+
+pub fn run(
+    ops: mpsc::Sender<Op>,
+    events: mpsc::Receiver<Event>,
+    whatsapp: WhatsAppLaunchConfig,
+) -> Result<()> {
+    let runtime = Handle::current();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("GnomeAI-RS")
+            .with_inner_size([1220.0, 780.0])
+            .with_min_inner_size([880.0, 540.0]),
+        centered: true,
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "GnomeAI-RS",
+        options,
+        Box::new(move |creation| {
+            Ok(Box::new(GuiApp::new(
+                creation, ops, events, runtime, whatsapp,
+            )))
+        }),
+    )
+    .map_err(|error| anyhow!(error.to_string()))
+}
+
+struct GuiApp {
+    ops: mpsc::Sender<Op>,
+    events: mpsc::Receiver<Event>,
+    runtime: Handle,
+    login_tx: std_mpsc::Sender<LoginUpdate>,
+    login_rx: std_mpsc::Receiver<LoginUpdate>,
+    whatsapp_tx: std_mpsc::Sender<WhatsAppReply>,
+    whatsapp_rx: std_mpsc::Receiver<WhatsAppReply>,
+    node_tx: std_mpsc::Sender<NodeReply>,
+    node_rx: std_mpsc::Receiver<NodeReply>,
+    whatsapp_service: WhatsAppService,
+
+    blocks: Vec<Block>,
+    composer: String,
+    queue: VecDeque<QueuedMessage>,
+    history: Vec<String>,
+    history_pos: Option<usize>,
+    pending_attachment: Option<PathBuf>,
+    busy: bool,
+    started: Option<Instant>,
+    fatal: bool,
+
+    session_id: String,
+    provider: String,
+    model: String,
+    models: Vec<String>,
+    workspace: PathBuf,
+    branch: Option<String>,
+    sandbox: String,
+    web_search_enabled: bool,
+    recent_workspaces: Vec<String>,
+    tokens_in: i64,
+    tokens_out: i64,
+    token_history: Vec<(i64, i64, u64)>,
+
+    approval: Option<ApprovalDialog>,
+    privilege: Option<PrivilegeDialog>,
+    sessions: Vec<SessionSummary>,
+    show_sessions: bool,
+    confirm_delete_session: Option<String>,
+    rename_session: Option<(String, String)>,
+    show_provider: bool,
+    provider_index: usize,
+    provider_api_key: String,
+    provider_base_url: String,
+    login_status: Option<String>,
+    device_login: Option<DeviceLoginDialog>,
+    show_models: bool,
+    model_filter: String,
+    show_help: bool,
+    show_settings: bool,
+    show_activity: bool,
+    show_whatsapp: bool,
+    show_nodes: bool,
+    whatsapp_enabled: bool,
+    whatsapp_assistant_name: String,
+    whatsapp_has_own_number: bool,
+    whatsapp_allowed_jids: String,
+    whatsapp_status: Value,
+    whatsapp_feedback: Option<String>,
+    whatsapp_request_pending: bool,
+    whatsapp_last_poll: Instant,
+    whatsapp_test_jid: String,
+    whatsapp_test_message: String,
+    whatsapp_log_file: PathBuf,
+    node_status: Value,
+    node_feedback: Option<String>,
+    node_request_pending: bool,
+    node_last_poll: Instant,
+    node_api_base: String,
+    node_admin_token: String,
+    node_enrollment_token: String,
+    node_enabled: bool,
+    node_bind: String,
+    node_port: u16,
+    search: String,
+    notifications: bool,
+    high_contrast: bool,
+    copy_request: Option<String>,
+    quit_requested: bool,
+    request_focus: bool,
+}
+
+impl GuiApp {
+    fn new(
+        creation: &eframe::CreationContext<'_>,
+        ops: mpsc::Sender<Op>,
+        events: mpsc::Receiver<Event>,
+        runtime: Handle,
+        whatsapp: WhatsAppLaunchConfig,
+    ) -> Self {
+        configure_style(&creation.egui_ctx);
+        let (login_tx, login_rx) = std_mpsc::channel();
+        let (whatsapp_tx, whatsapp_rx) = std_mpsc::channel();
+        let (node_tx, node_rx) = std_mpsc::channel();
+        let whatsapp_service = WhatsAppService::launch(&whatsapp);
+        let whatsapp_allowed_jids = whatsapp.allowed_jids.join("\n");
+        Self {
+            ops,
+            events,
+            runtime,
+            login_tx,
+            login_rx,
+            whatsapp_tx,
+            whatsapp_rx,
+            node_tx,
+            node_rx,
+            whatsapp_service,
+            blocks: Vec::new(),
+            composer: String::new(),
+            queue: VecDeque::new(),
+            history: Vec::new(),
+            history_pos: None,
+            pending_attachment: None,
+            busy: false,
+            started: None,
+            fatal: false,
+            session_id: String::new(),
+            provider: "—".into(),
+            model: "—".into(),
+            models: Vec::new(),
+            workspace: PathBuf::new(),
+            branch: None,
+            sandbox: "normal".into(),
+            web_search_enabled: false,
+            recent_workspaces: Vec::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            token_history: Vec::new(),
+            approval: None,
+            privilege: None,
+            sessions: Vec::new(),
+            show_sessions: false,
+            confirm_delete_session: None,
+            rename_session: None,
+            show_provider: false,
+            provider_index: 0,
+            provider_api_key: String::new(),
+            provider_base_url: PROVIDERS
+                .iter()
+                .find(|provider| provider.id == "custom")
+                .map(|provider| provider.base_url.to_string())
+                .unwrap_or_default(),
+            login_status: None,
+            device_login: None,
+            show_models: false,
+            model_filter: String::new(),
+            show_help: false,
+            show_settings: false,
+            show_activity: false,
+            show_whatsapp: false,
+            show_nodes: false,
+            whatsapp_enabled: whatsapp.enabled,
+            whatsapp_assistant_name: whatsapp.assistant_name,
+            whatsapp_has_own_number: whatsapp.has_own_number,
+            whatsapp_allowed_jids,
+            whatsapp_status: serde_json::json!({}),
+            whatsapp_feedback: None,
+            whatsapp_request_pending: false,
+            whatsapp_last_poll: Instant::now() - Duration::from_secs(10),
+            whatsapp_test_jid: String::new(),
+            whatsapp_test_message: String::new(),
+            whatsapp_log_file: whatsapp.log_file,
+            node_status: serde_json::json!({"nodes": []}),
+            node_feedback: None,
+            node_request_pending: false,
+            node_last_poll: Instant::now() - Duration::from_secs(10),
+            node_api_base: whatsapp.node_api_base,
+            node_admin_token: whatsapp.node_admin_token,
+            node_enrollment_token: whatsapp.node_enrollment_token,
+            node_enabled: whatsapp.node_enabled,
+            node_bind: whatsapp.node_bind,
+            node_port: whatsapp.node_port,
+            search: String::new(),
+            notifications: true,
+            high_contrast: false,
+            copy_request: None,
+            quit_requested: false,
+            request_focus: true,
+        }
+    }
+
+    fn send(&mut self, op: Op) {
+        if let Err(error) = self.ops.try_send(op) {
+            self.blocks.push(Block::Error(format!(
+                "cannot send command to agent core: {error}"
+            )));
+        }
+    }
+
+    fn poll_whatsapp(&mut self, force: bool) {
+        if self.whatsapp_request_pending
+            || (!force && self.whatsapp_last_poll.elapsed() < Duration::from_secs(2))
+        {
+            return;
+        }
+        self.whatsapp_request_pending = true;
+        self.whatsapp_last_poll = Instant::now();
+        let sender = self.whatsapp_tx.clone();
+        let url = format!("{}/api/whatsapp/status", self.whatsapp_service.api_base);
+        let token = self.whatsapp_service.token.clone();
+        self.runtime.spawn(async move {
+            let result = http_json(
+                reqwest::Client::new()
+                    .get(url)
+                    .header("X-Gnomef-Token", token),
+            )
+            .await;
+            let _ = sender.send(WhatsAppReply::Status(result));
+        });
+    }
+
+    fn poll_nodes(&mut self, force: bool) {
+        if !self.node_enabled
+            || self.node_request_pending
+            || (!force && self.node_last_poll.elapsed() < Duration::from_secs(3))
+        {
+            return;
+        }
+        self.node_request_pending = true;
+        self.node_last_poll = Instant::now();
+        let sender = self.node_tx.clone();
+        let url = format!("{}/v1/nodes", self.node_api_base);
+        let token = self.node_admin_token.clone();
+        self.runtime.spawn(async move {
+            let result = http_json(
+                reqwest::Client::new()
+                    .get(url)
+                    .header("X-GnomeAI-Admin-Token", token),
+            )
+            .await;
+            let _ = sender.send(NodeReply::List(result));
+        });
+    }
+
+    fn set_node_policy(&mut self, node_id: String, policy: String) {
+        self.node_feedback = Some("Se actualizează permisiunea root…".into());
+        let sender = self.node_tx.clone();
+        let url = format!("{}/v1/nodes/{node_id}/policy", self.node_api_base);
+        let token = self.node_admin_token.clone();
+        self.runtime.spawn(async move {
+            let result = http_json(
+                reqwest::Client::new()
+                    .post(url)
+                    .header("X-GnomeAI-Admin-Token", token)
+                    .json(&serde_json::json!({"policy": policy})),
+            )
+            .await;
+            let _ = sender.send(NodeReply::Policy(result));
+        });
+    }
+
+    fn reload_whatsapp_service(&mut self) {
+        self.whatsapp_feedback = Some("Se aplică setările WhatsApp…".into());
+        let sender = self.whatsapp_tx.clone();
+        let url = format!("{}/api/whatsapp/reload", self.whatsapp_service.api_base);
+        let token = self.whatsapp_service.token.clone();
+        self.runtime.spawn(async move {
+            let result = http_json(
+                reqwest::Client::new()
+                    .post(url)
+                    .header("X-Gnomef-Token", token),
+            )
+            .await;
+            let _ = sender.send(WhatsAppReply::Action(result));
+        });
+    }
+
+    fn refresh_whatsapp_qr(&mut self) {
+        self.whatsapp_feedback = Some("Se generează un cod QR nou…".into());
+        let sender = self.whatsapp_tx.clone();
+        let url = format!("{}/api/whatsapp/qr/refresh", self.whatsapp_service.api_base);
+        let token = self.whatsapp_service.token.clone();
+        self.runtime.spawn(async move {
+            let result = http_json(
+                reqwest::Client::new()
+                    .post(url)
+                    .header("X-Gnomef-Token", token),
+            )
+            .await;
+            let _ = sender.send(WhatsAppReply::Action(result));
+        });
+    }
+
+    fn send_whatsapp_test(&mut self) {
+        let jid = self.whatsapp_test_jid.trim().to_string();
+        let message = self.whatsapp_test_message.trim().to_string();
+        if jid.is_empty() || message.is_empty() {
+            self.whatsapp_feedback = Some("Completează JID-ul și mesajul de test.".into());
+            return;
+        }
+        self.whatsapp_feedback = Some("Se trimite mesajul…".into());
+        let sender = self.whatsapp_tx.clone();
+        let url = format!("{}/send", self.whatsapp_service.bridge_base);
+        let token = self.whatsapp_service.token.clone();
+        self.runtime.spawn(async move {
+            let result = http_json(
+                reqwest::Client::new()
+                    .post(url)
+                    .header("X-Gnomef-Token", token)
+                    .json(&serde_json::json!({"jid": jid, "text": message})),
+            )
+            .await;
+            let _ = sender.send(WhatsAppReply::Sent(result));
+        });
+    }
+
+    fn drain_events(&mut self) {
+        while let Ok(event) = self.events.try_recv() {
+            self.apply_event(event);
+        }
+        while let Ok(login) = self.login_rx.try_recv() {
+            match login {
+                LoginUpdate::DeviceCode {
+                    verification_url,
+                    user_code,
+                } => {
+                    let browser_error = open_external_url(&verification_url).err();
+                    self.copy_request = Some(user_code.clone());
+                    self.login_status =
+                        Some("Pagina OpenAI a fost deschisă; codul a fost copiat.".into());
+                    self.device_login = Some(DeviceLoginDialog {
+                        verification_url,
+                        user_code,
+                        browser_error,
+                    });
+                }
+                LoginUpdate::Finished {
+                    provider_id,
+                    result,
+                } => match result {
+                    Ok(()) => {
+                        self.device_login = None;
+                        self.login_status =
+                            Some("Autentificare finalizată; activez providerul…".into());
+                        self.send(Op::SetProvider {
+                            provider_id,
+                            api_key: None,
+                            base_url: None,
+                        });
+                    }
+                    Err(error) => {
+                        self.login_status = Some(format!("Autentificare eșuată: {error}"));
+                        self.blocks.push(Block::Error(error));
+                    }
+                },
+            }
+        }
+        while let Ok(reply) = self.whatsapp_rx.try_recv() {
+            match reply {
+                WhatsAppReply::Status(Ok(status)) => {
+                    self.whatsapp_status = status;
+                    self.whatsapp_request_pending = false;
+                }
+                WhatsAppReply::Status(Err(error)) => {
+                    self.whatsapp_request_pending = false;
+                    self.whatsapp_feedback = Some(error);
+                }
+                WhatsAppReply::Action(Ok(value)) => {
+                    self.whatsapp_feedback = Some(
+                        value
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Setările WhatsApp au fost aplicate.")
+                            .to_string(),
+                    );
+                    self.poll_whatsapp(true);
+                }
+                WhatsAppReply::Action(Err(error)) => {
+                    self.whatsapp_feedback = Some(error);
+                    self.poll_whatsapp(true);
+                }
+                WhatsAppReply::Sent(Ok(value)) => {
+                    let queued = value
+                        .get("queued")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    self.whatsapp_feedback = Some(if queued {
+                        "Mesajul a fost pus în coada WhatsApp.".into()
+                    } else {
+                        "Mesajul WhatsApp a fost trimis.".into()
+                    });
+                    self.whatsapp_test_message.clear();
+                }
+                WhatsAppReply::Sent(Err(error)) => self.whatsapp_feedback = Some(error),
+            }
+        }
+        while let Ok(reply) = self.node_rx.try_recv() {
+            self.node_request_pending = false;
+            match reply {
+                NodeReply::List(Ok(value)) => {
+                    self.node_status = value;
+                    self.node_feedback = None;
+                }
+                NodeReply::List(Err(error)) => self.node_feedback = Some(error),
+                NodeReply::Policy(Ok(_)) => {
+                    self.node_feedback = Some("Permisiunea root a fost actualizată.".into());
+                    self.poll_nodes(true);
+                }
+                NodeReply::Policy(Err(error)) => self.node_feedback = Some(error),
+            }
+        }
+
+        if !self.busy && self.approval.is_none() {
+            if let Some(message) = self.queue.pop_front() {
+                self.submit_message(message.text, message.attachment);
+            }
+        }
+    }
+
+    fn apply_event(&mut self, event: Event) {
+        match event {
+            Event::Ready {
+                session_id,
+                provider,
+                model,
+                workspace,
+                sandbox,
+                web_search_enabled,
+                git_branch,
+                recent_workspaces,
+                models,
+            } => {
+                self.session_id = session_id;
+                self.provider = provider;
+                self.model = model;
+                self.workspace = workspace;
+                self.sandbox = sandbox;
+                self.web_search_enabled = web_search_enabled;
+                self.branch = git_branch;
+                self.recent_workspaces = recent_workspaces;
+                self.set_models(models);
+                self.send(Op::ListSessions);
+            }
+            Event::SessionReset => {
+                self.blocks.clear();
+                self.queue.clear();
+                self.busy = false;
+                self.tokens_in = 0;
+                self.tokens_out = 0;
+                self.token_history.clear();
+                self.send(Op::ListSessions);
+            }
+            Event::SessionList { sessions } => {
+                self.sessions = sessions;
+                if self
+                    .confirm_delete_session
+                    .as_ref()
+                    .is_some_and(|id| !self.sessions.iter().any(|session| &session.id == id))
+                {
+                    self.confirm_delete_session = None;
+                }
+            }
+            Event::HistoryReplay { turns } => {
+                for turn in turns {
+                    match turn.role.as_str() {
+                        "user" => self.blocks.push(Block::User(turn.text)),
+                        "assistant" => self.blocks.push(Block::Assistant(turn.text)),
+                        _ => self.blocks.push(Block::Note(turn.text)),
+                    }
+                }
+            }
+            Event::ProviderChanged {
+                provider,
+                model,
+                models,
+            } => {
+                self.provider = provider;
+                self.model = model;
+                self.set_models(models);
+                self.provider_api_key.clear();
+                self.show_provider = false;
+            }
+            Event::WebSearchChanged { enabled } => self.web_search_enabled = enabled,
+            Event::WhatsAppConfigChanged {
+                enabled,
+                assistant_name,
+                has_own_number,
+                allowed_jids,
+            } => {
+                self.whatsapp_enabled = enabled;
+                self.whatsapp_assistant_name = assistant_name;
+                self.whatsapp_has_own_number = has_own_number;
+                self.whatsapp_allowed_jids = allowed_jids.join("\n");
+                self.reload_whatsapp_service();
+            }
+            Event::NodeHubConfigChanged {
+                enabled,
+                bind,
+                port,
+            } => {
+                self.node_enabled = enabled;
+                self.node_bind = bind;
+                self.node_port = port;
+                self.node_api_base = format!("http://127.0.0.1:{port}");
+                self.node_feedback = Some(
+                    "Setările au fost salvate. Repornește GnomeAI pentru a aplica listenerul."
+                        .into(),
+                );
+            }
+            Event::TurnStarted { .. } => {
+                self.busy = true;
+                self.started = Some(Instant::now());
+            }
+            Event::Token { text } => match self.blocks.last_mut() {
+                Some(Block::Assistant(buffer)) => buffer.push_str(&text),
+                _ => self.blocks.push(Block::Assistant(text)),
+            },
+            Event::Reasoning { text } => match self.blocks.last_mut() {
+                Some(Block::Reasoning(buffer)) => buffer.push_str(&text),
+                _ => self.blocks.push(Block::Reasoning(text)),
+            },
+            Event::ToolCallStarted {
+                call_id,
+                name,
+                summary,
+            } => self.blocks.push(Block::Tool {
+                call_id,
+                name,
+                summary,
+                output: String::new(),
+                done: false,
+                ok: false,
+                ms: 0,
+            }),
+            Event::ToolOutput { call_id, chunk } => {
+                if let Some(Block::Tool { output, .. }) = self.blocks.iter_mut().rev().find(
+                    |block| matches!(block, Block::Tool { call_id: id, .. } if id == &call_id),
+                ) {
+                    output.push_str(&chunk);
+                    if output.len() > 16_384 {
+                        let mut cut = output.len() - 16_384;
+                        while !output.is_char_boundary(cut) {
+                            cut += 1;
+                        }
+                        *output = output[cut..].to_string();
+                    }
+                }
+            }
+            Event::ToolCallEnded {
+                call_id,
+                ok,
+                duration_ms,
+            } => {
+                if let Some(Block::Tool {
+                    done,
+                    ok: success,
+                    ms,
+                    ..
+                }) = self.blocks.iter_mut().rev().find(
+                    |block| matches!(block, Block::Tool { call_id: id, .. } if id == &call_id),
+                ) {
+                    *done = true;
+                    *success = ok;
+                    *ms = duration_ms;
+                }
+            }
+            Event::ApprovalRequest {
+                call_id,
+                command,
+                reason,
+                allow_always,
+                ..
+            } => {
+                if self.notifications {
+                    desktop_notify("GnomeAI — approval needed", &command);
+                }
+                self.approval = Some(ApprovalDialog {
+                    call_id,
+                    command,
+                    reason,
+                    allow_always,
+                });
+            }
+            Event::PrivilegeCredentialRequest {
+                request_id,
+                command,
+                keyring_available,
+                attempt,
+                message,
+            } => {
+                self.privilege = Some(PrivilegeDialog {
+                    request_id,
+                    command,
+                    credential: String::new(),
+                    remember: false,
+                    keyring_available,
+                    attempt,
+                    message,
+                });
+            }
+            Event::PatchApplied { diff, .. } => self.blocks.push(Block::Diff(diff)),
+            Event::Verification {
+                stage,
+                passed,
+                summary,
+            } => self.blocks.push(Block::Verify {
+                stage,
+                passed,
+                summary,
+            }),
+            Event::Compacted { freed_tokens } => self.blocks.push(Block::Note(format!(
+                "Context compacted; {freed_tokens} tokens freed."
+            ))),
+            Event::TurnCompleted {
+                input_tokens,
+                output_tokens,
+                duration_ms,
+                ..
+            } => {
+                self.busy = false;
+                self.started = None;
+                self.tokens_in += input_tokens;
+                self.tokens_out += output_tokens;
+                self.token_history
+                    .push((input_tokens, output_tokens, duration_ms));
+                if self.notifications {
+                    desktop_notify(
+                        "GnomeAI — turn complete",
+                        &format!(
+                            "{output_tokens} tokens out · {:.1}s · {}",
+                            duration_ms as f64 / 1000.0,
+                            self.model
+                        ),
+                    );
+                }
+            }
+            Event::Interrupted => {
+                self.busy = false;
+                self.started = None;
+                self.blocks.push(Block::Note("Interrupted.".into()));
+            }
+            Event::Notice { message } => self.blocks.push(Block::Note(message)),
+            Event::Error { message, fatal } => {
+                self.busy = false;
+                self.started = None;
+                self.fatal = fatal;
+                self.blocks.push(Block::Error(message));
+            }
+        }
+    }
+
+    fn set_models(&mut self, mut models: Vec<String>) {
+        models.retain(|model| !model.trim().is_empty());
+        models.sort_unstable();
+        models.dedup();
+        if !self.model.trim().is_empty() && !models.contains(&self.model) {
+            models.insert(0, self.model.clone());
+        }
+        self.models = models;
+    }
+
+    fn dispatch_composer(&mut self) {
+        let text = std::mem::take(&mut self.composer);
+        let attachment = self.pending_attachment.take();
+        if text.trim().is_empty() && attachment.is_none() {
+            return;
+        }
+        self.history.push(text.clone());
+        self.history_pos = None;
+        if self.busy {
+            self.queue.push_back(QueuedMessage { text, attachment });
+            self.blocks.push(Block::Note(format!(
+                "Message queued ({} waiting).",
+                self.queue.len()
+            )));
+        } else {
+            self.submit_message(text, attachment);
+        }
+        self.request_focus = true;
+    }
+
+    fn submit_message(&mut self, text: String, attachment: Option<PathBuf>) {
+        if attachment.is_none() && self.handle_command(text.trim()) {
+            return;
+        }
+        if attachment.is_none() {
+            if let Some(path) = workspace_path_from_message(text.trim()) {
+                self.send(Op::SetWorkspace { path });
+                return;
+            }
+        }
+
+        let mut model_text = text.clone();
+        let mut display_text = text;
+        if let Some(path) = attachment {
+            match encode_attachment(&path, &model_text) {
+                Ok(encoded) => {
+                    model_text = encoded;
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_else(|| path.as_os_str().to_string_lossy());
+                    if !display_text.is_empty() {
+                        display_text.push('\n');
+                    }
+                    display_text.push_str(&format!("📎 {name}"));
+                }
+                Err(error) => {
+                    self.blocks.push(Block::Error(error));
+                    return;
+                }
+            }
+        }
+        self.blocks.push(Block::User(display_text));
+        self.send(Op::Submit { text: model_text });
+    }
+
+    fn handle_command(&mut self, text: &str) -> bool {
+        match text {
+            "/help" | "/?" | "/commands" => self.show_help = true,
+            "/new" => self.send(Op::NewSession),
+            "/sessions" => self.send(Op::ListSessions),
+            "/resume" => self.blocks.push(Block::Note(
+                "Folosește /resume ID sau fereastra Sessions.".into(),
+            )),
+            "/fork" => self.send(Op::ForkSession),
+            "/compact" => self.send(Op::Compact),
+            "/rollback" => self.send(Op::Rollback),
+            "/workspace" | "/cd" => self.choose_workspace(),
+            "/provider" => self.show_provider = true,
+            "/model" => self.show_models = true,
+            "/websearch" => self.send(Op::SetWebSearch {
+                enabled: !self.web_search_enabled,
+            }),
+            "/whatsapp" => {
+                self.show_whatsapp = true;
+                self.poll_whatsapp(true);
+            }
+            "/nodes" => {
+                self.show_nodes = true;
+                self.poll_nodes(true);
+            }
+            "/sandbox" => self.blocks.push(Block::Note(
+                "Use the Sandbox selector in the sidebar or /sandbox MODE.".into(),
+            )),
+            "/skills" => self.send(Op::SkillsList),
+            "/skill" => self.blocks.push(Block::Note(
+                "Folosește /skill use|inspect|install|update|verify|remove ARG.".into(),
+            )),
+            "/memory" => self.send(Op::MemoryShow),
+            "/copy" => {
+                if let Some(text) = self.blocks.iter().rev().find_map(|block| match block {
+                    Block::Assistant(text) if !text.is_empty() => Some(text.clone()),
+                    _ => None,
+                }) {
+                    self.copy_request = Some(text);
+                    self.blocks.push(Block::Note(
+                        "Ultimul răspuns al asistentului a fost copiat.".into(),
+                    ));
+                } else {
+                    self.blocks
+                        .push(Block::Note("Nu există încă un răspuns de copiat.".into()));
+                }
+            }
+            "/contrast" => self.high_contrast = !self.high_contrast,
+            "/notify" => self.notifications = !self.notifications,
+            "/mouse" => self.blocks.push(Block::Note(
+                "Mouse-ul este activ permanent în interfața grafică.".into(),
+            )),
+            "/tokens" => self.show_token_usage(),
+            "/doctor" => self.send(Op::Doctor),
+            "/diff" => self.send(Op::ShowDiff),
+            "/export" => self.export_conversation(),
+            "/clear" => {
+                self.blocks.clear();
+                self.blocks.push(Block::Note(
+                    "Transcript cleared; session history is preserved.".into(),
+                ));
+            }
+            "/quit" => self.quit_requested = true,
+            _ if text.starts_with("/workspace ") || text.starts_with("/cd ") => {
+                let path = text
+                    .split_once(' ')
+                    .map(|(_, path)| path.trim())
+                    .unwrap_or("");
+                if path.is_empty() {
+                    self.blocks
+                        .push(Block::Error("usage: /workspace PATH".into()));
+                } else {
+                    self.send(Op::SetWorkspace {
+                        path: PathBuf::from(unquote(path)),
+                    });
+                }
+            }
+            _ if text.starts_with("/resume ") => {
+                let id = text.trim_start_matches("/resume ").trim();
+                self.send(Op::ResumeSession { id: id.into() });
+            }
+            _ if text.starts_with("/model ") => {
+                let model = text.trim_start_matches("/model ").trim();
+                if model.is_empty() {
+                    self.blocks.push(Block::Error("usage: /model MODEL".into()));
+                } else {
+                    self.send(Op::SetModel {
+                        model: model.into(),
+                    });
+                }
+            }
+            _ if text.starts_with("/sandbox ") => {
+                let mode = text.trim_start_matches("/sandbox ").trim();
+                self.send(Op::SetSandbox { mode: mode.into() });
+            }
+            _ if text.starts_with("/websearch ") => {
+                let value = text.trim_start_matches("/websearch ").trim();
+                match value {
+                    "on" | "true" | "1" => self.send(Op::SetWebSearch { enabled: true }),
+                    "off" | "false" | "0" => self.send(Op::SetWebSearch { enabled: false }),
+                    _ => self
+                        .blocks
+                        .push(Block::Error("usage: /websearch on|off".into())),
+                }
+            }
+            _ if text.starts_with("/notify ") => {
+                let value = text.trim_start_matches("/notify ").trim();
+                match value {
+                    "on" | "true" | "1" => self.notifications = true,
+                    "off" | "false" | "0" => self.notifications = false,
+                    _ => self
+                        .blocks
+                        .push(Block::Error("usage: /notify on|off".into())),
+                }
+            }
+            _ if text.starts_with("/memory ") => self.handle_memory_command(text),
+            _ if text.starts_with("/skill ") => self.handle_skill_command(text),
+            _ => return false,
+        }
+        true
+    }
+
+    fn handle_memory_command(&mut self, text: &str) {
+        let value = text.trim_start_matches("/memory ").trim();
+        match value {
+            "show" | "list" => self.send(Op::MemoryShow),
+            "status" => self.send(Op::MemoryStatus),
+            "dream" => self.send(Op::MemoryDream { dry_run: false }),
+            "dream --dry-run" | "dream dry-run" => self.send(Op::MemoryDream { dry_run: true }),
+            "reindex" => self.send(Op::MemoryReindex),
+            "clear" | "wipe" => self.send(Op::MemoryClear),
+            "on" => self.send(Op::MemorySet { enabled: true }),
+            "off" => self.send(Op::MemorySet { enabled: false }),
+            _ if value.starts_with("forget ") => self.send(Op::MemoryForget {
+                id: value.trim_start_matches("forget ").trim().into(),
+            }),
+            _ => self.blocks.push(Block::Error(
+                "usage: /memory status|show|dream [--dry-run]|reindex|forget ID|clear|on|off"
+                    .into(),
+            )),
+        }
+    }
+
+    fn handle_skill_command(&mut self, text: &str) {
+        let value = text.trim_start_matches("/skill ").trim();
+        let (action, argument) = value.split_once(' ').unwrap_or((value, ""));
+        if argument.trim().is_empty() {
+            self.blocks.push(Block::Error(
+                "usage: /skill use|inspect|install|update|verify|remove ARG".into(),
+            ));
+            return;
+        }
+        let argument = argument.trim().to_string();
+        let op = match action {
+            "use" | "activate" => Op::SkillActivate { name: argument },
+            "show" | "inspect" => Op::SkillInspect { name: argument },
+            "install" => Op::SkillInstall { source: argument },
+            "update" => Op::SkillUpdate { name: argument },
+            "verify" => Op::SkillVerify { name: argument },
+            "remove" | "uninstall" => Op::SkillRemove { name: argument },
+            _ => {
+                self.blocks.push(Block::Error(
+                    "usage: /skill use|inspect|install|update|verify|remove ARG".into(),
+                ));
+                return;
+            }
+        };
+        self.send(op);
+    }
+
+    fn choose_workspace(&mut self) {
+        let mut dialog = rfd::FileDialog::new().set_title("Choose GnomeAI workspace");
+        if self.workspace.is_dir() {
+            dialog = dialog.set_directory(&self.workspace);
+        }
+        if let Some(path) = dialog.pick_folder() {
+            self.send(Op::SetWorkspace { path });
+        }
+    }
+
+    fn choose_skill_file(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Instalează SKILL.md")
+            .add_filter("Agent Skill", &["md"]);
+        if self.workspace.is_dir() {
+            dialog = dialog.set_directory(&self.workspace);
+        }
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
+        if path.file_name().and_then(|name| name.to_str()) != Some("SKILL.md") {
+            self.blocks.push(Block::Error(
+                "Selectează un fișier numit exact SKILL.md.".into(),
+            ));
+            return;
+        }
+        let Some(directory) = path.parent() else {
+            self.blocks.push(Block::Error(
+                "SKILL.md nu are un director părinte valid.".into(),
+            ));
+            return;
+        };
+        self.send(Op::SkillInstall {
+            source: directory.display().to_string(),
+        });
+    }
+
+    fn choose_attachment(&mut self) {
+        let mut supported = Vec::from(IMAGE_EXTS);
+        supported.push("pdf");
+        supported.extend_from_slice(OOXML_EXTS);
+        supported.extend_from_slice(TEXT_EXTS);
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Atașează un fișier")
+            .add_filter("Fișiere acceptate", &supported)
+            .add_filter("Documente", &["pdf", "docx", "xlsx", "pptx"])
+            .add_filter("Cod și text", TEXT_EXTS)
+            .add_filter("Imagini", IMAGE_EXTS);
+        if self.workspace.is_dir() {
+            dialog = dialog.set_directory(&self.workspace);
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.pending_attachment = Some(path);
+            self.request_focus = true;
+        }
+    }
+
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|input| input.raw.dropped_files.clone());
+        let Some(file) = dropped.into_iter().next() else {
+            return;
+        };
+        let path = file.path().to_path_buf();
+        if path.as_os_str().is_empty() {
+            self.blocks.push(Block::Error(
+                "Fișierul tras nu oferă o cale locală; folosește butonul + pentru a-l selecta."
+                    .into(),
+            ));
+            return;
+        }
+        self.pending_attachment = Some(path);
+        self.request_focus = true;
+    }
+
+    fn export_conversation(&mut self) {
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let filename = format!("gnomeai_export_{timestamp}.md");
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Export conversation")
+            .set_file_name(filename)
+            .add_filter("Markdown", &["md"]);
+        if self.workspace.is_dir() {
+            dialog = dialog.set_directory(&self.workspace);
+        }
+        let Some(path) = dialog.save_file() else {
+            return;
+        };
+        match std::fs::write(&path, self.export_markdown()) {
+            Ok(()) => self
+                .blocks
+                .push(Block::Note(format!("Exported to {}", path.display()))),
+            Err(error) => self.blocks.push(Block::Error(format!(
+                "Cannot export to {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn export_markdown(&self) -> String {
+        let mut output = format!(
+            "# GnomeAI-RS conversation\n\n**Provider:** {}  \n**Model:** {}  \n**Workspace:** {}\n\n---\n\n",
+            self.provider,
+            self.model,
+            self.workspace.display()
+        );
+        for block in &self.blocks {
+            match block {
+                Block::User(text) => output.push_str(&format!("## User\n\n{text}\n\n")),
+                Block::Assistant(text) => output.push_str(&format!("## Assistant\n\n{text}\n\n")),
+                Block::Reasoning(text) => output.push_str(&format!(
+                    "<details><summary>Reasoning</summary>\n\n{text}\n\n</details>\n\n"
+                )),
+                Block::Tool {
+                    name,
+                    summary,
+                    output: tool_output,
+                    ok,
+                    ..
+                } => output.push_str(&format!(
+                    "### Tool: {name} ({})\n\n{summary}\n\n```text\n{tool_output}\n```\n\n",
+                    if *ok { "ok" } else { "failed" }
+                )),
+                Block::Diff(diff) => output.push_str(&format!("```diff\n{diff}\n```\n\n")),
+                Block::Verify {
+                    stage,
+                    passed,
+                    summary,
+                } => output.push_str(&format!(
+                    "**Verification {stage}: {}** — {summary}\n\n",
+                    if *passed { "passed" } else { "failed" }
+                )),
+                Block::Error(error) => output.push_str(&format!("> Error: {error}\n\n")),
+                Block::Note(note) => output.push_str(&format!("> {note}\n\n")),
+            }
+        }
+        output
+    }
+
+    fn show_token_usage(&mut self) {
+        if self.token_history.is_empty() {
+            self.blocks
+                .push(Block::Note("No completed turns yet.".into()));
+            return;
+        }
+        let mut text = String::from("turn | in | out | total | duration\n");
+        for (index, (input, output, ms)) in self.token_history.iter().enumerate() {
+            text.push_str(&format!(
+                "{} | {} | {} | {} | {:.1}s\n",
+                index + 1,
+                input,
+                output,
+                input + output,
+                *ms as f64 / 1000.0
+            ));
+        }
+        text.push_str(&format!(
+            "\nTotal: {} in / {} out · model {}",
+            self.tokens_in, self.tokens_out, self.model
+        ));
+        self.blocks.push(Block::Note(text));
+    }
+
+    fn spawn_login(&mut self, provider_id: String) {
+        let sender = self.login_tx.clone();
+        let login_id = provider_id.clone();
+        self.login_status = Some("Pornesc autentificarea în browser…".into());
+        self.device_login = None;
+        self.show_provider = false;
+        self.runtime.spawn(async move {
+            let result = match login_id.as_str() {
+                "openai-account" => {
+                    let progress = sender.clone();
+                    crate::codex_app_server::login_with_chatgpt_notifying(
+                        move |verification_url, user_code| {
+                            let _ = progress.send(LoginUpdate::DeviceCode {
+                                verification_url,
+                                user_code,
+                            });
+                        },
+                    )
+                    .await
+                }
+                "anthropic-account" => crate::provider::login_with_claude().await,
+                _ => Err(anyhow!("account login is not configured")),
+            }
+            .map_err(|error| error.to_string());
+            let _ = sender.send(LoginUpdate::Finished {
+                provider_id: login_id,
+                result,
+            });
+        });
+    }
+
+    fn sidebar(&mut self, root: &mut egui::Ui) {
+        let session_rows = self
+            .sessions
+            .iter()
+            .take(8)
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    session
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "Conversație fără titlu".into()),
+                    session
+                        .workspace
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("proiect")
+                        .to_string(),
+                    session.is_current,
+                )
+            })
+            .collect::<Vec<_>>();
+        let workspace_name = self
+            .workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Alege proiectul")
+            .to_string();
+        let whatsapp_connected = whatsapp_bool(&self.whatsapp_status, "connected");
+        let confirming_delete = self.confirm_delete_session.clone();
+        let mut session_action = None;
+        let sidebar_width = if root.available_width() < 1040.0 {
+            228.0
+        } else {
+            264.0
+        };
+
+        egui::Panel::left("sidebar")
+            .exact_size(sidebar_width)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::default()
+                    .fill(Color32::from_rgb(22, 23, 26))
+                    .inner_margin(Margin::symmetric(13, 15)),
+            )
+            .show(root, |ui| {
+                ui.horizontal(|ui| {
+                    let (logo, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                    ui.painter()
+                        .rect_filled(logo, 8.0, Color32::from_rgb(105, 205, 153));
+                    ui.painter().text(
+                        logo.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "G",
+                        FontId::new(16.0, FontFamily::Proportional),
+                        Color32::from_rgb(18, 31, 24),
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("GnomeAI-RS").size(16.0).strong());
+                        ui.label(
+                            RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .small()
+                                .color(Color32::from_rgb(125, 125, 132)),
+                        );
+                    });
+                });
+                ui.add_space(18.0);
+
+                if new_conversation_button(ui, "Conversație nouă").clicked() {
+                    self.send(Op::NewSession);
+                }
+                ui.add_space(18.0);
+                ui.label(
+                    RichText::new("CONVERSAȚII")
+                        .size(10.0)
+                        .strong()
+                        .color(Color32::from_rgb(120, 120, 128)),
+                );
+                ui.add_space(5.0);
+
+                let list_height = (ui.available_height() - 238.0).max(120.0);
+                ScrollArea::vertical()
+                    .id_salt("sidebar_sessions")
+                    .max_height(list_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if session_rows.is_empty() {
+                            ui.label(
+                                RichText::new("Conversațiile recente vor apărea aici.")
+                                    .small()
+                                    .color(Color32::from_rgb(118, 118, 126)),
+                            );
+                        }
+                        for (id, title, project, current) in &session_rows {
+                            let action = session_row(
+                                ui,
+                                id,
+                                title,
+                                project,
+                                *current,
+                                confirming_delete.as_deref() == Some(id),
+                            );
+                            if action != SessionRowAction::None {
+                                session_action = Some((id.clone(), action, *current));
+                            }
+                        }
+                    });
+
+                if nav_button(ui, "Toate conversațiile", false, NavIcon::More).clicked() {
+                    self.show_sessions = true;
+                    self.send(Op::ListSessions);
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(5.0);
+
+                if nav_button(ui, &workspace_name, false, NavIcon::Folder).clicked() {
+                    self.choose_workspace();
+                }
+                if nav_button(ui, &self.model, false, NavIcon::Model).clicked() {
+                    self.show_models = true;
+                }
+                if nav_button(ui, "WhatsApp", whatsapp_connected, NavIcon::WhatsApp).clicked() {
+                    self.show_whatsapp = true;
+                    self.poll_whatsapp(true);
+                }
+                if nav_button(ui, "Setări", self.show_settings, NavIcon::Settings).clicked() {
+                    self.show_settings = true;
+                }
+            });
+
+        if let Some((id, action, current)) = session_action {
+            match action {
+                SessionRowAction::Resume if !current => {
+                    self.confirm_delete_session = None;
+                    self.send(Op::ResumeSession { id });
+                }
+                SessionRowAction::AskDelete => self.confirm_delete_session = Some(id),
+                SessionRowAction::ConfirmDelete => {
+                    self.confirm_delete_session = None;
+                    self.send(Op::DeleteSession { id });
+                }
+                SessionRowAction::CancelDelete => self.confirm_delete_session = None,
+                SessionRowAction::None | SessionRowAction::Resume => {}
+            }
+        }
+    }
+
+    fn status_bar(&mut self, root: &mut egui::Ui) {
+        let conversation_title = self
+            .sessions
+            .iter()
+            .find(|session| session.is_current)
+            .and_then(|session| session.title.clone())
+            .or_else(|| {
+                self.workspace
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| format!("Lucru în {name}"))
+            })
+            .unwrap_or_else(|| "Conversație nouă".into());
+        egui::Panel::top("status")
+            .exact_size(64.0)
+            .show_separator_line(true)
+            .frame(
+                egui::Frame::default()
+                    .fill(Color32::from_rgb(20, 21, 24))
+                    .inner_margin(Margin::symmetric(20, 9)),
+            )
+            .show(root, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(conversation_title).size(15.0).strong());
+                        let mut context = self.workspace.display().to_string();
+                        if let Some(branch) = &self.branch {
+                            context.push_str(&format!("  ·  {branch}"));
+                        }
+                        ui.label(
+                            RichText::new(ellipsize(&context, 72))
+                                .small()
+                                .color(Color32::from_rgb(128, 128, 136)),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let (status, status_color) = if self.busy {
+                            let elapsed = self
+                                .started
+                                .map_or(0.0, |time| time.elapsed().as_secs_f32());
+                            (
+                                format!("Lucrează · {elapsed:.1}s"),
+                                Color32::from_rgb(230, 183, 88),
+                            )
+                        } else if self.fatal {
+                            ("Nucleu oprit".into(), Color32::from_rgb(241, 112, 127))
+                        } else {
+                            ("Pregătit".into(), Color32::from_rgb(105, 205, 153))
+                        };
+                        status_indicator(ui, &status, status_color);
+                        if ui
+                            .selectable_label(self.show_activity, "Modificări")
+                            .on_hover_text("Arată activitatea și diff-urile")
+                            .clicked()
+                        {
+                            self.show_activity = !self.show_activity;
+                        }
+                        if !self.queue.is_empty() {
+                            ui.label(
+                                RichText::new(format!("{} în așteptare", self.queue.len()))
+                                    .small()
+                                    .color(Color32::from_rgb(162, 163, 171)),
+                            );
+                        }
+                        if ui
+                            .small_button(ellipsize(
+                                &format!("{} · {}", self.provider, self.model),
+                                34,
+                            ))
+                            .on_hover_text("Schimbă modelul")
+                            .clicked()
+                        {
+                            self.show_models = true;
+                        }
+                    });
+                });
+            });
+    }
+
+    fn activity_panel(&mut self, root: &mut egui::Ui) {
+        if !self.show_activity {
+            return;
+        }
+
+        let latest_diff = self.blocks.iter().rev().find_map(|block| match block {
+            Block::Diff(diff) => Some(diff.clone()),
+            _ => None,
+        });
+        let file_count = latest_diff
+            .as_deref()
+            .map(diff_file_names)
+            .map_or(0, |files| files.len());
+        let activities = self
+            .blocks
+            .iter()
+            .rev()
+            .filter_map(|block| match block {
+                Block::Tool {
+                    name,
+                    summary,
+                    done,
+                    ok,
+                    ms,
+                    ..
+                } => Some((
+                    format!(
+                        "{} {name} · {summary}{}",
+                        if !*done {
+                            "●"
+                        } else if *ok {
+                            "✓"
+                        } else {
+                            "✕"
+                        },
+                        if *done {
+                            format!(" · {ms} ms")
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    if !*done {
+                        Color32::YELLOW
+                    } else if *ok {
+                        Color32::from_rgb(80, 200, 130)
+                    } else {
+                        Color32::LIGHT_RED
+                    },
+                )),
+                Block::Verify {
+                    stage,
+                    passed,
+                    summary,
+                } => Some((
+                    format!("{} {stage} · {summary}", if *passed { "✓" } else { "✕" }),
+                    if *passed {
+                        Color32::from_rgb(80, 200, 130)
+                    } else {
+                        Color32::LIGHT_RED
+                    },
+                )),
+                Block::Error(error) => Some((format!("✕ {error}"), Color32::LIGHT_RED)),
+                _ => None,
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        let panel_width = (root.available_width() * 0.34).clamp(280.0, 360.0);
+
+        egui::Panel::right("activity")
+            .exact_size(panel_width)
+            .resizable(false)
+            .show_separator_line(true)
+            .frame(
+                egui::Frame::default()
+                    .fill(Color32::from_rgb(22, 23, 26))
+                    .inner_margin(Margin::symmetric(15, 14)),
+            )
+            .show(root, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading(RichText::new(format!("Modificări ({file_count})")).size(16.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Închide").clicked() {
+                            self.show_activity = false;
+                        }
+                    });
+                });
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    if ui.small_button("Actualizează diff").clicked() {
+                        self.send(Op::ShowDiff);
+                    }
+                    ui.menu_button("Acțiuni", |ui| {
+                        if ui.button("Skills").clicked() {
+                            self.send(Op::SkillsList);
+                            ui.close();
+                        }
+                        if ui.button("Memorie").clicked() {
+                            self.send(Op::MemoryShow);
+                            ui.close();
+                        }
+                        if ui.button("Diagnostic").clicked() {
+                            self.send(Op::Doctor);
+                            ui.close();
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                ui.separator();
+
+                ScrollArea::vertical()
+                    .id_salt("activity_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("FIȘIERE")
+                                .size(10.0)
+                                .strong()
+                                .color(Color32::from_rgb(120, 120, 128)),
+                        );
+                        ui.add_space(5.0);
+                        match latest_diff.as_deref() {
+                            Some(diff) => {
+                                let files = diff_file_names(diff);
+                                if files.is_empty() {
+                                    ui.label(
+                                        RichText::new("Există modificări în sesiune.")
+                                            .small()
+                                            .color(Color32::GRAY),
+                                    );
+                                } else {
+                                    for file in files {
+                                        egui::Frame::default()
+                                            .fill(Color32::from_rgb(29, 29, 33))
+                                            .corner_radius(7.0)
+                                            .inner_margin(Margin::symmetric(8, 6))
+                                            .show(ui, |ui| {
+                                                ui.label(RichText::new(file).monospace().small());
+                                            });
+                                        ui.add_space(3.0);
+                                    }
+                                }
+
+                                ui.add_space(10.0);
+                                ui.label(
+                                    RichText::new("PREVIZUALIZARE DIFF")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(120, 120, 128)),
+                                );
+                                egui::Frame::default()
+                                    .fill(Color32::from_rgb(14, 14, 16))
+                                    .corner_radius(8.0)
+                                    .inner_margin(8.0)
+                                    .show(ui, |ui| {
+                                        ScrollArea::horizontal().show(ui, |ui| {
+                                            for line in diff.lines().take(80) {
+                                                let color = diff_line_color(line);
+                                                ui.label(
+                                                    RichText::new(line)
+                                                        .monospace()
+                                                        .small()
+                                                        .color(color),
+                                                );
+                                            }
+                                        });
+                                    });
+                            }
+                            None => {
+                                ui.label(
+                                    RichText::new("Nu există încă modificări în această sesiune.")
+                                        .small()
+                                        .color(Color32::GRAY),
+                                );
+                            }
+                        }
+
+                        ui.add_space(14.0);
+                        ui.label(
+                            RichText::new("ACTIVITATE")
+                                .size(10.0)
+                                .strong()
+                                .color(Color32::from_rgb(120, 120, 128)),
+                        );
+                        ui.add_space(5.0);
+                        if activities.is_empty() {
+                            ui.label(
+                                RichText::new("Comenzile și verificările vor apărea aici.")
+                                    .small()
+                                    .color(Color32::GRAY),
+                            );
+                        }
+                        for (text, color) in activities {
+                            ui.add(
+                                egui::Label::new(RichText::new(text).small().color(color)).wrap(),
+                            );
+                            ui.add_space(4.0);
+                        }
+                    });
+            });
+    }
+
+    fn transcript(&mut self, root: &mut egui::Ui) {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::default()
+                    .fill(Color32::from_rgb(15, 15, 17))
+                    .inner_margin(Margin::symmetric(18, 14)),
+            )
+            .show(root, |ui| {
+                ScrollArea::vertical()
+                    .id_salt("transcript")
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        let content_width = ui.available_width().min(900.0);
+                        let gutter = ((ui.available_width() - content_width) / 2.0).max(0.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(gutter);
+                            ui.vertical(|ui| {
+                                ui.set_width(content_width);
+                                if self.blocks.is_empty() {
+                                    ui.vertical_centered(|ui| {
+                                        ui.add_space(54.0);
+                                        let (logo, _) = ui
+                                            .allocate_exact_size(Vec2::splat(46.0), Sense::hover());
+                                        ui.painter().circle_filled(
+                                            logo.center(),
+                                            23.0,
+                                            Color32::from_rgb(105, 205, 153),
+                                        );
+                                        ui.painter().text(
+                                            logo.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "G",
+                                            FontId::new(23.0, FontFamily::Proportional),
+                                            Color32::from_rgb(18, 31, 24),
+                                        );
+                                        ui.add_space(12.0);
+                                        ui.heading(
+                                            RichText::new("Cu ce lucrăm astăzi?").size(25.0),
+                                        );
+                                        ui.label(
+                                            RichText::new(
+                                                "Cere o modificare, atașează o imagine sau alege o acțiune rapidă.",
+                                            )
+                                            .color(Color32::from_rgb(151, 152, 161)),
+                                        );
+                                        ui.add_space(22.0);
+
+                                        if suggestion_button(
+                                            ui,
+                                            "Analizează proiectul curent",
+                                            "Structură, probleme și îmbunătățiri",
+                                        )
+                                        .clicked()
+                                        {
+                                            self.composer = "Analizează proiectul curent și spune-mi ce ar trebui îmbunătățit.".into();
+                                            self.request_focus = true;
+                                        }
+                                        if suggestion_button(
+                                            ui,
+                                            "Arată modificările Git",
+                                            "Fișiere schimbate și diff",
+                                        )
+                                        .clicked()
+                                        {
+                                            self.show_activity = true;
+                                            self.send(Op::ShowDiff);
+                                        }
+                                        if suggestion_button(
+                                            ui,
+                                            "Configurează WhatsApp",
+                                            "Conectare, QR și numere permise",
+                                        )
+                                        .clicked()
+                                        {
+                                            self.show_whatsapp = true;
+                                            self.poll_whatsapp(true);
+                                        }
+                                    });
+                                }
+                                let filter = self.search.trim().to_lowercase();
+                                for (index, block) in self.blocks.iter().enumerate() {
+                                    if !filter.is_empty()
+                                        && !block
+                                            .searchable_text()
+                                            .to_lowercase()
+                                            .contains(&filter)
+                                    {
+                                        continue;
+                                    }
+                                    render_block(ui, index, block);
+                                    ui.add_space(10.0);
+                                }
+                            });
+                        });
+                    });
+            });
+    }
+
+    fn composer(&mut self, root: &mut egui::Ui) {
+        let ctx = root.ctx().clone();
+        egui::Panel::bottom("composer")
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::default()
+                    .fill(Color32::from_rgb(17, 18, 20))
+                    .inner_margin(Margin::symmetric(18, 12)),
+            )
+            .show(root, |ui| {
+                let content_width = ui.available_width().min(900.0);
+                let gutter = ((ui.available_width() - content_width) / 2.0).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(gutter);
+                    ui.vertical(|ui| {
+                        ui.set_width(content_width);
+
+                        if let Some(path) = self.pending_attachment.clone() {
+                            egui::Frame::default()
+                                .fill(Color32::from_rgb(27, 28, 32))
+                                .corner_radius(8.0)
+                                .inner_margin(Margin::symmetric(9, 5))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("Fișier · {}", path.display()))
+                                                .small()
+                                                .color(Color32::from_rgb(183, 184, 191)),
+                                        );
+                                        if ui.small_button("Elimină").clicked() {
+                                            self.pending_attachment = None;
+                                        }
+                                    });
+                                });
+                            ui.add_space(5.0);
+                        }
+
+                        let prefix = self.composer.trim_start();
+                        if prefix.starts_with('/') && !prefix.contains(char::is_whitespace) {
+                            let matches = COMMANDS
+                                .iter()
+                                .filter(|(command, _)| command.starts_with(prefix))
+                                .take(7)
+                                .copied()
+                                .collect::<Vec<_>>();
+                            if !matches.is_empty() {
+                                egui::Frame::default()
+                                    .fill(Color32::from_rgb(25, 26, 30))
+                                    .stroke(Stroke::new(1.0, Color32::from_rgb(51, 52, 59)))
+                                    .corner_radius(10.0)
+                                    .inner_margin(8.0)
+                                    .show(ui, |ui| {
+                                        for (command, description) in matches {
+                                            if ui
+                                                .selectable_label(
+                                                    false,
+                                                    format!("{command:<12}  {description}"),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.composer = command.into();
+                                                self.request_focus = true;
+                                            }
+                                        }
+                                    });
+                                ui.add_space(5.0);
+                            }
+                        }
+
+                        let frame = egui::Frame::default()
+                            .fill(Color32::from_rgb(28, 29, 33))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(63, 64, 72)))
+                            .corner_radius(16.0)
+                            .inner_margin(Margin::symmetric(13, 10));
+                        let composer_frame = frame.show(ui, |ui| {
+                            let width = ui.available_width().max(160.0);
+                            let rows = composer_rows(&self.composer, width);
+                            let response = ui.add_sized(
+                                [width, rows as f32 * 22.0 + 8.0],
+                                TextEdit::multiline(&mut self.composer)
+                                    .id(egui::Id::new("main_composer"))
+                                    .frame(egui::Frame::NONE)
+                                    .desired_rows(rows)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("Întreabă GnomeAI…")
+                                    .return_key(KeyboardShortcut::new(
+                                        Modifiers::SHIFT,
+                                        Key::Enter,
+                                    )),
+                            );
+                            if self.request_focus {
+                                response.request_focus();
+                                self.request_focus = false;
+                            }
+                            let enter = response.has_focus()
+                                && ui.input_mut(|input| {
+                                    input.consume_key(Modifiers::NONE, Key::Enter)
+                                });
+                            let ctrl_enter = response.has_focus()
+                                && ui.input_mut(|input| {
+                                    input.consume_key(Modifiers::CTRL, Key::Enter)
+                                });
+
+                            ui.add_space(3.0);
+                            ui.horizontal(|ui| {
+                                if composer_icon_button(ui, ComposerIcon::Attach, false)
+                                    .on_hover_text("Atașează un fișier")
+                                    .clicked()
+                                {
+                                    self.choose_attachment();
+                                }
+                                let web = if self.web_search_enabled {
+                                    "web activ"
+                                } else {
+                                    "web oprit"
+                                };
+                                ui.label(
+                                    RichText::new(format!("{} · {web}", self.sandbox))
+                                        .small()
+                                        .color(Color32::from_rgb(126, 127, 136)),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if self.busy {
+                                        if composer_icon_button(ui, ComposerIcon::Stop, true)
+                                            .on_hover_text("Oprește")
+                                            .clicked()
+                                        {
+                                            self.send(Op::Interrupt);
+                                        }
+                                    } else if composer_icon_button(
+                                        ui,
+                                        ComposerIcon::Send,
+                                        !self.composer.trim().is_empty()
+                                            || self.pending_attachment.is_some(),
+                                    )
+                                    .on_hover_text("Trimite (Enter)")
+                                    .clicked()
+                                    {
+                                        self.dispatch_composer();
+                                    }
+                                    ui.label(
+                                        RichText::new(&self.model)
+                                            .small()
+                                            .color(Color32::from_rgb(126, 127, 136)),
+                                    );
+                                });
+                            });
+
+                            if enter || ctrl_enter {
+                                self.dispatch_composer();
+                            }
+                        });
+                        let clicked_inside = ctx.input(|input| {
+                            input.pointer.any_click()
+                                && input.pointer.interact_pos().is_some_and(|position| {
+                                    composer_frame.response.rect.contains(position)
+                                })
+                        });
+                        if clicked_inside {
+                            ctx.memory_mut(|memory| {
+                                memory.request_focus(egui::Id::new("main_composer"));
+                            });
+                        }
+
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Enter trimite · Shift+Enter adaugă un rând")
+                                    .small()
+                                    .color(Color32::from_rgb(83, 84, 92)),
+                            );
+                            if let Some(status) = &self.login_status {
+                                ui.label(
+                                    RichText::new(status)
+                                        .small()
+                                        .color(Color32::from_rgb(128, 190, 245)),
+                                );
+                            }
+                        });
+                    });
+                });
+            });
+    }
+
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        self.approval_dialog(ctx);
+        self.privilege_dialog(ctx);
+        self.device_login_dialog(ctx);
+        self.provider_dialog(ctx);
+        self.model_dialog(ctx);
+        self.session_dialog(ctx);
+        self.whatsapp_dialog(ctx);
+        self.nodes_dialog(ctx);
+        self.settings_dialog(ctx);
+        self.help_dialog(ctx);
+    }
+
+    fn device_login_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.device_login.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        let mut copy_code = false;
+        let mut open_browser = false;
+        egui::Window::new("Conectare OpenAI Codex")
+            .id(egui::Id::new("codex_device_login_v1"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(Vec2::new(420.0, 210.0))
+            .min_size(Vec2::new(340.0, 180.0))
+            .show(ctx, |ui| {
+                ui.label("Pagina de autentificare a fost deschisă în browser.");
+                ui.label("Introdu acest cod unic:");
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(&dialog.user_code)
+                        .monospace()
+                        .size(24.0)
+                        .strong(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(&dialog.verification_url)
+                        .small()
+                        .color(Color32::from_rgb(128, 190, 245)),
+                );
+                if let Some(error) = &dialog.browser_error {
+                    ui.colored_label(
+                        Color32::LIGHT_RED,
+                        format!("Browserul nu a putut fi deschis automat: {error}"),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    copy_code = ui.button("Copiază codul").clicked();
+                    open_browser = ui.button("Deschide browserul").clicked();
+                });
+                ui.label(
+                    RichText::new("Aștept confirmarea OpenAI…")
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            });
+
+        if copy_code {
+            self.copy_request = Some(dialog.user_code.clone());
+        }
+        if open_browser {
+            dialog.browser_error = open_external_url(&dialog.verification_url).err();
+        }
+        if !open {
+            self.device_login = None;
+        }
+    }
+
+    fn settings_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = true;
+        let old_sandbox = self.sandbox.clone();
+        let old_web_search = self.web_search_enabled;
+        let mut save_node_hub = false;
+
+        let dialog_size = Vec2::new(420.0, 360.0);
+        egui::Window::new("Setări")
+            // A new id intentionally discards geometry saved by the older
+            // dialog, whose labelled Sandbox combo could make the body wider
+            // than the title bar.
+            .id(egui::Id::new("settings_dialog_compact_v3"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_pos(centered_dialog_pos(ctx, dialog_size))
+            .default_size(dialog_size)
+            .min_size(Vec2::new(340.0, 260.0))
+            .max_width(560.0)
+            .resizable(true)
+            .scroll([false, true])
+            .show(ctx, |ui| {
+                ui.label(RichText::new("MODEL ȘI CONEXIUNI").small().strong());
+                ui.add_space(5.0);
+                egui::Frame::default()
+                    .fill(Color32::from_rgb(27, 27, 31))
+                    .corner_radius(9.0)
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("Provider: {}", self.provider));
+                            if ui.small_button("Schimbă providerul").clicked() {
+                                self.show_provider = true;
+                            }
+                            ui.label(format!("Model: {}", self.model));
+                            if ui.small_button("Schimbă modelul").clicked() {
+                                self.show_models = true;
+                            }
+                            if ui.small_button("WhatsApp").clicked() {
+                                self.show_whatsapp = true;
+                                self.poll_whatsapp(true);
+                            }
+                            if ui.small_button("Dispozitive").clicked() {
+                                self.show_nodes = true;
+                                self.poll_nodes(true);
+                            }
+                        });
+                    });
+
+                ui.add_space(12.0);
+                ui.label(RichText::new("EXECUȚIE").small().strong());
+                ui.checkbox(&mut self.web_search_enabled, "Căutare web");
+                ui.horizontal(|ui| {
+                    ui.label("Sandbox");
+                    egui::ComboBox::from_id_salt("settings_sandbox")
+                        .selected_text(&self.sandbox)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.sandbox,
+                                "read-only".into(),
+                                "Doar citire",
+                            );
+                            ui.selectable_value(&mut self.sandbox, "normal".into(), "Normal");
+                            ui.selectable_value(
+                                &mut self.sandbox,
+                                "full-access".into(),
+                                "Acces complet",
+                            );
+                        });
+                });
+                ui.add_space(6.0);
+                egui::Frame::default()
+                    .fill(Color32::from_rgb(27, 27, 31))
+                    .corner_radius(9.0)
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.checkbox(
+                            &mut self.node_enabled,
+                            "Hub pentru dispozitive slabe",
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Adresă");
+                            ui.add(
+                                TextEdit::singleline(&mut self.node_bind)
+                                    .hint_text("0.0.0.0")
+                                    .desired_width(120.0),
+                            );
+                            ui.label("Port");
+                            ui.add(
+                                egui::DragValue::new(&mut self.node_port)
+                                    .range(1..=u16::MAX),
+                            );
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            save_node_hub = ui.small_button("Salvează Hub").clicked();
+                            if ui.small_button("Administrează dispozitivele").clicked() {
+                                self.show_nodes = true;
+                                self.poll_nodes(true);
+                            }
+                        });
+                        ui.label(
+                            RichText::new(
+                                "Modificarea listenerului se aplică după repornirea aplicației.",
+                            )
+                            .small()
+                            .color(Color32::GRAY),
+                        );
+                    });
+
+                ui.add_space(12.0);
+                ui.label(RichText::new("INTERFAȚĂ").small().strong());
+                ui.checkbox(&mut self.notifications, "Notificări desktop");
+                ui.checkbox(&mut self.high_contrast, "Contrast ridicat");
+                ui.label(
+                    RichText::new("Caută în conversația curentă")
+                        .small()
+                        .color(Color32::GRAY),
+                );
+                ui.add(
+                    TextEdit::singleline(&mut self.search)
+                        .id(egui::Id::new("transcript_search"))
+                        .hint_text("Caută…")
+                        .desired_width(f32::INFINITY),
+                );
+
+                ui.add_space(12.0);
+                ui.label(RichText::new("INSTRUMENTE").small().strong());
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Skills").clicked() {
+                        self.send(Op::SkillsList);
+                    }
+                    if ui.button("Instalează SKILL.md").clicked() {
+                        self.choose_skill_file();
+                    }
+                    if ui.button("Memorie").clicked() {
+                        self.send(Op::MemoryShow);
+                    }
+                    if ui.button("Compactează contextul").clicked() {
+                        self.send(Op::Compact);
+                    }
+                    if ui.button("Anulează patch-urile").clicked() {
+                        self.send(Op::Rollback);
+                    }
+                    if ui.button("Diagnostic").clicked() {
+                        self.send(Op::Doctor);
+                    }
+                    if ui.button("Tokeni").clicked() {
+                        self.show_token_usage();
+                    }
+                    if ui.button("Export Markdown").clicked() {
+                        self.export_conversation();
+                    }
+                });
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{} tokeni intrare · {} tokeni ieșire",
+                        self.tokens_in, self.tokens_out
+                    ))
+                    .small()
+                    .color(Color32::GRAY),
+                );
+            });
+
+        self.show_settings = open;
+        if self.web_search_enabled != old_web_search {
+            self.send(Op::SetWebSearch {
+                enabled: self.web_search_enabled,
+            });
+        }
+        if self.sandbox != old_sandbox {
+            self.send(Op::SetSandbox {
+                mode: self.sandbox.clone(),
+            });
+        }
+        if save_node_hub {
+            self.send(Op::SetNodeHub {
+                enabled: self.node_enabled,
+                bind: self.node_bind.trim().to_string(),
+                port: self.node_port,
+            });
+        }
+    }
+
+    fn approval_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.approval.as_ref() else {
+            return;
+        };
+        let call_id = dialog.call_id.clone();
+        let allow_always = dialog.allow_always;
+        let mut decision = None;
+        egui::Window::new("Approval required")
+            .collapsible(false)
+            .resizable(true)
+            .default_size(Vec2::new(420.0, 190.0))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(&dialog.command).monospace());
+                ui.separator();
+                ui.label(&dialog.reason);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Allow once").clicked() {
+                        decision = Some(Decision::Allow);
+                    }
+                    if allow_always && ui.button("Always allow").clicked() {
+                        decision = Some(Decision::AlwaysAllow);
+                    }
+                    if ui.button("Deny").clicked() {
+                        decision = Some(Decision::Deny);
+                    }
+                });
+            });
+        if let Some(decision) = decision {
+            self.approval = None;
+            self.send(Op::Approve { call_id, decision });
+        }
+    }
+
+    fn privilege_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.privilege.as_mut() else {
+            return;
+        };
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new("Administrator credential")
+            .collapsible(false)
+            .resizable(true)
+            .default_size(Vec2::new(390.0, 190.0))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(&dialog.command).monospace());
+                ui.label(format!("Attempt {}", dialog.attempt));
+                if let Some(message) = &dialog.message {
+                    ui.colored_label(Color32::LIGHT_RED, message);
+                }
+                let response = ui.add(
+                    TextEdit::singleline(&mut dialog.credential)
+                        .password(true)
+                        .hint_text("Password"),
+                );
+                if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                if dialog.keyring_available {
+                    ui.checkbox(&mut dialog.remember, "Remember in system keyring");
+                }
+                ui.horizontal(|ui| {
+                    submit |= ui.button("Continue").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        if submit || cancel {
+            let dialog = self.privilege.take().expect("dialog still exists");
+            self.send(Op::ProvidePrivilegeCredential {
+                request_id: dialog.request_id,
+                credential: (!cancel && !dialog.credential.is_empty())
+                    .then(|| SecretString::new(dialog.credential)),
+                remember: !cancel && dialog.remember && dialog.keyring_available,
+            });
+        }
+    }
+
+    fn provider_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_provider {
+            return;
+        }
+        let mut open = true;
+        let mut apply = false;
+        let mut login = None;
+        let dialog_size = Vec2::new(410.0, 280.0);
+        egui::Window::new("Provider")
+            // Discard geometry saved by the older labelled combo, which
+            // could make the body wider than the title bar.
+            .id(egui::Id::new("provider_dialog_compact_v3"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_pos(centered_dialog_pos(ctx, dialog_size))
+            .default_size(dialog_size)
+            .min_size(Vec2::new(340.0, 220.0))
+            .max_width(540.0)
+            .scroll([false, true])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Provider");
+                    egui::ComboBox::from_id_salt("provider_selector")
+                        .selected_text(PROVIDERS[self.provider_index].name)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for (index, provider) in PROVIDERS.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.provider_index,
+                                    index,
+                                    format!("{} — {}", provider.name, provider.description),
+                                );
+                            }
+                        });
+                });
+                let provider = PROVIDERS[self.provider_index];
+                ui.label(RichText::new(provider.description).color(Color32::GRAY));
+                if provider.id == "custom" {
+                    ui.label("OpenAI-compatible base URL");
+                    ui.text_edit_singleline(&mut self.provider_base_url);
+                }
+                match provider.auth {
+                    AuthKind::Account => {
+                        ui.label(
+                            "Sesiunea este memorată de aplicația oficială și se reutilizează cât timp rămâne validă.",
+                        );
+                        if ui.button("Activează contul").clicked() {
+                            login = Some(provider.id.to_string());
+                        }
+                    }
+                    AuthKind::ApiKey | AuthKind::OptionalApiKey => {
+                        ui.label(if provider.auth == AuthKind::ApiKey {
+                            "API key"
+                        } else {
+                            "API key (optional)"
+                        });
+                        ui.add(
+                            TextEdit::singleline(&mut self.provider_api_key)
+                                .password(true)
+                                .hint_text("Lasă gol pentru cheia memorată")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Cheia nouă este salvată privat; câmpul gol reutilizează cheia existentă.",
+                            )
+                            .small()
+                            .color(Color32::GRAY),
+                        );
+                        apply = ui.button("Use provider").clicked();
+                    }
+                }
+            });
+        self.show_provider = open;
+        if apply {
+            let provider = PROVIDERS[self.provider_index];
+            let key = self.provider_api_key.trim().to_string();
+            // An empty field deliberately asks the core to reuse this
+            // provider's owner-only saved credential. If none exists, the
+            // core returns the normal "API key required" error.
+            self.send(Op::SetProvider {
+                provider_id: provider.id.into(),
+                api_key: (!key.is_empty()).then(|| SecretString::new(key)),
+                base_url: (provider.id == "custom")
+                    .then(|| self.provider_base_url.trim().to_string()),
+            });
+        }
+        if let Some(provider_id) = login {
+            self.spawn_login(provider_id);
+        }
+    }
+
+    fn model_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_models {
+            return;
+        }
+        let mut open = true;
+        let mut selected = None;
+        let dialog_size = Vec2::new(400.0, 300.0);
+        egui::Window::new("Model")
+            .id(egui::Id::new("model_dialog_compact_v2"))
+            .open(&mut open)
+            .default_pos(centered_dialog_pos(ctx, dialog_size))
+            .default_size(dialog_size)
+            .min_size(Vec2::new(320.0, 220.0))
+            .max_width(560.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.add(
+                    TextEdit::singleline(&mut self.model_filter)
+                        .hint_text("Filter models…")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.separator();
+                let filter = self.model_filter.trim().to_lowercase();
+                ScrollArea::vertical().show(ui, |ui| {
+                    if self.models.is_empty() {
+                        ui.label("No provider model list is available. Use /model MODEL.");
+                    }
+                    for model in &self.models {
+                        if !filter.is_empty() && !model.to_lowercase().contains(&filter) {
+                            continue;
+                        }
+                        if ui.selectable_label(model == &self.model, model).clicked() {
+                            selected = Some(model.clone());
+                        }
+                    }
+                });
+            });
+        self.show_models = open;
+        if let Some(model) = selected {
+            self.model = model.clone();
+            self.show_models = false;
+            self.send(Op::SetModel { model });
+        }
+    }
+
+    fn session_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_sessions {
+            return;
+        }
+        let mut open = true;
+        let mut op = None;
+        egui::Window::new("Sessions")
+            .open(&mut open)
+            .default_size(Vec2::new(520.0, 340.0))
+            .resizable(true)
+            .show(ctx, |ui| {
+                if self.sessions.is_empty() {
+                    ui.label("No saved sessions.");
+                }
+                ScrollArea::vertical().show(ui, |ui| {
+                    for session in &self.sessions {
+                        egui::Frame::default()
+                            .fill(if session.is_current {
+                                Color32::from_rgb(35, 48, 58)
+                            } else {
+                                Color32::from_rgb(27, 27, 31)
+                            })
+                            .corner_radius(8.0)
+                            .inner_margin(8.0)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            RichText::new(
+                                                session.title.as_deref().unwrap_or(&session.id),
+                                            )
+                                            .strong(),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} · {} · {} turns",
+                                                session.workspace.display(),
+                                                session.model,
+                                                session.turns
+                                            ))
+                                            .small()
+                                            .color(Color32::GRAY),
+                                        );
+                                    });
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.button("Delete").clicked() {
+                                            op = Some(Op::DeleteSession {
+                                                id: session.id.clone(),
+                                            });
+                                        }
+                                        if ui.button("Rename").clicked() {
+                                            self.rename_session = Some((
+                                                session.id.clone(),
+                                                session.title.clone().unwrap_or_default(),
+                                            ));
+                                        }
+                                        if ui.button("Resume").clicked() {
+                                            op = Some(Op::ResumeSession {
+                                                id: session.id.clone(),
+                                            });
+                                        }
+                                    });
+                                });
+                            });
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+        self.show_sessions = open;
+        if let Some(op) = op {
+            self.send(op);
+        }
+        if let Some((id, title)) = self.rename_session.as_mut() {
+            let mut save = false;
+            let mut cancel = false;
+            egui::Window::new("Rename session")
+                .collapsible(false)
+                .resizable(true)
+                .default_size(Vec2::new(360.0, 135.0))
+                .show(ctx, |ui| {
+                    ui.text_edit_singleline(title);
+                    ui.horizontal(|ui| {
+                        save = ui.button("Save").clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                });
+            if save {
+                let id = id.clone();
+                let title = title.trim().to_string();
+                self.rename_session = None;
+                self.send(Op::RenameSession { id, title });
+            } else if cancel {
+                self.rename_session = None;
+            }
+        }
+    }
+
+    fn whatsapp_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_whatsapp {
+            return;
+        }
+        let mut open = true;
+        let mut save = false;
+        let mut stop = false;
+        let mut reload = false;
+        let mut refresh_qr = false;
+        let mut send_test = false;
+        let connected = whatsapp_bool(&self.whatsapp_status, "connected");
+        let running = whatsapp_bool(&self.whatsapp_status, "bridge_running");
+        let authenticated = whatsapp_bool(&self.whatsapp_status, "authenticated");
+        let qr = whatsapp_text(&self.whatsapp_status, "qr").to_string();
+        let own_phone = whatsapp_text(&self.whatsapp_status, "own_phone").to_string();
+        let own_jid = whatsapp_text(&self.whatsapp_status, "own_jid").to_string();
+        let bridge_error = whatsapp_text(&self.whatsapp_status, "last_error").to_string();
+        if connected && self.whatsapp_test_jid.is_empty() && !own_jid.is_empty() {
+            self.whatsapp_test_jid = own_jid.clone();
+        }
+
+        egui::Window::new("WhatsApp")
+            .open(&mut open)
+            .default_size(Vec2::new(480.0, 460.0))
+            .resizable(true)
+            .scroll([false, true])
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    status_badge(ui, "Serviciu", running);
+                    status_badge(ui, "Autentificat", authenticated);
+                    status_badge(ui, "Conectat", connected);
+                    if !own_phone.is_empty() {
+                        ui.label(RichText::new(format!("Număr: +{own_phone}")).small());
+                    }
+                });
+                if let Some(error) = &self.whatsapp_service.launch_error {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+                if !bridge_error.is_empty() {
+                    ui.colored_label(Color32::LIGHT_RED, &bridge_error);
+                }
+                if let Some(message) = &self.whatsapp_feedback {
+                    ui.label(RichText::new(message).color(Color32::LIGHT_BLUE));
+                }
+
+                ui.separator();
+                ui.checkbox(
+                    &mut self.whatsapp_enabled,
+                    "Activează integrarea WhatsApp",
+                );
+                ui.label("Numele afișat al asistentului");
+                ui.add(
+                    TextEdit::singleline(&mut self.whatsapp_assistant_name)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.checkbox(
+                    &mut self.whatsapp_has_own_number,
+                    "Asistentul folosește un număr WhatsApp dedicat",
+                );
+                ui.label("Conversații permise (JID-uri, câte unul pe rând)");
+                ui.add(
+                    TextEdit::multiline(&mut self.whatsapp_allowed_jids)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("40700000000@s.whatsapp.net"),
+                );
+                ui.label(
+                    RichText::new(
+                        "Dacă lista rămâne goală, sunt acceptate numai mesajele către propriul cont.",
+                    )
+                    .small()
+                    .color(Color32::GRAY),
+                );
+                ui.horizontal(|ui| {
+                    save = ui.button("Salvează și aplică").clicked();
+                    stop = ui.button("Oprește").clicked();
+                    reload = ui.button("Repornește bridge-ul").clicked();
+                    if self.whatsapp_enabled && !connected {
+                        refresh_qr = ui.button("Cod QR nou").clicked();
+                    }
+                });
+
+                if !qr.is_empty() && !connected {
+                    ui.separator();
+                    ui.heading("Scanează codul QR din WhatsApp");
+                    render_qr(ui, &qr);
+                }
+
+                if connected {
+                    ui.separator();
+                    ui.collapsing("Trimite un mesaj de test", |ui| {
+                        ui.label("JID destinatar");
+                        ui.add(
+                            TextEdit::singleline(&mut self.whatsapp_test_jid)
+                                .desired_width(f32::INFINITY)
+                                .hint_text(if own_jid.is_empty() {
+                                    "40700000000@s.whatsapp.net".to_string()
+                                } else {
+                                    own_jid.clone()
+                                }),
+                        );
+                        ui.label("Mesaj");
+                        ui.add(
+                            TextEdit::multiline(&mut self.whatsapp_test_message)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY),
+                        );
+                        send_test = ui.button("Trimite pe WhatsApp").clicked();
+                    });
+                }
+                ui.separator();
+                ui.collapsing("Jurnal recent", |ui| {
+                    ui.label(
+                        RichText::new(self.whatsapp_log_file.display().to_string())
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                    let log = read_log_tail(&self.whatsapp_log_file, 12 * 1024);
+                    if log.is_empty() {
+                        ui.label("Jurnalul este gol.");
+                    } else {
+                        ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(log).monospace())
+                                    .selectable(true),
+                            );
+                        });
+                    }
+                });
+            });
+        self.show_whatsapp = open;
+
+        if save {
+            let mut allowed_jids = self
+                .whatsapp_allowed_jids
+                .split(|character| character == '\n' || character == ',')
+                .map(str::trim)
+                .filter(|jid| !jid.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            allowed_jids.sort();
+            allowed_jids.dedup();
+            self.whatsapp_feedback = Some("Se salvează setările…".into());
+            self.send(Op::SetWhatsApp {
+                enabled: self.whatsapp_enabled,
+                assistant_name: self.whatsapp_assistant_name.clone(),
+                has_own_number: self.whatsapp_has_own_number,
+                allowed_jids,
+            });
+        }
+        if stop {
+            self.whatsapp_enabled = false;
+            self.send(Op::SetWhatsApp {
+                enabled: false,
+                assistant_name: self.whatsapp_assistant_name.clone(),
+                has_own_number: self.whatsapp_has_own_number,
+                allowed_jids: self
+                    .whatsapp_allowed_jids
+                    .lines()
+                    .map(str::trim)
+                    .filter(|jid| !jid.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            });
+        }
+        if reload {
+            self.reload_whatsapp_service();
+        }
+        if refresh_qr {
+            self.refresh_whatsapp_qr();
+        }
+        if send_test {
+            self.send_whatsapp_test();
+        }
+    }
+
+    fn nodes_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_nodes {
+            return;
+        }
+        let mut open = true;
+        let mut copy_command = None;
+        let mut policy_change = None;
+        let nodes = self
+            .node_status
+            .get("nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let enroll = format!(
+            "gnomeai-node enroll --server http://IP-PC:{} --token {} --name NUME",
+            self.node_port, self.node_enrollment_token
+        );
+        let enroll_root = format!("{enroll} --allow-root");
+
+        egui::Window::new("Dispozitive")
+            .id(egui::Id::new("nodes_dialog_v1"))
+            .open(&mut open)
+            .default_size(Vec2::new(540.0, 430.0))
+            .min_size(Vec2::new(400.0, 280.0))
+            .resizable(true)
+            .scroll([false, true])
+            .show(ctx, |ui| {
+                if !self.node_enabled {
+                    ui.colored_label(
+                        Color32::LIGHT_YELLOW,
+                        "Hub-ul este oprit. Activează-l în Setări și repornește aplicația.",
+                    );
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        status_badge(ui, "Hub", self.node_feedback.is_none());
+                        ui.label(format!("{}:{}", self.node_bind, self.node_port));
+                        if ui.small_button("Reîmprospătează").clicked() {
+                            self.poll_nodes(true);
+                        }
+                    });
+                }
+                if let Some(message) = &self.node_feedback {
+                    ui.label(RichText::new(message).color(Color32::LIGHT_BLUE));
+                }
+
+                ui.separator();
+                ui.label(RichText::new("CONECTEAZĂ UN CLIENT").small().strong());
+                ui.label(
+                    RichText::new(
+                        "Instalează pachetul minimal pe dispozitiv, apoi rulează una dintre comenzile de mai jos. Înlocuiește IP-PC și NUME.",
+                    )
+                    .small()
+                    .color(Color32::GRAY),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Copiază comanda normală").clicked() {
+                        copy_command = Some(enroll.clone());
+                    }
+                    if ui.button("Copiază cu root local").clicked() {
+                        copy_command = Some(enroll_root.clone());
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "Clientul rulează în foreground: manual sau cu runit, OpenRC, s6 ori alt supervisor. Nu depinde de systemd.",
+                    )
+                    .small()
+                    .color(Color32::GRAY),
+                );
+                ui.collapsing("Exemplu runit", |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new("#!/bin/sh\nexec /usr/bin/gnomeai-node run")
+                                .monospace(),
+                        )
+                        .selectable(true),
+                    );
+                });
+                ui.label(
+                    RichText::new(
+                        "Folosește o rețea de încredere/VPN (de exemplu Tailscale); nu expune portul HTTP direct pe internet.",
+                    )
+                    .small()
+                    .color(Color32::LIGHT_YELLOW),
+                );
+
+                ui.separator();
+                ui.label(RichText::new("DISPOZITIVE ASOCIATE").small().strong());
+                if nodes.is_empty() {
+                    ui.label("Niciun dispozitiv asociat încă.");
+                }
+                for node in &nodes {
+                    let node_id = node
+                        .get("node_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                        .to_string();
+                    let name = node
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&node_id);
+                    let online = node
+                        .get("online")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let os = node.get("os").and_then(Value::as_str).unwrap_or("?");
+                    let arch = node.get("arch").and_then(Value::as_str).unwrap_or("?");
+                    let init = node
+                        .get("init_system")
+                        .and_then(Value::as_str)
+                        .unwrap_or("manual");
+                    let root_available = node
+                        .get("root_available")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let original_policy = node
+                        .get("root_policy")
+                        .and_then(Value::as_str)
+                        .unwrap_or("ask")
+                        .to_string();
+                    let mut policy = original_policy.clone();
+                    let policy_label = match policy.as_str() {
+                        "disabled" => "Blocat",
+                        "session" => "Sesiune",
+                        "always" => "Permis mereu",
+                        _ => "Întreabă",
+                    }
+                    .to_string();
+                    egui::Frame::default()
+                        .fill(Color32::from_rgb(27, 27, 31))
+                        .corner_radius(9.0)
+                        .inner_margin(10.0)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                status_badge(ui, name, online);
+                                ui.label(
+                                    RichText::new(format!("{os} · {arch} · {init}"))
+                                        .small()
+                                        .color(Color32::GRAY),
+                                );
+                            });
+                            ui.label(
+                                RichText::new(format!("ID: {node_id}"))
+                                    .monospace()
+                                    .small(),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(if root_available {
+                                    "Root local disponibil"
+                                } else {
+                                    "Root local indisponibil"
+                                });
+                                ui.label("Politică root");
+                                egui::ComboBox::from_id_salt(format!(
+                                    "node_root_policy_{node_id}"
+                                ))
+                                .selected_text(policy_label)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut policy,
+                                        "disabled".into(),
+                                        "Blocat",
+                                    );
+                                    ui.selectable_value(
+                                        &mut policy,
+                                        "ask".into(),
+                                        "Întreabă la fiecare comandă",
+                                    );
+                                    ui.selectable_value(
+                                        &mut policy,
+                                        "session".into(),
+                                        "Permis în sesiunea Hub",
+                                    );
+                                    ui.selectable_value(
+                                        &mut policy,
+                                        "always".into(),
+                                        "Permis mereu",
+                                    );
+                                });
+                            });
+                        });
+                    if policy != original_policy {
+                        policy_change = Some((node_id, policy));
+                    }
+                    ui.add_space(7.0);
+                }
+            });
+        self.show_nodes = open;
+        if let Some(command) = copy_command {
+            self.copy_request = Some(command);
+            self.node_feedback = Some("Comanda a fost copiată.".into());
+        }
+        if let Some((node_id, policy)) = policy_change {
+            self.set_node_policy(node_id, policy);
+        }
+    }
+
+    fn help_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        egui::Window::new("Commands")
+            .open(&mut self.show_help)
+            .default_size(Vec2::new(440.0, 340.0))
+            .resizable(true)
+            .scroll([false, true])
+            .show(ctx, |ui| {
+                for (command, description) in COMMANDS {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(*command).monospace().strong());
+                        ui.label(*description);
+                    });
+                }
+                ui.separator();
+                ui.label(
+                    "Enter sends · Shift+Enter inserts a newline · Ctrl+. stops · Esc closes dialogs",
+                );
+            });
+    }
+}
+
+impl eframe::App for GuiApp {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = root.ctx().clone();
+        self.drain_events();
+        self.handle_dropped_files(&ctx);
+        apply_contrast(&ctx, self.high_contrast);
+        if let Some(text) = self.copy_request.take() {
+            ctx.copy_text(text);
+        }
+
+        let composer_id = egui::Id::new("main_composer");
+        if ctx.memory(|memory| memory.has_focus(composer_id)) {
+            if self.composer.is_empty()
+                && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowUp))
+                && !self.history.is_empty()
+            {
+                let index = self.history.len() - 1;
+                self.history_pos = Some(index);
+                self.composer = self.history[index].clone();
+            } else if self.history_pos.is_some()
+                && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowDown))
+            {
+                let next = self.history_pos.unwrap_or(0) + 1;
+                if next >= self.history.len() {
+                    self.history_pos = None;
+                    self.composer.clear();
+                } else {
+                    self.history_pos = Some(next);
+                    self.composer = self.history[next].clone();
+                }
+            }
+            let prefix = self.composer.trim();
+            if prefix.starts_with('/')
+                && !prefix.contains(char::is_whitespace)
+                && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab))
+            {
+                if let Some((command, _)) = COMMANDS
+                    .iter()
+                    .find(|(command, _)| command.starts_with(prefix))
+                {
+                    self.composer = (*command).into();
+                }
+            }
+        }
+        if self.show_whatsapp || self.whatsapp_enabled {
+            self.poll_whatsapp(false);
+        }
+        if self.show_nodes {
+            self.poll_nodes(false);
+        }
+        self.sidebar(root);
+        self.activity_panel(root);
+        self.status_bar(root);
+        self.composer(root);
+        self.transcript(root);
+        self.dialogs(&ctx);
+
+        if ctx.input(|input| input.key_pressed(Key::Escape)) {
+            self.show_help = false;
+            self.show_models = false;
+            self.show_provider = false;
+            self.show_sessions = false;
+            self.show_whatsapp = false;
+            self.show_nodes = false;
+            self.show_settings = false;
+        }
+        if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::F)) {
+            self.show_settings = true;
+            ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("transcript_search")));
+        }
+        if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Period)) && self.busy {
+            self.send(Op::Interrupt);
+        }
+        if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::L)) {
+            ctx.memory_mut(|memory| memory.request_focus(composer_id));
+        }
+        if self.quit_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        ctx.request_repaint_after(Duration::from_millis(if self.busy { 40 } else { 120 }));
+    }
+}
+
+fn configure_style(ctx: &egui::Context) {
+    let mut style = (*ctx.global_style()).clone();
+    style.visuals = app_visuals(false);
+    style.spacing.item_spacing = Vec2::new(8.0, 7.0);
+    style.spacing.button_padding = Vec2::new(11.0, 6.0);
+    style.spacing.interact_size = Vec2::new(40.0, 32.0);
+    style.spacing.window_margin = Margin::same(16);
+    style.spacing.menu_margin = Margin::same(10);
+    style.spacing.extra_text_line_spacing = 1.0;
+    style.animation_time = 0.12;
+    style.text_styles.insert(
+        egui::TextStyle::Heading,
+        FontId::new(21.0, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Body,
+        FontId::new(14.5, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Monospace,
+        FontId::new(12.8, FontFamily::Monospace),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        FontId::new(14.0, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Small,
+        FontId::new(11.5, FontFamily::Proportional),
+    );
+    ctx.set_global_style(style);
+}
+
+fn apply_contrast(ctx: &egui::Context, high_contrast: bool) {
+    ctx.set_visuals(app_visuals(high_contrast));
+}
+
+fn app_visuals(high_contrast: bool) -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    let border = Color32::from_rgb(54, 55, 62);
+    let surface = Color32::from_rgb(31, 32, 36);
+    let surface_hover = Color32::from_rgb(42, 43, 49);
+    let text = Color32::from_rgb(232, 233, 237);
+    let muted = Color32::from_rgb(154, 155, 164);
+    let accent = Color32::from_rgb(105, 205, 153);
+
+    visuals.override_text_color = Some(text);
+    visuals.weak_text_color = Some(muted);
+    visuals.panel_fill = Color32::from_rgb(17, 18, 20);
+    visuals.window_fill = Color32::from_rgb(25, 26, 29);
+    visuals.window_stroke = Stroke::new(1.0, border);
+    visuals.window_corner_radius = egui::CornerRadius::same(12);
+    visuals.menu_corner_radius = egui::CornerRadius::same(10);
+    visuals.faint_bg_color = Color32::from_rgb(28, 29, 33);
+    visuals.extreme_bg_color = Color32::from_rgb(13, 14, 16);
+    visuals.text_edit_bg_color = Some(Color32::from_rgb(20, 21, 24));
+    visuals.code_bg_color = Color32::from_rgb(24, 25, 29);
+    visuals.hyperlink_color = Color32::from_rgb(128, 190, 245);
+    visuals.warn_fg_color = Color32::from_rgb(232, 185, 92);
+    visuals.error_fg_color = Color32::from_rgb(241, 112, 127);
+    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(78, 149, 112, 150);
+    visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(188, 238, 211));
+    visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
+    visuals.indent_has_left_vline = true;
+
+    visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(25, 26, 29);
+    visuals.widgets.noninteractive.weak_bg_fill = Color32::TRANSPARENT;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
+    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
+
+    visuals.widgets.inactive.bg_fill = surface;
+    visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(28, 29, 33);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, border);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(207, 208, 214));
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
+
+    visuals.widgets.hovered.bg_fill = surface_hover;
+    visuals.widgets.hovered.weak_bg_fill = surface_hover;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(74, 76, 85));
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
+
+    visuals.widgets.active.bg_fill = Color32::from_rgb(48, 49, 55);
+    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(48, 49, 55);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
+    visuals.widgets.open = visuals.widgets.active;
+
+    if high_contrast {
+        visuals.override_text_color = Some(Color32::WHITE);
+        visuals.panel_fill = Color32::BLACK;
+        visuals.window_fill = Color32::from_rgb(5, 5, 5);
+        visuals.extreme_bg_color = Color32::BLACK;
+        visuals.widgets.noninteractive.fg_stroke.color = Color32::WHITE;
+        visuals.widgets.inactive.fg_stroke.color = Color32::WHITE;
+    }
+    visuals
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NavIcon {
+    More,
+    Folder,
+    Model,
+    WhatsApp,
+    Settings,
+}
+
+fn new_conversation_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
+    ui.painter().rect_filled(
+        rect,
+        10.0,
+        if response.hovered() {
+            Color32::WHITE
+        } else {
+            Color32::from_rgb(235, 236, 238)
+        },
+    );
+    let icon_center = rect.left_center() + Vec2::new(16.0, 0.0);
+    let ink = Color32::from_rgb(28, 29, 32);
+    let stroke = Stroke::new(1.7, ink);
+    ui.painter().line_segment(
+        [
+            icon_center + Vec2::new(-4.5, 0.0),
+            icon_center + Vec2::new(4.5, 0.0),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            icon_center + Vec2::new(0.0, -4.5),
+            icon_center + Vec2::new(0.0, 4.5),
+        ],
+        stroke,
+    );
+    ui.painter().text(
+        rect.left_center() + Vec2::new(35.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text,
+        FontId::new(14.0, FontFamily::Proportional),
+        ink,
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn suggestion_button(ui: &mut egui::Ui, title: &str, subtitle: &str) -> egui::Response {
+    let width = ui.available_width().min(520.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 58.0), Sense::click());
+    ui.painter().rect_filled(
+        rect,
+        12.0,
+        if response.hovered() {
+            Color32::from_rgb(36, 37, 42)
+        } else {
+            Color32::from_rgb(27, 28, 32)
+        },
+    );
+    let left = rect.left() + 15.0;
+    ui.painter().text(
+        egui::pos2(left, rect.top() + 20.0),
+        egui::Align2::LEFT_CENTER,
+        title,
+        FontId::new(13.8, FontFamily::Proportional),
+        Color32::from_rgb(230, 231, 235),
+    );
+    ui.painter().text(
+        egui::pos2(left, rect.top() + 40.0),
+        egui::Align2::LEFT_CENTER,
+        subtitle,
+        FontId::new(11.2, FontFamily::Proportional),
+        Color32::from_rgb(134, 135, 144),
+    );
+    let arrow = rect.right_center() + Vec2::new(-17.0, 0.0);
+    let arrow_color = if response.hovered() {
+        Color32::from_rgb(105, 205, 153)
+    } else {
+        Color32::from_rgb(126, 127, 136)
+    };
+    let stroke = Stroke::new(1.4, arrow_color);
+    ui.painter().line_segment(
+        [arrow + Vec2::new(-4.0, 0.0), arrow + Vec2::new(4.0, 0.0)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [arrow + Vec2::new(1.0, -3.0), arrow + Vec2::new(4.0, 0.0)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [arrow + Vec2::new(1.0, 3.0), arrow + Vec2::new(4.0, 0.0)],
+        stroke,
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ComposerIcon {
+    Attach,
+    Send,
+    Stop,
+}
+
+fn composer_icon_button(ui: &mut egui::Ui, icon: ComposerIcon, accented: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+    let fill = match icon {
+        ComposerIcon::Stop => {
+            if response.hovered() {
+                Color32::from_rgb(177, 65, 78)
+            } else {
+                Color32::from_rgb(142, 50, 62)
+            }
+        }
+        _ if accented => {
+            if response.hovered() {
+                Color32::from_rgb(127, 222, 173)
+            } else {
+                Color32::from_rgb(105, 205, 153)
+            }
+        }
+        _ => {
+            if response.hovered() {
+                Color32::from_rgb(55, 56, 63)
+            } else {
+                Color32::from_rgb(39, 40, 45)
+            }
+        }
+    };
+    ui.painter().circle_filled(rect.center(), 15.0, fill);
+    let ink = if accented {
+        Color32::from_rgb(17, 36, 26)
+    } else {
+        Color32::from_rgb(210, 211, 217)
+    };
+    let stroke = Stroke::new(1.7, ink);
+    match icon {
+        ComposerIcon::Attach => {
+            ui.painter().line_segment(
+                [
+                    rect.center() + Vec2::new(-4.5, 0.0),
+                    rect.center() + Vec2::new(4.5, 0.0),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    rect.center() + Vec2::new(0.0, -4.5),
+                    rect.center() + Vec2::new(0.0, 4.5),
+                ],
+                stroke,
+            );
+        }
+        ComposerIcon::Send => {
+            ui.painter().line_segment(
+                [
+                    rect.center() + Vec2::new(0.0, 5.0),
+                    rect.center() + Vec2::new(0.0, -5.0),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    rect.center() + Vec2::new(-4.0, -1.0),
+                    rect.center() + Vec2::new(0.0, -5.0),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    rect.center() + Vec2::new(4.0, -1.0),
+                    rect.center() + Vec2::new(0.0, -5.0),
+                ],
+                stroke,
+            );
+        }
+        ComposerIcon::Stop => {
+            ui.painter().rect_filled(
+                egui::Rect::from_center_size(rect.center(), Vec2::splat(7.0)),
+                1.5,
+                Color32::WHITE,
+            );
+        }
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn nav_button(ui: &mut egui::Ui, text: &str, selected: bool, icon: NavIcon) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::click());
+    let hovered = response.hovered();
+    if selected || hovered {
+        ui.painter().rect_filled(
+            rect,
+            9.0,
+            if selected {
+                Color32::from_rgb(41, 42, 47)
+            } else {
+                Color32::from_rgb(31, 32, 36)
+            },
+        );
+    }
+    let foreground = if selected || hovered {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(198, 199, 207)
+    };
+    draw_nav_icon(
+        ui.painter(),
+        rect.left_center() + Vec2::new(15.0, 0.0),
+        icon,
+        if selected {
+            Color32::from_rgb(105, 205, 153)
+        } else {
+            foreground
+        },
+    );
+    ui.painter().text(
+        rect.left_center() + Vec2::new(34.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        ellipsize(text, 26),
+        FontId::new(14.0, FontFamily::Proportional),
+        foreground,
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn draw_nav_icon(painter: &egui::Painter, center: egui::Pos2, icon: NavIcon, color: Color32) {
+    let stroke = Stroke::new(1.5, color);
+    match icon {
+        NavIcon::More => {
+            for offset in [-5.0, 0.0, 5.0] {
+                painter.circle_filled(center + Vec2::new(offset, 0.0), 1.4, color);
+            }
+        }
+        NavIcon::Folder => {
+            let points = [
+                center + Vec2::new(-6.0, -4.0),
+                center + Vec2::new(-1.5, -4.0),
+                center + Vec2::new(0.5, -2.0),
+                center + Vec2::new(6.0, -2.0),
+                center + Vec2::new(6.0, 5.0),
+                center + Vec2::new(-6.0, 5.0),
+                center + Vec2::new(-6.0, -4.0),
+            ];
+            painter.add(egui::Shape::line(points.to_vec(), stroke));
+        }
+        NavIcon::Model => {
+            painter.circle_stroke(center, 6.0, stroke);
+            painter.circle_filled(center, 2.0, color);
+        }
+        NavIcon::WhatsApp => {
+            painter.circle_stroke(center + Vec2::new(0.0, -0.5), 6.0, stroke);
+            painter.line_segment(
+                [center + Vec2::new(-4.0, 4.0), center + Vec2::new(-5.5, 7.0)],
+                stroke,
+            );
+            painter.circle_filled(center + Vec2::new(0.0, -0.5), 1.4, color);
+        }
+        NavIcon::Settings => {
+            for (y, knob) in [(-4.0, -2.0), (0.0, 3.0), (4.0, -1.0)] {
+                painter.line_segment(
+                    [center + Vec2::new(-6.0, y), center + Vec2::new(6.0, y)],
+                    stroke,
+                );
+                painter.circle_filled(center + Vec2::new(knob, y), 1.9, color);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionRowAction {
+    None,
+    Resume,
+    AskDelete,
+    ConfirmDelete,
+    CancelDelete,
+}
+
+fn session_row(
+    ui: &mut egui::Ui,
+    id: &str,
+    title: &str,
+    project: &str,
+    selected: bool,
+    confirming_delete: bool,
+) -> SessionRowAction {
+    let height = if confirming_delete { 62.0 } else { 52.0 };
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
+    let row_id = ui.make_persistent_id(("session_row", id));
+    let painter = ui.painter();
+
+    if confirming_delete {
+        painter.rect_filled(rect, 9.0, Color32::from_rgb(54, 29, 33));
+        painter.text(
+            egui::pos2(rect.left() + 11.0, rect.top() + 17.0),
+            egui::Align2::LEFT_CENTER,
+            ellipsize(title, 27),
+            FontId::new(13.0, FontFamily::Proportional),
+            Color32::from_rgb(242, 220, 223),
+        );
+        painter.text(
+            egui::pos2(rect.left() + 11.0, rect.bottom() - 16.0),
+            egui::Align2::LEFT_CENTER,
+            "Ștergi?",
+            FontId::new(11.5, FontFamily::Proportional),
+            Color32::from_rgb(222, 150, 159),
+        );
+
+        let delete_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 65.0, rect.bottom() - 29.0),
+            Vec2::new(57.0, 23.0),
+        );
+        let cancel_rect = egui::Rect::from_min_size(
+            egui::pos2(delete_rect.left() - 65.0, delete_rect.top()),
+            Vec2::new(59.0, 23.0),
+        );
+        let delete = ui.interact(delete_rect, row_id.with("confirm"), Sense::click());
+        let cancel = ui.interact(cancel_rect, row_id.with("cancel"), Sense::click());
+        painter.rect_filled(
+            delete_rect,
+            6.0,
+            if delete.hovered() {
+                Color32::from_rgb(176, 63, 77)
+            } else {
+                Color32::from_rgb(139, 48, 60)
+            },
+        );
+        painter.rect_filled(
+            cancel_rect,
+            6.0,
+            if cancel.hovered() {
+                Color32::from_rgb(69, 52, 56)
+            } else {
+                Color32::from_rgb(61, 43, 47)
+            },
+        );
+        painter.text(
+            delete_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Șterge",
+            FontId::new(11.0, FontFamily::Proportional),
+            Color32::WHITE,
+        );
+        painter.text(
+            cancel_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Anulează",
+            FontId::new(11.0, FontFamily::Proportional),
+            Color32::from_rgb(222, 211, 214),
+        );
+        return if delete.clicked() {
+            SessionRowAction::ConfirmDelete
+        } else if cancel.clicked() {
+            SessionRowAction::CancelDelete
+        } else {
+            SessionRowAction::None
+        };
+    }
+
+    if selected || response.hovered() {
+        painter.rect_filled(
+            rect,
+            9.0,
+            if selected {
+                Color32::from_rgb(39, 40, 45)
+            } else {
+                Color32::from_rgb(31, 32, 36)
+            },
+        );
+    }
+    if selected {
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left(), rect.top() + 10.0),
+                Vec2::new(3.0, rect.height() - 20.0),
+            ),
+            2.0,
+            Color32::from_rgb(105, 205, 153),
+        );
+    }
+
+    let left = rect.left() + 11.0;
+    painter.text(
+        egui::pos2(left, rect.top() + 18.0),
+        egui::Align2::LEFT_CENTER,
+        ellipsize(title, 25),
+        FontId::new(13.5, FontFamily::Proportional),
+        Color32::from_rgb(225, 225, 230),
+    );
+    painter.text(
+        egui::pos2(left, rect.top() + 38.0),
+        egui::Align2::LEFT_CENTER,
+        ellipsize(project, 29),
+        FontId::new(11.0, FontFamily::Proportional),
+        Color32::from_rgb(125, 126, 135),
+    );
+
+    let delete_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 17.0, rect.center().y),
+        Vec2::splat(26.0),
+    );
+    let delete = ui.interact(delete_rect, row_id.with("delete"), Sense::click());
+    if response.hovered() || delete.hovered() {
+        if delete.hovered() {
+            painter.rect_filled(delete_rect, 6.0, Color32::from_rgb(61, 43, 47));
+        }
+        draw_trash_icon(
+            painter,
+            delete_rect.center(),
+            if delete.hovered() {
+                Color32::from_rgb(242, 125, 138)
+            } else {
+                Color32::from_rgb(154, 154, 164)
+            },
+        );
+    }
+
+    if delete.clicked() {
+        SessionRowAction::AskDelete
+    } else if response.clicked() {
+        SessionRowAction::Resume
+    } else {
+        SessionRowAction::None
+    }
+}
+
+fn draw_trash_icon(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let stroke = Stroke::new(1.4, color);
+    painter.line_segment(
+        [
+            center + Vec2::new(-5.0, -4.0),
+            center + Vec2::new(5.0, -4.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(-3.5, -6.0),
+            center + Vec2::new(3.5, -6.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + Vec2::new(-4.0, -2.0),
+            center + Vec2::new(-3.0, 6.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [center + Vec2::new(4.0, -2.0), center + Vec2::new(3.0, 6.0)],
+        stroke,
+    );
+    painter.line_segment(
+        [center + Vec2::new(-3.0, 6.0), center + Vec2::new(3.0, 6.0)],
+        stroke,
+    );
+}
+
+fn ellipsize(text: &str, max_characters: usize) -> String {
+    if text.chars().count() <= max_characters {
+        return text.to_string();
+    }
+    let mut shortened = text
+        .chars()
+        .take(max_characters.saturating_sub(1))
+        .collect::<String>();
+    shortened.push('…');
+    shortened
+}
+
+fn diff_file_names(diff: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for line in diff.lines() {
+        let file = line
+            .strip_prefix("+++ b/")
+            .or_else(|| line.strip_prefix("--- a/"));
+        let Some(file) = file else {
+            continue;
+        };
+        if file == "/dev/null" || files.iter().any(|known| known == file) {
+            continue;
+        }
+        files.push(file.to_string());
+    }
+    files
+}
+
+fn diff_line_color(line: &str) -> Color32 {
+    if line.starts_with('+') && !line.starts_with("+++") {
+        Color32::from_rgb(100, 210, 140)
+    } else if line.starts_with('-') && !line.starts_with("---") {
+        Color32::from_rgb(235, 105, 105)
+    } else if line.starts_with("@@") {
+        Color32::LIGHT_BLUE
+    } else {
+        Color32::from_rgb(165, 165, 173)
+    }
+}
+
+fn status_indicator(ui: &mut egui::Ui, label: &str, color: Color32) {
+    let width = (label.chars().count() as f32 * 6.5 + 22.0).clamp(74.0, 150.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 27.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 13.5, Color32::from_rgb(27, 28, 32));
+    ui.painter()
+        .circle_filled(rect.left_center() + Vec2::new(10.0, 0.0), 3.2, color);
+    ui.painter().text(
+        rect.left_center() + Vec2::new(18.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::new(11.5, FontFamily::Proportional),
+        Color32::from_rgb(202, 203, 210),
+    );
+}
+
+fn status_badge(ui: &mut egui::Ui, label: &str, active: bool) {
+    let color = if active {
+        Color32::from_rgb(80, 200, 130)
+    } else {
+        Color32::from_rgb(135, 135, 145)
+    };
+    ui.label(
+        RichText::new(format!("{} {label}", if active { "●" } else { "○" }))
+            .small()
+            .color(color),
+    );
+}
+
+fn whatsapp_bool(status: &Value, key: &str) -> bool {
+    status.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn centered_dialog_pos(ctx: &egui::Context, size: Vec2) -> egui::Pos2 {
+    let viewport = ctx.content_rect();
+    egui::pos2(
+        (viewport.center().x - size.x * 0.5).max(viewport.left() + 12.0),
+        (viewport.center().y - size.y * 0.5).max(viewport.top() + 12.0),
+    )
+}
+
+fn whatsapp_text<'a>(status: &'a Value, key: &str) -> &'a str {
+    status.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+fn render_qr(ui: &mut egui::Ui, payload: &str) {
+    let Ok(code) = QrCode::new(payload.as_bytes()) else {
+        ui.colored_label(Color32::LIGHT_RED, "Codul QR nu poate fi afișat.");
+        return;
+    };
+    let modules = code.width();
+    let quiet_zone = 4usize;
+    let total = modules + quiet_zone * 2;
+    let side = 240.0;
+    let module_side = side / total as f32;
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(side), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, Color32::WHITE);
+    for y in 0..modules {
+        for x in 0..modules {
+            if code[(x, y)] != QrColor::Dark {
+                continue;
+            }
+            let min = rect.min
+                + Vec2::new(
+                    (x + quiet_zone) as f32 * module_side,
+                    (y + quiet_zone) as f32 * module_side,
+                );
+            painter.rect_filled(
+                egui::Rect::from_min_size(min, Vec2::splat(module_side + 0.15)),
+                0.0,
+                Color32::BLACK,
+            );
+        }
+    }
+}
+
+fn companion_executable(name: &str) -> std::result::Result<PathBuf, String> {
+    let current = std::env::current_exe()
+        .map_err(|error| format!("Nu pot determina executabilul curent: {error}"))?;
+    let candidate = current.with_file_name(name);
+    if candidate.is_file() {
+        Ok(candidate)
+    } else {
+        Err(format!(
+            "Lipsește serviciul WhatsApp: {}. Rulează `cargo build --bins` sau reinstalează pachetul.",
+            candidate.display()
+        ))
+    }
+}
+
+async fn http_json(request: reqwest::RequestBuilder) -> std::result::Result<Value, String> {
+    let response = request
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|error| format!("Serviciul WhatsApp nu răspunde: {error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("Răspuns WhatsApp invalid: {error}"))?;
+    let value = serde_json::from_str::<Value>(&text)
+        .unwrap_or_else(|_| serde_json::json!({"message": text}));
+    if status.is_success() {
+        Ok(value)
+    } else {
+        Err(value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Operația WhatsApp a eșuat.")
+            .to_string())
+    }
+}
+
+fn read_log_tail(path: &Path, limit: usize) -> String {
+    let Ok(bytes) = std::fs::read(path) else {
+        return String::new();
+    };
+    let start = bytes.len().saturating_sub(limit);
+    let mut tail = &bytes[start..];
+    if start > 0 {
+        if let Some(newline) = tail.iter().position(|byte| *byte == b'\n') {
+            tail = &tail[newline + 1..];
+        }
+    }
+    String::from_utf8_lossy(tail).trim().to_string()
+}
+
+fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
+    match block {
+        Block::User(text) => {
+            let width = ui.available_width();
+            egui::Frame::default()
+                .fill(Color32::from_rgb(30, 31, 35))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(48, 49, 55)))
+                .corner_radius(12.0)
+                .inner_margin(Margin::symmetric(14, 11))
+                .show(ui, |ui| {
+                    ui.set_min_width((width - 30.0).max(120.0));
+                    ui.label(
+                        RichText::new("TU")
+                            .size(10.0)
+                            .strong()
+                            .color(Color32::from_rgb(126, 207, 164)),
+                    );
+                    ui.add_space(2.0);
+                    ui.add(egui::Label::new(text).selectable(true).wrap());
+                });
+        }
+        Block::Assistant(text) => {
+            let width = ui.available_width();
+            ui.horizontal(|ui| {
+                let (avatar, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                ui.painter()
+                    .circle_filled(avatar.center(), 14.0, Color32::from_rgb(105, 205, 153));
+                ui.painter().text(
+                    avatar.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "G",
+                    FontId::new(14.0, FontFamily::Proportional),
+                    Color32::from_rgb(18, 31, 24),
+                );
+                ui.vertical(|ui| {
+                    ui.set_min_width((width - 46.0).max(120.0));
+                    ui.label(
+                        RichText::new("GnomeAI")
+                            .size(11.0)
+                            .strong()
+                            .color(Color32::from_rgb(151, 152, 161)),
+                    );
+                    ui.add_space(2.0);
+                    ui.add(egui::Label::new(text).selectable(true).wrap());
+                });
+            });
+        }
+        Block::Reasoning(text) => {
+            egui::Frame::default()
+                .fill(Color32::from_rgb(23, 24, 28))
+                .corner_radius(9.0)
+                .inner_margin(Margin::symmetric(10, 7))
+                .show(ui, |ui| {
+                    egui::CollapsingHeader::new(
+                        RichText::new("Procesare")
+                            .italics()
+                            .color(Color32::from_rgb(148, 149, 158)),
+                    )
+                    .id_salt(("reasoning", index))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(text).color(Color32::from_rgb(153, 154, 163)),
+                            )
+                            .selectable(true)
+                            .wrap(),
+                        );
+                    });
+                });
+        }
+        Block::Tool {
+            call_id,
+            name,
+            summary,
+            output,
+            done,
+            ok,
+            ms,
+        } => {
+            let (mark, color) = match (*done, *ok) {
+                (false, _) => ("●", Color32::YELLOW),
+                (true, true) => ("✓", Color32::from_rgb(80, 200, 130)),
+                (true, false) => ("✕", Color32::LIGHT_RED),
+            };
+            let title = if *done {
+                format!("{mark} {name} — {summary} · {ms} ms")
+            } else {
+                format!("{mark} {name} — {summary}")
+            };
+            let width = ui.available_width();
+            egui::Frame::default()
+                .fill(Color32::from_rgb(24, 25, 29))
+                .stroke(Stroke::new(
+                    1.0,
+                    if *done && *ok {
+                        Color32::from_rgb(47, 62, 55)
+                    } else if *done {
+                        Color32::from_rgb(76, 46, 51)
+                    } else {
+                        Color32::from_rgb(71, 63, 42)
+                    },
+                ))
+                .corner_radius(10.0)
+                .inner_margin(Margin::symmetric(11, 8))
+                .show(ui, |ui| {
+                    ui.set_min_width((width - 24.0).max(120.0));
+                    egui::CollapsingHeader::new(RichText::new(title).color(color))
+                        .id_salt(("tool", call_id))
+                        .default_open(!*done || !*ok)
+                        .show(ui, |ui| {
+                            if output.is_empty() {
+                                ui.label(
+                                    RichText::new("Se așteaptă rezultatul…").color(Color32::GRAY),
+                                );
+                            } else {
+                                egui::Frame::default()
+                                    .fill(Color32::from_rgb(15, 16, 18))
+                                    .corner_radius(7.0)
+                                    .inner_margin(8.0)
+                                    .show(ui, |ui| {
+                                        ScrollArea::horizontal().max_height(260.0).show(ui, |ui| {
+                                            ui.add(
+                                                egui::Label::new(RichText::new(output).monospace())
+                                                    .selectable(true),
+                                            );
+                                        });
+                                    });
+                            }
+                        });
+                });
+        }
+        Block::Diff(diff) => {
+            egui::Frame::default()
+                .fill(Color32::from_rgb(23, 25, 29))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(44, 58, 72)))
+                .corner_radius(10.0)
+                .inner_margin(Margin::symmetric(11, 8))
+                .show(ui, |ui| {
+                    egui::CollapsingHeader::new(
+                        RichText::new(format!(
+                            "Modificări în patch · {} fișiere",
+                            diff_file_names(diff).len()
+                        ))
+                        .color(Color32::from_rgb(128, 190, 245)),
+                    )
+                    .id_salt(("diff", index))
+                    .show(ui, |ui| {
+                        egui::Frame::default()
+                            .fill(Color32::from_rgb(14, 15, 17))
+                            .corner_radius(7.0)
+                            .inner_margin(8.0)
+                            .show(ui, |ui| {
+                                ScrollArea::horizontal().max_height(320.0).show(ui, |ui| {
+                                    for line in diff.lines().take(240) {
+                                        ui.label(
+                                            RichText::new(line)
+                                                .monospace()
+                                                .color(diff_line_color(line)),
+                                        );
+                                    }
+                                });
+                            });
+                    });
+                });
+        }
+        Block::Verify {
+            stage,
+            passed,
+            summary,
+        } => {
+            let color = if *passed {
+                Color32::from_rgb(80, 200, 130)
+            } else {
+                Color32::LIGHT_RED
+            };
+            egui::Frame::default()
+                .fill(Color32::from_rgb(23, 25, 27))
+                .corner_radius(8.0)
+                .inner_margin(Margin::symmetric(10, 7))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} [{stage}] {summary}",
+                            if *passed { "✓" } else { "✕" }
+                        ))
+                        .color(color),
+                    );
+                });
+        }
+        Block::Error(error) => {
+            egui::Frame::default()
+                .fill(Color32::from_rgb(55, 25, 28))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(130, 50, 58)))
+                .corner_radius(8.0)
+                .inner_margin(9.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(error).color(Color32::LIGHT_RED))
+                            .selectable(true),
+                    );
+                });
+        }
+        Block::Note(note) => {
+            ui.horizontal(|ui| {
+                let (line, _) = ui.allocate_exact_size(Vec2::new(18.0, 1.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(line, 0.5, Color32::from_rgb(70, 71, 79));
+                ui.add(
+                    egui::Label::new(RichText::new(note).color(Color32::from_rgb(137, 138, 147)))
+                        .selectable(true)
+                        .wrap(),
+                );
+            });
+        }
+    }
+}
+
+fn composer_rows(text: &str, width: f32) -> usize {
+    let characters_per_row = (width / 8.2).floor().max(20.0) as usize;
+    text.split('\n')
+        .map(|line| (line.chars().count().max(1) + characters_per_row - 1) / characters_per_row)
+        .sum::<usize>()
+        .clamp(1, 8)
+}
+
+fn encode_attachment(path: &Path, prompt: &str) -> std::result::Result<String, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("Cannot inspect {}: {error}", path.display()))?;
+    if metadata.len() as usize > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "Attachment is too large (limit {} MiB)",
+            MAX_ATTACHMENT_BYTES / (1024 * 1024)
+        ));
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment");
+    if file_type_from_name(name) == "image" {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("Nu pot citi {}: {error}", path.display()))?;
+        let media_type = mime_guess::from_path(path)
+            .first_raw()
+            .unwrap_or("application/octet-stream");
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let prompt = if prompt.trim().is_empty() {
+            format!("Analizează imaginea atașată „{name}”.")
+        } else {
+            prompt.trim().to_string()
+        };
+        return serde_json::to_string(&serde_json::json!([
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": format!("data:{media_type};base64,{data}")}}
+        ]))
+        .map_err(|error| format!("Nu pot pregăti imaginea: {error}"));
+    }
+
+    let extracted =
+        extract_text_attachment(path).map_err(|error| format!("Nu pot citi {name}: {error:#}"))?;
+    if extracted.trim().is_empty() {
+        return Err(format!("Nu am găsit text lizibil în {name}."));
+    }
+    let prompt = if prompt.trim().is_empty() {
+        format!("Analizează fișierul atașat „{name}”.")
+    } else {
+        prompt.trim().to_string()
+    };
+    Ok(format!(
+        "{prompt}\n\n<attached_file name=\"{name}\">\n{extracted}\n</attached_file>"
+    ))
+}
+
+fn desktop_notify(title: &str, body: &str) {
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = Command::new("notify-send");
+        command.args(["--app-name=GnomeAI-RS", "--expire-time=5000", title, body]);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("osascript");
+        let escaped_title = title.replace('"', "\\\"");
+        let escaped_body = body.replace('"', "\\\"");
+        command.args([
+            "-e",
+            &format!("display notification \"{escaped_body}\" with title \"{escaped_title}\""),
+        ]);
+        command
+    };
+    let _ = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+fn open_external_url(url: &str) -> std::result::Result<(), String> {
+    let url = url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("adresa de autentificare nu este HTTP/HTTPS".into());
+    }
+
+    #[cfg(target_os = "linux")]
+    let attempts: &[(&str, &[&str])] = &[("xdg-open", &[url]), ("gio", &["open", url])];
+    #[cfg(target_os = "macos")]
+    let attempts: &[(&str, &[&str])] = &[("open", &[url])];
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut errors = Vec::new();
+        for (program, args) in attempts {
+            match Command::new(program)
+                .args(*args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(_) => return Ok(()),
+                Err(error) => errors.push(format!("{program}: {error}")),
+            }
+        }
+        return Err(errors.join("; "));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    Err("deschiderea automată a browserului nu este disponibilă pe acest sistem".into())
+}
+
+fn unquote(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(value)
+}
+
+fn workspace_path_from_message(text: &str) -> Option<PathBuf> {
+    let lower = text.to_lowercase();
+    let names_workspace = [
+        "workspace",
+        "folder",
+        "director",
+        "proiect",
+        "directory",
+        "project",
+    ]
+    .iter()
+    .any(|word| lower.contains(word));
+    if !names_workspace {
+        return None;
+    }
+    let requests_change = [
+        "schimb", "mută", "muta", "seteaz", "change", "switch", "move", "set the",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase));
+    let states_location = [
+        "proiectul meu este",
+        "proiectul meu e",
+        "folderul meu este",
+        "folderul meu e",
+        "directorul meu este",
+        "directorul meu e",
+        "my project is",
+        "my folder is",
+        "my directory is",
+        "workspace is",
+        "workspace-ul este",
+        "workspace-ul e",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase));
+    let concise_assignment = lower.trim_start().starts_with("workspace:")
+        || lower.trim_start().starts_with("folder:")
+        || lower.trim_start().starts_with("director:")
+        || lower.trim_start().starts_with("project:");
+    if !(requests_change || states_location || concise_assignment) {
+        return None;
+    }
+    explicit_path(text).map(PathBuf::from)
+}
+
+fn explicit_path(text: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let Some(start) = text.find(quote) else {
+            continue;
+        };
+        let after = &text[start + quote.len_utf8()..];
+        let Some(end) = after.find(quote) else {
+            continue;
+        };
+        let candidate = after[..end].trim();
+        if looks_like_path(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    text.split_whitespace().find_map(|part| {
+        let candidate = part.trim_matches(|character: char| {
+            matches!(
+                character,
+                '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '!' | '?'
+            )
+        });
+        let candidate = candidate.strip_suffix('.').unwrap_or(candidate);
+        looks_like_path(candidate).then(|| candidate.to_string())
+    })
+}
+
+fn looks_like_path(value: &str) -> bool {
+    value.starts_with('/')
+        || value == "~"
+        || value.starts_with("~/")
+        || value == "."
+        || value == ".."
+        || value.starts_with("./")
+        || value.starts_with("../")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composer_grows_for_wrapped_and_hard_lines() {
+        assert_eq!(composer_rows("hello", 320.0), 1);
+        assert_eq!(composer_rows("hello\nworld", 320.0), 2);
+        assert!(composer_rows(&"x".repeat(300), 240.0) > 1);
+        assert_eq!(composer_rows(&"x".repeat(10_000), 240.0), 8);
+    }
+
+    #[test]
+    fn native_attachment_reads_text_and_source_files() {
+        let path = std::env::temp_dir().join(format!(
+            "gnomeai-gui-attachment-{}.rs",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "fn main() { println!(\"salut\"); }").unwrap();
+        let encoded = encode_attachment(&path, "explică acest cod").unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(encoded.contains("explică acest cod"));
+        assert!(encoded.contains("<attached_file"));
+        assert!(encoded.contains("fn main()"));
+    }
+
+    #[test]
+    fn unquote_handles_workspace_paths() {
+        assert_eq!(unquote("\"/tmp/my project\""), "/tmp/my project");
+        assert_eq!(unquote("/tmp/project"), "/tmp/project");
+    }
+
+    #[test]
+    fn romanian_workspace_intent_is_detected_with_diacritics() {
+        assert_eq!(
+            workspace_path_from_message("Vreau să schimb folderul în /home/user/Proiectul-Meu"),
+            Some(PathBuf::from("/home/user/Proiectul-Meu"))
+        );
+        assert!(workspace_path_from_message("Citește /tmp/README.md").is_none());
+    }
+
+    #[test]
+    fn diff_panel_extracts_each_changed_file_once() {
+        let diff = "--- a/src/gui.rs\n+++ b/src/gui.rs\n@@ -1 +1 @@\n-old\n+new\n--- a/README.md\n+++ b/README.md";
+        assert_eq!(
+            diff_file_names(diff),
+            vec!["src/gui.rs".to_string(), "README.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn sidebar_labels_preserve_romanian_characters() {
+        assert_eq!(ellipsize("Conversație nouă", 40), "Conversație nouă");
+        assert_eq!(ellipsize("ăîâșț foarte lung", 8), "ăîâșț f…");
+    }
+
+    #[test]
+    fn whatsapp_service_avoids_ports_held_by_an_old_instance() {
+        let api_guard = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let bridge_guard = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut config = AppConfig::default();
+        config.port = api_guard.local_addr().unwrap().port();
+        config.whatsapp_bridge_port = bridge_guard.local_addr().unwrap().port();
+
+        let (api_port, bridge_port) = native_service_ports(&config);
+
+        assert_ne!(api_port, config.port);
+        assert_ne!(bridge_port, config.whatsapp_bridge_port);
+        assert_ne!(api_port, bridge_port);
+    }
+}

@@ -83,9 +83,19 @@ pub fn known_models(provider_id: &str) -> Vec<ModelInfo> {
         "nvidia" => vec![model("openai/gpt-oss-120b")],
         "sambanova" => vec![model("DeepSeek-V3.1"), model("DeepSeek-R1")],
         "cohere" => vec![model("command-a-03-2025"), model("command-r-plus")],
-        // Account-backed providers and custom — the caller supplies the
-        // default model from config when the list is empty.
-        "openai-account" | "anthropic-account" | "custom" | _ => Vec::new(),
+        // A ChatGPT account can expose a different Codex catalog depending on
+        // its plan and rollout. Never guess those ids: model/list replaces
+        // this safe fallback whenever the account runtime is available.
+        "openai-account" => vec![model("default")],
+        // Claude Code accepts these stable aliases and resolves them to the
+        // newest model included in the connected Anthropic subscription.
+        "anthropic-account" => vec![
+            model("default"),
+            model("sonnet"),
+            model("opus"),
+            model("haiku"),
+        ],
+        "custom" | _ => Vec::new(),
     }
 }
 
@@ -117,6 +127,23 @@ pub fn normalize_model_ids(mut ids: Vec<String>, active_model: &str) -> Vec<Stri
         ids.insert(0, active_model.to_string());
     }
     ids
+}
+
+/// Normalize Codex account models without reviving a stale or guessed model.
+/// `default` remains usable when discovery is temporarily unavailable; an
+/// explicit model is selected only when model/list actually advertised it.
+pub fn codex_account_model_ids(models: Vec<ModelInfo>, active_model: &str) -> Vec<String> {
+    let mut ids = model_ids(models, "");
+    if !ids.iter().any(|model| model == "default") {
+        ids.push("default".to_string());
+    }
+    let active_model = active_model.trim();
+    let selected = if !active_model.is_empty() && ids.iter().any(|model| model == active_model) {
+        active_model
+    } else {
+        "default"
+    };
+    normalize_model_ids(ids, selected)
 }
 
 fn model(id: &str) -> ModelInfo {
@@ -158,6 +185,34 @@ impl LlamaClient {
     }
 
     pub async fn list_models(&self, cfg: &AppConfig) -> anyhow::Result<Vec<ModelInfo>> {
+        if cfg.provider_id == "openai-account" {
+            let discovered = match tokio::time::timeout(
+                Duration::from_secs(20),
+                crate::codex_app_server::list_available_models(),
+            )
+            .await
+            {
+                Ok(Ok(models)) if models.len() > 1 => Some(models),
+                Ok(Ok(_)) => {
+                    tracing::warn!("Codex model/list returned no selectable account models");
+                    None
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Codex model discovery failed; using default");
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!("Codex model discovery timed out; using default");
+                    None
+                }
+            };
+            return Ok(discovered
+                .map(|models| models.into_iter().map(|id| model(&id)).collect())
+                .unwrap_or_else(|| known_models("openai-account")));
+        }
+        if cfg.provider_id == "anthropic-account" {
+            return Ok(known_models("anthropic-account"));
+        }
         if cfg.provider_protocol == "anthropic" {
             return Ok(known_models("anthropic"));
         }
@@ -714,12 +769,8 @@ impl LlamaClient {
 
 fn ensure_web_provider_supported(cfg: &AppConfig) -> anyhow::Result<()> {
     match cfg.provider_protocol.as_str() {
-        "codex" => bail!(
-            "OpenAI account login is available in the terminal agent; choose an API provider in WebTool"
-        ),
-        "claude-cli" => bail!(
-            "Claude Code account login is available in the terminal agent; choose an API provider in WebTool"
-        ),
+        "codex" => bail!("OpenAI account requests must use the Codex app-server adapter"),
+        "claude-cli" => bail!("Anthropic account requests must use the Claude Code adapter"),
         _ => Ok(()),
     }
 }
@@ -1841,6 +1892,34 @@ mod tests {
 
         let ids = model_ids(vec![model("zeta"), model("alpha")], "zeta");
         assert_eq!(ids, vec!["zeta", "alpha"]);
+    }
+
+    #[test]
+    fn account_provider_fallbacks_never_invent_codex_model_ids() {
+        let openai = known_models("openai-account")
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+        assert_eq!(openai, vec!["default"]);
+
+        let anthropic = known_models("anthropic-account")
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+        assert_eq!(anthropic, vec!["default", "sonnet", "opus", "haiku"]);
+    }
+
+    #[test]
+    fn codex_account_models_reject_a_stale_active_model() {
+        let models = vec![model("gpt-account-a"), model("gpt-account-b")];
+        assert_eq!(
+            codex_account_model_ids(models.clone(), "not-in-model-list"),
+            vec!["default", "gpt-account-a", "gpt-account-b"]
+        );
+        assert_eq!(
+            codex_account_model_ids(models, "gpt-account-b"),
+            vec!["gpt-account-b", "default", "gpt-account-a"]
+        );
     }
 }
 

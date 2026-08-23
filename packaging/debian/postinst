@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+# Refresh desktop launch metadata after upgrades so environments do not keep
+# using the older Terminal=true launcher definition.
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+fi
+
+exit 0

@@ -5,13 +5,12 @@
 //! agent logic living inside an HTTP handler.
 //!
 //! This is the piece to build while the codebase is still small. Once the
-//! agent loop has leaked into axum handlers you cannot add a TUI without
-//! rewriting both, and that refactor is miserable.
+//! agent loop leaks into interface handlers, replacing one frontend requires
+//! rewriting the core as well.
 //!
-//! Three clients, one protocol:
-//!   - the ratatui TUI      (tokio mpsc, in-process)
-//!   - the web UI           (the same events, serialised over SSE)
-//!   - the headless CLI     (drains events, prints, exits)
+//! The native GUI uses Tokio channels in-process. The protocol remains
+//! serializable so headless or remote clients can be added without coupling
+//! them to the agent implementation.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -119,6 +118,23 @@ pub enum Op {
     /// next command; widening should require the user to confirm.
     SetSandbox {
         mode: String,
+    },
+
+    /// Persist the WhatsApp bridge settings used by the native background
+    /// service. The GUI asks that service to reload only after this succeeds.
+    SetWhatsApp {
+        enabled: bool,
+        assistant_name: String,
+        has_own_number: bool,
+        allowed_jids: Vec<String>,
+    },
+
+    /// Configure the listener used by init-agnostic lightweight nodes. A
+    /// listener change takes effect after restarting the native application.
+    SetNodeHub {
+        enabled: bool,
+        bind: String,
+        port: u16,
     },
 
     /// Ask the core for the recent session list; answered with
@@ -273,6 +289,19 @@ pub enum Event {
 
     WebSearchChanged {
         enabled: bool,
+    },
+
+    WhatsAppConfigChanged {
+        enabled: bool,
+        assistant_name: String,
+        has_own_number: bool,
+        allowed_jids: Vec<String>,
+    },
+
+    NodeHubConfigChanged {
+        enabled: bool,
+        bind: String,
+        port: u16,
     },
 
     TurnStarted {

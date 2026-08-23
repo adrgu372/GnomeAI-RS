@@ -352,6 +352,43 @@ fn encode_message(m: &Message) -> Value {
     }
 }
 
+fn text_only_user_content(content: &str) -> Option<String> {
+    let parts = openai_user_content(content)?.as_array()?.clone();
+    let mut text = parts
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str(
+        "[Imaginea atașată nu poate fi transmisă acestui provider text-only. Răspunde numai pe baza textului sau OCR-ului disponibil și nu inventa detalii vizuale.]",
+    );
+    Some(text)
+}
+
+fn encode_message_text_only(message: &Message) -> Value {
+    match message {
+        Message::User { content } => json!({
+            "role": "user",
+            "content": text_only_user_content(content).unwrap_or_else(|| content.clone()),
+        }),
+        _ => encode_message(message),
+    }
+}
+
+fn rejects_image_content(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("image_url")
+        && (error.contains("unknown variant")
+            || error.contains("expected `text`")
+            || error.contains("expected \"text\"")
+            || error.contains("text-only"))
+}
+
 #[async_trait]
 impl Provider for OpenAiCompatible {
     fn name(&self) -> &str {
@@ -361,27 +398,42 @@ impl Provider for OpenAiCompatible {
     async fn stream(&self, req: Request) -> Result<BoxStream<'static, Result<Delta>>> {
         let url = format!("{}/chat/completions", self.base_url);
         let mut body = self.body(&req);
-        let mut resp = self.send_request(&url, &body).await?;
-        // A few otherwise-compatible servers reject the optional usage
-        // extension. Retry once without it instead of making every preset
-        // carry a brittle compatibility flag.
-        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
-            let status = resp.status();
-            let error_body = resp.text().await.unwrap_or_default();
-            if error_body.contains("stream_options") {
+        let mut removed_stream_options = false;
+        let mut image_text_fallback = false;
+        // Compatibility servers differ both on `stream_options` and on
+        // multipart vision content. Retry only the exact rejected feature;
+        // the loop permits a server to reject both, one after the other.
+        let mut resp = loop {
+            let response = self.send_request(&url, &body).await?;
+            if response.status() != reqwest::StatusCode::BAD_REQUEST {
+                break response;
+            }
+            let status = response.status();
+            let error_body = response.text().await.unwrap_or_default();
+            if !removed_stream_options && error_body.contains("stream_options") {
                 body.as_object_mut()
                     .map(|object| object.remove("stream_options"));
-                resp = self
-                    .send_request(&url, &body)
-                    .await
-                    .context("provider retry failed")?;
-            } else {
-                bail!(
-                    "provider returned {status}: {}",
-                    error_body.chars().take(500).collect::<String>()
-                );
+                removed_stream_options = true;
+                continue;
             }
-        }
+            if !image_text_fallback
+                && request_has_images(&req)
+                && rejects_image_content(&error_body)
+            {
+                body["messages"] = json!(
+                    req.messages
+                        .iter()
+                        .map(encode_message_text_only)
+                        .collect::<Vec<_>>()
+                );
+                image_text_fallback = true;
+                continue;
+            }
+            bail!(
+                "provider returned {status}: {}",
+                error_body.chars().take(500).collect::<String>()
+            );
+        };
 
         let mut free_fallback = None;
         if self.openrouter_credit_fallback && crate::openrouter::is_credit_exhausted(resp.status())
@@ -417,16 +469,21 @@ impl Provider for OpenAiCompatible {
         }
 
         let response_stream = parse_sse(resp);
-        if let Some(model) = free_fallback {
-            let notice = stream::once(async move {
-                Ok(Delta::Reasoning(format!(
-                    "OpenRouter credits exhausted — using ranked free fallback (first candidate: {model})"
-                )))
-            });
-            Ok(Box::pin(notice.chain(response_stream)))
-        } else {
-            Ok(Box::pin(response_stream))
+        let mut notices = Vec::new();
+        if image_text_fallback {
+            notices.push(Delta::Reasoning(
+                "Providerul activ acceptă doar text; imaginea a fost eliminată din cerere. Pentru analiză vizuală completă, selectează un model multimodal."
+                    .into(),
+            ));
         }
+        if let Some(model) = free_fallback {
+            notices.push(Delta::Reasoning(format!(
+                "OpenRouter credits exhausted — using ranked free fallback (first candidate: {model})"
+            )));
+        }
+        Ok(Box::pin(
+            stream::iter(notices.into_iter().map(Ok)).chain(response_stream),
+        ))
     }
 }
 
@@ -931,6 +988,20 @@ fn claude_user_candidates(home: Option<&Path>, npm_prefix: Option<&Path>) -> Vec
 /// receives or persists the OAuth token.
 pub async fn login_with_claude() -> Result<()> {
     let program = claude_executable();
+
+    // Claude Code owns and refreshes its persisted account credentials. Avoid
+    // opening the vendor login again while that saved session is still valid.
+    let saved_status = tokio::process::Command::new(&program)
+        .args(["auth", "status", "--text"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    if saved_status.is_ok_and(|status| status.success()) {
+        return Ok(());
+    }
+
     println!("\nGnomeAI-RS paused its UI for the official Claude Code login flow.\n");
     let status = tokio::process::Command::new(&program)
         .args(["auth", "login"])
@@ -966,7 +1037,18 @@ fn cli_prompt(messages: &[Message]) -> String {
     let mut prompt = String::from(
         "You are being invoked by GnomeAI-RS as its account-authenticated coding provider. \
          Work directly in the current workspace, satisfy the latest user request, verify your \
-         work, and finish with a concise summary. Relevant conversation follows.\n\n",
+         work, and finish with a concise summary. For graphical desktop tasks, prefer the installed \
+         helper's semantic interface: `gnomeai-desktop inspect [QUERY] [LIMIT]` returns AT-SPI \
+         targets; use `gnomeai-desktop activate TARGET [ACTION]`, `set_text TARGET TEXT`, or \
+         `focus TARGET`. It is faster and survives window resizing. Only when a control is absent, \
+         use `observe OUTPUT.png` followed by click/type/key/scroll, and inspect the PNG before \
+         choosing coordinates. For work on a paired weak device, run `gnomeai-hubctl list`, then \
+         `gnomeai-hubctl exec NODE_ID -- COMMAND`; never guess a node ID. Remote root additionally \
+         requires the per-device policy selected in the GnomeAI graphical app. Only when the user \
+         explicitly asks to learn a reusable workflow, write a JSON spec with name, description, \
+         instructions, optional POSIX-shell script and platforms, then call `gnomeai-hubctl learn \
+         SPEC.json`; learning never runs it. Use `gnomeai-hubctl run-skill NAME` separately. Relevant \
+         conversation follows.\n\n",
     );
     let host_context = delegated_host_context(messages);
     if !host_context.is_empty() {
@@ -1284,6 +1366,23 @@ mod tests {
             encoded["content"][1]["image_url"]["url"],
             "data:image/png;base64,cG5n"
         );
+    }
+
+    #[test]
+    fn text_only_encoding_removes_image_bytes_but_keeps_the_prompt() {
+        let message = Message::User {
+            content: serde_json::to_string(&json!([
+                {"type": "text", "text": "descrie poza"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,secret"}}
+            ]))
+            .unwrap(),
+        };
+        let encoded = encode_message_text_only(&message);
+        let content = encoded["content"].as_str().unwrap();
+        assert!(content.contains("descrie poza"));
+        assert!(content.contains("text-only"));
+        assert!(!content.contains("image_url"));
+        assert!(!content.contains("secret"));
     }
 
     #[test]
@@ -1661,6 +1760,75 @@ mod http_tests {
 
         let second = server.await.unwrap();
         assert!(!second.contains("stream_options"));
+    }
+
+    #[tokio::test]
+    async fn openai_retries_image_as_text_when_server_rejects_multipart() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let reject = error_response(
+                "400 Bad Request",
+                r#"{"error":{"message":"unknown variant `image_url`, expected `text`"}}"#,
+            );
+            let accept = sse_response(&[
+                r#"{"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}"#,
+                "[DONE]",
+            ]);
+            let mut second_body = String::new();
+            for (index, response) in [reject, accept].into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                    if let Some(head_end) = find(&request, b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..head_end]);
+                        let content_length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= head_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+                if index == 1 {
+                    second_body = String::from_utf8_lossy(&request).to_string();
+                }
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.ok();
+            }
+            second_body
+        });
+
+        let provider = OpenAiCompatible::named("test", format!("http://{addr}/v1"), None);
+        let mut req = request("text-only-model");
+        req.messages = vec![Message::User {
+            content: serde_json::to_string(&json!([
+                {"type": "text", "text": "citește"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}}
+            ]))
+            .unwrap(),
+        }];
+        let stream = provider.stream(req).await.unwrap();
+        let (text, _, reason, _) = drain(stream).await;
+        assert_eq!(text, "ok");
+        assert_eq!(reason, StopReason::Stop);
+
+        let second = server.await.unwrap();
+        assert!(second.contains("citește"));
+        assert!(!second.contains("image_url"));
+        assert!(!second.contains("cG5n"));
     }
 
     #[tokio::test]

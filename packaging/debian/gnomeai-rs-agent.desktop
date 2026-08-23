@@ -2,11 +2,12 @@
 Type=Application
 Name=GnomeAI-RS Agent
 GenericName=AI Coding Agent
-Comment=Deschide agentul AI multi-provider în terminal
-Exec=gnomeai-rs
+Comment=Deschide aplicația grafică AI multi-provider
+TryExec=/usr/lib/gnomeai-rs/gnomef-rs
+Exec=/usr/lib/gnomeai-rs/gnomef-rs
 Icon=gnomeai-rs-agent
-Terminal=true
+Terminal=false
+DBusActivatable=false
 Categories=Development;Utility;
 Keywords=AI;Agent;Codex;Claude;Rust;
 StartupNotify=true
-

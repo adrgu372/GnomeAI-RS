@@ -66,6 +66,26 @@ impl Provider for CodexAppServer {
 
         Ok(Box::pin(async_stream::try_stream! {
             let mut session = AppServerSession::spawn().await?;
+            // `account/read` is only a best-effort refresh hint. Some app-server
+            // releases can temporarily return `account: null` while their
+            // credential provider is refreshing even though `thread/start`
+            // can use the persisted session normally. Do not turn that
+            // advisory response into a false sign-out; the real request below
+            // remains the authoritative authentication check and reports its
+            // upstream diagnostic if the session is genuinely invalid.
+            match session
+                .request(90, "account/read", json!({ "refreshToken": true }))
+                .await
+            {
+                Ok(account) if !has_saved_chatgpt_account(&account) => tracing::warn!(
+                    "Codex account refresh returned no recognized ChatGPT account; continuing with the persisted app-server session"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "Codex account refresh failed; continuing so the actual request can validate the session"
+                ),
+                Ok(_) => {}
+            }
             let mut thread_params = json!({
                 "cwd": workspace,
                 "approvalPolicy": "never",
@@ -194,11 +214,19 @@ impl Provider for CodexAppServer {
                         break;
                     }
                     Some("error") => {
-                        let error = message
-                            .pointer("/params/message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Codex app-server reported an error");
-                        Err(anyhow::anyhow!(error.to_string()))?;
+                        // App-server emits transient stream errors with
+                        // `willRetry: true`.  Let its own retry loop continue
+                        // instead of aborting an otherwise recoverable turn.
+                        let error = codex_turn_error(&message);
+                        if message
+                            .pointer("/params/willRetry")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            tracing::warn!(%error, "Codex app-server is retrying a turn");
+                            continue;
+                        }
+                        Err(anyhow::anyhow!(error))?;
                     }
                     _ => {}
                 }
@@ -209,67 +237,50 @@ impl Provider for CodexAppServer {
     }
 }
 
-/// Start the official Codex device-code login. The Codex executable owns all
-/// credential persistence and token refresh; GnomeAI only waits for its exit
-/// status.
+/// Start the official Codex device-code login. The Codex app-server owns all
+/// credential persistence and token refresh; GnomeAI only surfaces the URL
+/// and one-time code and waits for completion.
 pub async fn login_with_chatgpt() -> Result<()> {
-    let executable = codex_executable();
-    if is_standalone_app_server(&executable) {
-        return login_with_chatgpt_app_server().await;
-    }
-
-    let codex_home = prepare_codex_home()?;
-    println!("\nGnomeAI-RS paused its UI for the official OpenAI Codex login flow.\n");
-    let status = Command::new(&executable)
-        .args(["login", "--device-auth"])
-        .env("CODEX_HOME", &codex_home)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-        .with_context(|| {
-            format!(
-                "cannot start the bundled Codex executable at `{}`; restore the package or set \
-                 GNOMEF_CODEX_BIN",
-                executable.display()
-            )
-        })?;
-    if !status.success() {
-        bail!(
-            "`{} login --device-auth` exited with {status}",
-            executable.display()
-        );
-    }
-
-    let status = Command::new(&executable)
-        .args(["login", "status"])
-        .env("CODEX_HOME", &codex_home)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-        .context("OpenAI login finished, but Codex could not verify its authentication status")?;
-    if !status.success() {
-        bail!("Codex completed login but still reports that it is not authenticated");
-    }
-    Ok(())
+    login_with_chatgpt_notifying(|verification_url, user_code| {
+        println!("Open this URL in your browser:\n  {verification_url}");
+        println!("\nEnter this one-time code:\n  {user_code}");
+    })
+    .await
 }
 
-/// Compatibility path for installations that point GNOMEF_CODEX_BIN directly
-/// at the standalone app-server binary rather than the full Codex CLI.
-async fn login_with_chatgpt_app_server() -> Result<()> {
+pub async fn login_with_chatgpt_notifying<F>(on_device_code: F) -> Result<()>
+where
+    F: FnOnce(String, String) + Send,
+{
     let mut session = AppServerSession::spawn().await?;
+
+    // Codex owns a persistent credential store under CODEX_HOME and refreshes
+    // managed ChatGPT tokens itself. Check it before starting a new device-code
+    // ceremony so selecting the account provider on every launch is silent.
+    match session
+        .request(1, "account/read", json!({ "refreshToken": true }))
+        .await
+    {
+        Ok(account) if has_saved_chatgpt_account(&account) => {
+            session.stop().await;
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "Codex could not refresh the saved account; starting a new login"
+        ),
+    }
+
     session
         .send_request(
-            1,
+            2,
             "account/login/start",
             json!({ "type": "chatgptDeviceCode" }),
         )
         .await?;
     let login = session
-        .wait_for_response(1)
+        .wait_for_response(2)
         .await
         .context("Codex could not start ChatGPT login")?;
 
@@ -281,15 +292,15 @@ async fn login_with_chatgpt_app_server() -> Result<()> {
     let verification_url = login
         .get("verificationUrl")
         .and_then(Value::as_str)
-        .context("Codex login response did not contain a verification URL")?;
+        .context("Codex login response did not contain a verification URL")?
+        .to_string();
     let user_code = login
         .get("userCode")
         .and_then(Value::as_str)
-        .context("Codex login response did not contain a user code")?;
+        .context("Codex login response did not contain a user code")?
+        .to_string();
 
-    println!("Open this URL in your browser:\n  {verification_url}");
-    println!("\nEnter this one-time code:\n  {user_code}");
-    println!("\nWaiting for OpenAI sign-in to complete… (Ctrl+C to cancel)\n");
+    on_device_code(verification_url, user_code);
 
     loop {
         let message = session.next_message().await?;
@@ -319,6 +330,89 @@ async fn login_with_chatgpt_app_server() -> Result<()> {
             .unwrap_or("OpenAI sign-in failed");
         bail!("{error}");
     }
+}
+
+fn has_saved_chatgpt_account(account: &Value) -> bool {
+    let Some(saved) = account.pointer("/account").filter(|value| !value.is_null()) else {
+        return false;
+    };
+    let Some(kind) = saved.get("type").and_then(Value::as_str) else {
+        // Older/newer protocol builds have exposed an untagged account object.
+        // A populated object still proves that Codex found persisted account
+        // state; only an explicit API-key account must be rejected here.
+        return saved.as_object().is_some_and(|value| !value.is_empty());
+    };
+    let normalized = kind.to_ascii_lowercase();
+    normalized.contains("chatgpt") && !normalized.contains("apikey")
+}
+
+/// Return the models currently advertised by the authenticated Codex account.
+/// The app-server owns account entitlements, so this is more accurate than a
+/// hard-coded catalog and automatically follows additions made upstream.
+pub async fn list_available_models() -> Result<Vec<String>> {
+    let mut session = AppServerSession::spawn().await?;
+    let result = async {
+        let mut models = vec!["default".to_string()];
+        let mut cursor: Option<String> = None;
+
+        for request_id in 10..20 {
+            let response = session
+                .request(
+                    request_id,
+                    "model/list",
+                    json!({
+                        "cursor": cursor,
+                        "includeHidden": false,
+                        "limit": 100,
+                    }),
+                )
+                .await
+                .context("Codex could not list the models available to this account")?;
+            models.extend(parse_model_ids(&response));
+            cursor = response
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        models.sort_unstable();
+        models.dedup();
+        if let Some(index) = models.iter().position(|model| model == "default") {
+            models.remove(index);
+        }
+        models.insert(0, "default".to_string());
+        Ok(models)
+    }
+    .await;
+    session.stop().await;
+    result
+}
+
+fn parse_model_ids(response: &Value) -> Vec<String> {
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            !entry
+                .get("hidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter_map(|entry| {
+            entry
+                .get("model")
+                .and_then(Value::as_str)
+                .or_else(|| entry.get("id").and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 struct AppServerSession {
@@ -438,11 +532,7 @@ impl AppServerSession {
                 continue;
             }
             if let Some(error) = message.get("error") {
-                let text = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown Codex app-server error");
-                bail!("{text}");
+                bail!("{}", json_rpc_error(error));
             }
             return message
                 .get("result")
@@ -595,6 +685,76 @@ fn is_server_request(message: &Value) -> bool {
     message.get("id").is_some() && message.get("method").and_then(Value::as_str).is_some()
 }
 
+fn codex_turn_error(message: &Value) -> String {
+    let error = message
+        .pointer("/params/error")
+        .or_else(|| message.pointer("/params/turn/error"))
+        .or_else(|| message.get("error"));
+    let Some(error) = error else {
+        return "Codex app-server reported an error without diagnostic details".into();
+    };
+    let mut parts = Vec::new();
+    if let Some(text) = error.get("message").and_then(Value::as_str) {
+        parts.push(text.trim().to_string());
+    }
+    if let Some(details) = error
+        .get("additionalDetails")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        && !parts.iter().any(|part| part == details)
+    {
+        parts.push(details.to_string());
+    }
+    if let Some(kind) = error.get("codexErrorInfo").filter(|value| !value.is_null()) {
+        let kind = compact_json(kind);
+        if !kind.is_empty() {
+            parts.push(format!("Codex error: {kind}"));
+        }
+    }
+    if parts.is_empty() {
+        let fallback = compact_json(error);
+        if fallback.is_empty() || fallback == "{}" {
+            "Codex app-server reported an error without diagnostic details".into()
+        } else {
+            format!("Codex app-server error: {fallback}")
+        }
+    } else {
+        parts.join(" — ")
+    }
+}
+
+fn json_rpc_error(error: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(message) = error.get("message").and_then(Value::as_str) {
+        parts.push(message.trim().to_string());
+    }
+    if let Some(code) = error.get("code") {
+        parts.push(format!("code {code}"));
+    }
+    if let Some(data) = error.get("data").filter(|value| !value.is_null()) {
+        parts.push(compact_json(data));
+    }
+    if parts.is_empty() {
+        "unknown Codex app-server error".into()
+    } else {
+        parts.join(" — ")
+    }
+}
+
+fn compact_json(value: &Value) -> String {
+    let mut text = if let Some(value) = value.as_str() {
+        value.to_string()
+    } else {
+        serde_json::to_string(value).unwrap_or_default()
+    };
+    if text.chars().count() > 1_000 {
+        text = text.chars().take(1_000).collect();
+        text.push('…');
+    }
+    text
+}
+
 fn sandbox_name(mode: SandboxMode) -> &'static str {
     match mode {
         SandboxMode::ReadOnly => "read-only",
@@ -607,7 +767,18 @@ fn codex_prompt(messages: &[Message]) -> String {
     let mut prompt = String::from(
         "You are being invoked by GnomeAI-RS as its account-authenticated coding provider. \
          Work directly in the current workspace, satisfy the latest user request, verify your \
-         work, and finish with a concise summary. Relevant conversation follows.\n\n",
+         work, and finish with a concise summary. For graphical desktop tasks, prefer the installed \
+         helper's semantic interface: `gnomeai-desktop inspect [QUERY] [LIMIT]` returns AT-SPI \
+         targets; use `gnomeai-desktop activate TARGET [ACTION]`, `set_text TARGET TEXT`, or \
+         `focus TARGET`. It is faster and survives window resizing. Only when a control is absent, \
+         use `observe OUTPUT.png` followed by click/type/key/scroll, and inspect the PNG before \
+         choosing coordinates. For work on a paired weak device, run `gnomeai-hubctl list`, then \
+         `gnomeai-hubctl exec NODE_ID -- COMMAND`; never guess a node ID. Remote root additionally \
+         requires the per-device policy selected in the GnomeAI graphical app. Only when the user \
+         explicitly asks to learn a reusable workflow, write a JSON spec with name, description, \
+         instructions, optional POSIX-shell script and platforms, then call `gnomeai-hubctl learn \
+         SPEC.json`; learning never runs it. Use `gnomeai-hubctl run-skill NAME` separately. Relevant \
+         conversation follows.\n\n",
     );
     let host_context = delegated_host_context(messages);
     if !host_context.is_empty() {
@@ -759,8 +930,77 @@ mod tests {
     }
 
     #[test]
+    fn saved_chatgpt_accounts_are_reused_without_a_new_login() {
+        assert!(has_saved_chatgpt_account(&json!({
+            "account": {"type": "chatgpt", "email": "user@example.com"},
+            "requiresOpenaiAuth": true
+        })));
+        assert!(has_saved_chatgpt_account(&json!({
+            "account": {"type": "chatgptAuthTokens"}
+        })));
+        assert!(has_saved_chatgpt_account(&json!({
+            "account": {"email": "user@example.com", "planType": "plus"}
+        })));
+        assert!(has_saved_chatgpt_account(&json!({
+            "account": {"type": "ChatGPTDeviceCode"}
+        })));
+        assert!(!has_saved_chatgpt_account(&json!({
+            "account": {"type": "apiKey"}
+        })));
+        assert!(!has_saved_chatgpt_account(&json!({
+            "account": null,
+            "requiresOpenaiAuth": true
+        })));
+    }
+
+    #[test]
     fn pinned_codex_release_is_explicit() {
         assert_eq!(UPSTREAM_VERSION, "0.145.0");
         assert_eq!(UPSTREAM_COMMIT.len(), 40);
+    }
+
+    #[test]
+    fn model_list_uses_runnable_model_ids_and_ignores_hidden_entries() {
+        let ids = parse_model_ids(&json!({
+            "data": [
+                {"id": "display-a", "model": "gpt-a", "hidden": false},
+                {"id": "gpt-b", "hidden": false},
+                {"id": "hidden", "model": "gpt-hidden", "hidden": true},
+                {"id": "blank", "model": "  ", "hidden": false}
+            ]
+        }));
+        assert_eq!(ids, vec!["gpt-a", "gpt-b"]);
+    }
+
+    #[test]
+    fn error_notifications_keep_the_real_app_server_diagnostic() {
+        let notification = json!({
+            "method": "error",
+            "params": {
+                "error": {
+                    "message": "The selected model is unavailable",
+                    "additionalDetails": "Choose a model returned by model/list",
+                    "codexErrorInfo": "badRequest"
+                },
+                "willRetry": false
+            }
+        });
+        let text = codex_turn_error(&notification);
+        assert!(text.contains("selected model is unavailable"));
+        assert!(text.contains("model/list"));
+        assert!(text.contains("badRequest"));
+        assert!(!text.contains("reported an error"));
+    }
+
+    #[test]
+    fn json_rpc_errors_include_code_and_data() {
+        let text = json_rpc_error(&json!({
+            "code": -32602,
+            "message": "Invalid params",
+            "data": {"field": "model"}
+        }));
+        assert!(text.contains("Invalid params"));
+        assert!(text.contains("-32602"));
+        assert!(text.contains("model"));
     }
 }

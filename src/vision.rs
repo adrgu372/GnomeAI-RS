@@ -77,6 +77,10 @@ pub fn is_image_intent(query: &str) -> bool {
 }
 
 pub fn supports_images(model: &str, known_models: &[ModelInfo]) -> bool {
+    if model.trim().is_empty() {
+        return false;
+    }
+
     let re = Regex::new(
         r"(?i)(vision|omni|vl|vila|llava|bakllava|minicpm|moondream|internvl|qwen.*(?:vl|vision)|pixtral|gemma[-_.: ]?3|gemma3|llama[-_.: ]?3\.2.*vision|mistral.*vision|ministral)",
     )
@@ -84,14 +88,41 @@ pub fn supports_images(model: &str, known_models: &[ModelInfo]) -> bool {
     if re.is_match(model) {
         return true;
     }
-    known_models
+    let Some(info) = known_models.iter().find(|info| info.id == model) else {
+        // Model catalogues are frequently incomplete or lag behind newly
+        // released multimodal models. Let the provider make the authoritative
+        // decision instead of blocking the attachment in the client.
+        return true;
+    };
+
+    let capabilities = info
+        .capabilities
         .iter()
-        .find(|info| info.id == model)
-        .is_some_and(|info| {
-            info.capabilities
-                .iter()
-                .any(|cap| matches!(cap.as_str(), "vision" | "image" | "images" | "multimodal"))
-        })
+        .map(|capability| capability.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if capabilities.iter().any(|capability| {
+        matches!(
+            capability.as_str(),
+            "vision" | "image" | "images" | "multimodal" | "input_image" | "image_input"
+        )
+    }) {
+        return true;
+    }
+
+    // Only an explicit negative marker is restrictive. A catalogue that says
+    // merely `text` may simply omit modality metadata, so it remains eligible.
+    !capabilities.iter().any(|capability| {
+        matches!(
+            capability.as_str(),
+            "text-only"
+                | "text_only"
+                | "no-image"
+                | "no_image"
+                | "no-vision"
+                | "no_vision"
+                | "vision-disabled"
+        )
+    })
 }
 
 pub fn build_image_vision_messages(
@@ -245,7 +276,7 @@ pub async fn generate_image_response(
                             .await;
                         }
                         return format!(
-                            "Am primit imaginea, dar request-ul vision a esuat. Verifica daca llama-server ruleaza modelul vision cu mmproj/projector incarcat. Eroare: {err}"
+                            "Am primit imaginea, dar providerul sau modelul selectat a respins cererea vizuală. Pentru un model local, verifică și dacă projectorul/mmproj este încărcat. Eroare: {err}"
                         );
                     }
                 },
@@ -274,7 +305,7 @@ pub async fn generate_image_response(
 
     if image_path.is_some() {
         format!(
-            "Am primit imaginea '{image_name}', dar modelul selectat '{model}' nu este recunoscut ca vision si OCR nu a gasit text. Alege un model vision pentru analiza vizuala."
+            "Am primit imaginea „{image_name}”, dar modelul selectat „{model}” este marcat explicit ca text-only și OCR nu a găsit text. Alege un model multimodal pentru analiză vizuală."
         )
     } else {
         "Nu am gasit imaginea atasata in istoricul chatului.".into()
@@ -303,7 +334,7 @@ async fn answer_from_ocr(
         format!("Cererea vision a esuat, deci pot raspunde doar din OCR. Eroare: {err}\n\n")
     } else {
         format!(
-            "Modelul '{model}' nu este confirmat ca vision, deci pot raspunde doar din OCR.\n\n"
+            "Modelul „{model}” este marcat explicit ca text-only, deci pot răspunde doar din OCR.\n\n"
         )
     };
     let prompt = format!(
@@ -348,6 +379,29 @@ mod tests {
             "provider/model-with-an-uninformative-name",
             &known_models,
         ));
-        assert!(!supports_images("provider/text-only-model", &[]));
+    }
+
+    #[test]
+    fn unknown_models_are_optimistically_allowed_to_try_images() {
+        assert!(supports_images("provider/new-multimodal-model", &[]));
+
+        let incomplete_metadata = vec![ModelInfo {
+            id: "provider/catalogue-only-says-text".into(),
+            capabilities: vec!["text".into()],
+        }];
+        assert!(supports_images(
+            "provider/catalogue-only-says-text",
+            &incomplete_metadata,
+        ));
+    }
+
+    #[test]
+    fn only_explicit_text_only_metadata_blocks_image_input() {
+        let known_models = vec![ModelInfo {
+            id: "provider/text-only-model".into(),
+            capabilities: vec!["text-only".into()],
+        }];
+        assert!(!supports_images("provider/text-only-model", &known_models,));
+        assert!(!supports_images("", &known_models));
     }
 }

@@ -1,18 +1,18 @@
 Package: gnomeai-rs
-Version: 1.2.4
+Version: 2.0.0-1
 Section: utils
 Priority: optional
 Architecture: amd64
 Maintainer: GnomeAI-RS Project <noreply@example.invalid>
 Homepage: https://github.com/adrgu372/GnomeAI-RS
 Installed-Size: 408924
-Depends: libc6 (>= 2.39), libgcc-s1, ca-certificates, curl, util-linux, nodejs (>= 20)
-Recommends: podman (>= 4.3), xdg-utils, git, libsecret-tools, wl-clipboard | xclip | xsel
+Depends: libc6 (>= 2.39), libgcc-s1, libx11-6, libxkbcommon0, libwayland-client0, libgl1, libdbus-1-3, at-spi2-core, ca-certificates, curl, util-linux, nodejs (>= 20), poppler-utils, xdotool, scrot | gnome-screenshot
+Recommends: podman (>= 4.3), xdg-utils, git, libsecret-tools, wl-clipboard | xclip | xsel, grim
 Suggests: npm, claude-code
-Description: multi-provider personal AI agent written in Rust
- GnomeAI-RS provides a terminal coding agent, local WebTool and optional
- WhatsApp assistant with shared providers, Web Search, persistent memory and
- installable SKILL.md packages.
+Description: native graphical multi-provider AI agent written in Rust
+ GnomeAI-RS provides a native desktop coding agent and optional WhatsApp
+ assistant with shared providers, Web Search, persistent memory and installable
+ SKILL.md packages.
  .
  The package bundles the official OpenAI Codex app-server runtime, the pinned
  WhatsApp bridge dependencies and a rootless, lazy Firecrawl deployment with

@@ -1,86 +1,38 @@
 GnomeAI-RS for Debian
 =====================
 
-The package itself must be installed by an administrator, but both applications
-run as the desktop user afterward. Runtime data and API keys are stored with
-owner-only permissions under:
+The package is installed by an administrator, but the application always runs
+as the desktop user. Do not launch it with sudo.
+
+The desktop menu entry and these compatible commands open the same native GUI:
+
+  gnomeai-rs /path/to/workspace
+  gnomef-rs /path/to/workspace
+  gnomef-agent /path/to/workspace
+
+Runtime state and API keys use owner-only permissions under:
 
   ${XDG_STATE_HOME:-$HOME/.local/state}/gnomeai-rs
 
-No application command should be launched with sudo.
+The sidebar exposes workspace, provider, model, Web Search and sandbox
+selection. `normal` asks for approval before host-side mutations,
+`full-access` skips ordinary user-level prompts, and `read-only` blocks
+mutations. Root commands still use a separate approval and masked credential
+dialog.
 
-Applications
-------------
+WhatsApp is configured from the native sidebar. Pairing state and the QR code
+are shown inside the GUI; the packaged private loopback helper has no browser
+page or public launcher.
 
-The desktop menu contains:
-
-* GnomeAI-RS Agent — terminal coding agent with /workspace, /provider,
-  /websearch and installable SKILL.md packages. The transcript supports
-  mouse-wheel and keyboard scrolling.
-  Hold the left mouse button while using the wheel to extend a selection
-  beyond the viewport; releasing the button copies the selection.
-* GnomeAI-RS WebTool — local browser interface at http://127.0.0.1:8787.
-
-Equivalent commands:
-
-  gnomeai-rs /path/to/workspace
-  gnomeai-webtool
-
-Execution modes
----------------
-
-`normal` is the default: commands may use normal user-level host access after
-an approval. `full-access` skips approval prompts, and `read-only` blocks
-mutations. These modes never grant root privileges; do not launch the agent
-with sudo. Strict upload parsers and generated-document jobs continue to use
-their own fail-closed Landlock/seccomp sandbox.
-
-Skills
-------
-
-The Agent, WebTool and WhatsApp share the native Rust skill manager. Managed
-packages are installed under:
+Managed SKILL.md packages live under:
 
   ${XDG_DATA_HOME:-$HOME/.local/share}/gnomeai-rs/skills
 
-The Agent commands are `/skills` and
-`/skill use|inspect|install|update|verify|remove`. WebTool exposes the manager
-in Settings. WhatsApp permits catalog, inspect and activation commands, but
-never remote package installation.
-
-Firecrawl
----------
-
-When Web Search is OFF, no Firecrawl process is started. With Web Search ON,
-the first WebSearch/WebFetch request starts the bundled deployment through
-rootless Podman. Its official container images are downloaded once into the
-current user's Podman storage.
-
-Useful diagnostics:
+The packaged Firecrawl helper remains lazy and rootless:
 
   gnomeai-firecrawl status
   gnomeai-firecrawl logs
   gnomeai-firecrawl stop
 
-Podman is a recommended dependency because a remote Firecrawl URL can also be
-configured instead. The local deployment binds only to 127.0.0.1:3002.
-
-Provider account authentication
--------------------------------
-
-OpenAI account authentication runs through the bundled official
-`codex login --device-auth` flow. Anthropic account authentication requires
-the official `claude` command; desktop launches also search the native install
-locations under ~/.local/bin and ~/.claude/bin. Set GNOMEF_CLAUDE_BIN for a
-custom path. Those account-backed modes are selected from the terminal agent.
-WebTool uses API-backed providers, including the native Anthropic Messages API.
-
-WhatsApp
---------
-
-The package contains the pinned Baileys/Pino dependencies and depends on
-Node.js 20 or newer; no runtime `npm install` is needed. Starting WhatsApp from
-WebTool waits for the bridge and then displays the QR code automatically.
-Startup and connection failures are shown in Settings and recorded under:
-
-  ${XDG_STATE_HOME:-$HOME/.local/state}/gnomeai-rs/whatsapp_bridge.log
+The former `gnomef-web`, `gnomeai-webtool` and static browser page are no
+longer installed.

@@ -9,7 +9,7 @@
     "start": "node bridge.mjs"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "7.0.0-rc13",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
     "pino": "9.14.0"
   }
 }

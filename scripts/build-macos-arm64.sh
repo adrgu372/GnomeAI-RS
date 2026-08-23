@@ -31,7 +31,7 @@ if [[ "${GNOMEAI_SKIP_BUILD:-0}" != "1" ]]; then
     cargo build --release --locked
 fi
 
-for binary in gnomef-rs gnomef-agent gnomef-web; do
+for binary in gnomef-rs gnomef-agent gnomef-whatsapp; do
     [[ -x "$binary_dir/$binary" ]] || {
         echo "Missing binary: $binary_dir/$binary" >&2
         exit 1
@@ -50,8 +50,6 @@ trap cleanup EXIT
 payload_root="$build_root/payload"
 applications_root="$payload_root/Applications"
 primary_app="$applications_root/GnomeAI-RS.app"
-agent_app="$applications_root/GnomeAI-RS Agent.app"
-web_app="$applications_root/GnomeAI-RS Web.app"
 primary_macos="$primary_app/Contents/MacOS"
 resources_root="$primary_app/Contents/Resources"
 npm_cache="${GNOMEAI_NPM_CACHE:-$build_root/npm-cache}"
@@ -100,7 +98,7 @@ create_app() {
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>LSUIElement</key>
-    <true/>
+    <false/>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>
@@ -110,13 +108,10 @@ EOF
 }
 
 create_app "$primary_app" "com.gnomeai.rs" "GnomeAI-RS"
-create_app "$agent_app" "com.gnomeai.rs.agent" "GnomeAI-RS Agent"
-create_app "$web_app" "com.gnomeai.rs.web" "GnomeAI-RS Web"
 
 install -m 0755 "$binary_dir/gnomef-rs" "$primary_macos/gnomef-rs"
 install -m 0755 "$binary_dir/gnomef-agent" "$primary_macos/gnomef-agent"
-install -m 0755 "$binary_dir/gnomef-web" "$primary_macos/gnomef-web"
-install -m 0644 index.html "$resources_root/index.html"
+install -m 0755 "$binary_dir/gnomef-whatsapp" "$primary_macos/gnomef-whatsapp"
 install -m 0644 config.example.json "$resources_root/config.example.json"
 install -m 0644 README.md "$resources_root/docs/README.md"
 install -m 0644 LICENSE "$resources_root/docs/LICENSE"
@@ -183,7 +178,6 @@ EOF
 
 write_cli_wrapper "$payload_root/usr/local/bin/gnomef-rs" "gnomef-rs"
 write_cli_wrapper "$payload_root/usr/local/bin/gnomef-agent" "gnomef-agent"
-write_cli_wrapper "$payload_root/usr/local/bin/gnomef-web" "gnomef-web"
 
 # Installer payloads must not retain Finder metadata or source quarantine flags.
 xattr -crs "$payload_root"
@@ -204,10 +198,8 @@ while IFS= read -r -d '' candidate; do
 done < <(find "$applications_root" -type f -print0)
 
 sign_code "$primary_app"
-sign_code "$agent_app"
-sign_code "$web_app"
 
-for app in "$primary_app" "$agent_app" "$web_app"; do
+for app in "$primary_app"; do
     codesign --verify --deep --strict --verbose=2 "$app"
 done
 
@@ -239,9 +231,6 @@ fi
 payload_list="$build_root/pkg-payload.txt"
 pkgutil --payload-files "$pkg" > "$payload_list"
 grep -q '^./Applications/GnomeAI-RS.app/' "$payload_list"
-grep -q '^./Applications/GnomeAI-RS Agent.app/' "$payload_list"
-grep -q '^./Applications/GnomeAI-RS Web.app/' "$payload_list"
-grep -q '^./usr/local/bin/gnomef-web$' "$payload_list"
 if grep -q '/\._' "$payload_list"; then
     echo "The installer payload contains unexpected AppleDouble files." >&2
     exit 1
@@ -289,15 +278,10 @@ Double-click "Install GnomeAI-RS.pkg" and follow the macOS Installer steps.
 
 The installer adds these applications to /Applications:
 - GnomeAI-RS
-- GnomeAI-RS Agent
-- GnomeAI-RS Web
 
 It also adds these Terminal commands to /usr/local/bin:
 - gnomef-rs
 - gnomef-agent
-- gnomef-web
-
-WebTool opens at http://127.0.0.1:8787/.
 EOF
 
 dmg="$output_dir/${package_name}.dmg"

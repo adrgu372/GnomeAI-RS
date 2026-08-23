@@ -23,9 +23,12 @@ use uuid::Uuid;
 use crate::{
     config::AppConfig,
     consistency::{ToolObservation, enforce_final_answer},
+    desktop,
     firecrawl::{firecrawl_fetch, firecrawl_search},
     llama::{ChatStreamEvent, LlamaClient, LlamaResponse},
     memory::append_memory_block,
+    node_protocol::QueueJobRequest,
+    nodes,
     privilege::{
         clear_keyring_secret, command_requests_privilege, keyring_available, lookup_keyring_secret,
         store_keyring_secret, validate_sudo,
@@ -326,8 +329,32 @@ fn summarize_call(name: &str, args: &Map<String, Value>) -> String {
         "Grep" => format!("grep {:?}", text("pattern")),
         "WebSearch" => format!("search {:?}", text("query")),
         "WebFetch" => format!("fetch {}", text("url")),
+        "Desktop" => match text("action") {
+            "click" | "double_click" | "move" => format!(
+                "desktop {} at {},{}",
+                text("action"),
+                args.get("x").and_then(Value::as_i64).unwrap_or(-1),
+                args.get("y").and_then(Value::as_i64).unwrap_or(-1)
+            ),
+            "inspect" => format!("inspect desktop UI {:?}", text("query")),
+            "activate" | "set_text" | "focus" => {
+                format!("desktop {} semantic target", text("action"))
+            }
+            action => format!("desktop {action}"),
+        },
+        "Node" => match text("action") {
+            "list" => "list remote nodes".into(),
+            "exec" => format!(
+                "run on {}: {}",
+                text("node_id"),
+                short_command(text("command"), 100)
+            ),
+            action => format!("node {action}"),
+        },
         "Agent" => format!("delegate: {}", text("description")),
         "Skill" => format!("skill {}", text("name")),
+        "Learn" => format!("learn skill {}", text("name")),
+        "RunSkill" => format!("run skill {} on {}", text("name"), text("target")),
         "Config" => format!("config {}", text("setting")),
         "TaskOutput" => format!("read output {}", text("taskId")),
         other => other.to_string(),
@@ -361,10 +388,10 @@ async fn run_tool_loop_internal(
     let channel_execution_policy = if session_key.is_some_and(is_whatsapp_scope) {
         "WhatsApp authorization: this turn came from an allowed WhatsApp chat. The user's inbound message itself authorizes the standard user-level tool calls needed to fulfill it, so execute them without waiting for a desktop confirmation. Read-only mode still blocks mutations. Sudo may proceed only with an existing sudo ticket or a valid credential already stored in the local keyring; if neither is available, fail clearly instead of opening a desktop prompt."
     } else {
-        "WebTool authorization: obey the selected execution mode and request local confirmation whenever normal mode requires it."
+        "Native desktop authorization: obey the selected execution mode and request local confirmation whenever normal mode requires it."
     };
     let runtime_aware_system_prompt = format!(
-        "{runtime_aware_system_prompt}\n\nSelected workspace: {}\nShared WebTool/WhatsApp execution mode: {}.\n{channel_execution_policy}\n{}\nWhen a tool is needed, call it through the native tool-calling API. Never print a tool call as markdown such as `**WebSearch** (query: ...)`. After receiving tool results, answer the user directly instead of announcing another intermediate step.",
+        "{runtime_aware_system_prompt}\n\nSelected workspace: {}\nShared desktop/WhatsApp execution mode: {}.\n{channel_execution_policy}\n{}\nFor graphical tasks, navigate autonomously with Desktop. Start with semantic `inspect`, then use the returned target with `activate`, `set_text`, or `focus`; these actions return an updated tree without an image round-trip. Use `observe` and coordinates only when the needed element is absent from AT-SPI, and never guess coordinates without a current capture.\nUse Node to inspect and operate paired weak devices. Use Learn only after an explicit user request to retain a reusable workflow; learning never authorizes or runs the entrypoint. RunSkill is a separate approved operation.\nWhen a tool is needed, call it through the native tool-calling API. Never print a tool call as markdown such as `**WebSearch** (query: ...)`. After receiving tool results, answer the user directly instead of announcing another intermediate step.",
         paths.workspace_dir.display(),
         cfg.web_sandbox_mode,
         agent_profile.guidance(),
@@ -574,9 +601,15 @@ async fn run_tool_loop_internal(
         };
 
         let mut structured_output = None;
+        let mut desktop_screenshots = Vec::new();
         for ((name, args, call_id), execution) in parsed_calls.iter().zip(executions) {
             let output = match execution {
                 Ok(result) => {
+                    if name == "Desktop"
+                        && let Some(path) = desktop::screenshot_path(&result)
+                    {
+                        desktop_screenshots.push(path);
+                    }
                     let observation =
                         ToolObservation::from_success(runtime_profile, name, args, &result);
                     let source_attribution = observation.source_attribution.as_json();
@@ -621,6 +654,18 @@ async fn run_tool_loop_internal(
                 "tool_call_id": call_id,
                 "content": output.to_string(),
             }));
+        }
+
+        // Preserve provider tool-call ordering, then add each fresh screen as
+        // a real multimodal user turn. Both OpenAI and Anthropic encoders can
+        // now let the model inspect pixels before choosing the next action.
+        for path in desktop_screenshots {
+            match desktop::screenshot_user_content(&path)
+                .and_then(|content| serde_json::from_str::<Value>(&content).map_err(Into::into))
+            {
+                Ok(content) => messages.push(json!({"role": "user", "content": content})),
+                Err(error) => warn!(%error, "could not attach desktop screenshot to model round"),
+            }
         }
 
         final_content = response.content;
@@ -732,7 +777,7 @@ impl AgentProfile {
     fn allows(self, tool: &str) -> bool {
         match self {
             Self::Root => true,
-            Self::GeneralPurpose => !matches!(tool, "AskUserQuestion" | "Config"),
+            Self::GeneralPurpose => !matches!(tool, "AskUserQuestion" | "Config" | "Learn"),
             Self::Explore => matches!(
                 tool,
                 "ToolSearch"
@@ -959,6 +1004,43 @@ async fn execute_tool_call(
             )
             .await
         }
+        "Desktop" => {
+            let action = value_string(args, "action").unwrap_or_else(|| "observe".into());
+            authorize_standard(
+                cfg,
+                pending_approvals,
+                &tool_ctx.approval_scope,
+                "Desktop",
+                &format!("desktop {action}"),
+                "The agent will inspect or control the current graphical desktop session.",
+                paths,
+            )
+            .await?;
+            desktop::perform(&paths.generated_dir, args, turn.cancel_token()).await
+        }
+        "Node" => {
+            let action = value_string(args, "action").unwrap_or_else(|| "list".into());
+            if action != "list" {
+                let node_id = value_string(args, "node_id").unwrap_or_else(|| "?".into());
+                authorize_standard(
+                    cfg,
+                    pending_approvals,
+                    &tool_ctx.approval_scope,
+                    "Node",
+                    &format!("remote node {node_id}: {action}"),
+                    "The agent will execute a command on the selected paired device.",
+                    paths,
+                )
+                .await?;
+            }
+            let root_approved = action != "list"
+                && matches!(
+                    web_sandbox_mode(cfg),
+                    SandboxMode::Normal | SandboxMode::IsolatedWorkspaceWrite
+                )
+                && !is_whatsapp_scope(&tool_ctx.approval_scope);
+            tool_node(cfg, args, root_approved).await
+        }
         "Sudo" => {
             tool_sudo(
                 cfg,
@@ -973,6 +1055,31 @@ async fn execute_tool_call(
         }
         "Config" => tool_config(cfg, paths, args, config_state).await,
         "Skill" => tool_skill(paths, args),
+        "Learn" => {
+            authorize_standard(
+                cfg,
+                pending_approvals,
+                &tool_ctx.approval_scope,
+                "Learn",
+                &format!("learn skill {}", value_string(args, "name").unwrap_or_default()),
+                "The agent will create or replace a persistent user-managed skill.",
+                paths,
+            )
+            .await?;
+            tool_learn(args).await
+        }
+        "RunSkill" => {
+            tool_run_skill(
+                cfg,
+                paths,
+                args,
+                runtime,
+                tool_ctx,
+                pending_approvals,
+                turn,
+            )
+            .await
+        }
         "StructuredOutput" => Ok(json!({"structured_output": args})),
         "TodoWrite" => tasks::todo_write(
             paths,
@@ -1320,7 +1427,7 @@ fn resolve_agent_provider(
         preset(&provider_id).ok_or_else(|| anyhow!("Unknown subagent provider: {provider_id}"))?;
     if provider.auth == AuthKind::Account {
         bail!(
-            "Subagents in WebTool/WhatsApp require an API provider; account-backed provider {} is terminal-only",
+            "WhatsApp subagents require an API provider; account-backed provider {} is available only in the native app",
             provider.name
         );
     }
@@ -1351,7 +1458,7 @@ fn resolve_agent_provider(
     agent_cfg.normalize();
     if provider.auth == AuthKind::ApiKey && agent_cfg.llama_api_key.trim().is_empty() {
         bail!(
-            "Provider {} has no saved API key. Save its key once in WebTool settings before assigning a subagent to it",
+            "Provider {} has no saved API key. Save its key once in the native Provider settings before assigning a subagent to it",
             provider.name
         );
     }
@@ -1926,7 +2033,7 @@ async fn tool_sudo(
     turn: &TurnStream,
 ) -> anyhow::Result<Value> {
     if !local_web {
-        bail!("Sudo is disabled when WebTool listens on a non-loopback address")
+        bail!("Sudo is disabled when the background service listens on a non-loopback address")
     }
     if web_sandbox_mode(cfg) == SandboxMode::ReadOnly {
         bail!("Sudo is disabled in read-only mode")
@@ -2331,6 +2438,41 @@ async fn tool_config(
     }))
 }
 
+async fn tool_node(
+    cfg: &AppConfig,
+    args: &Map<String, Value>,
+    centrally_approved: bool,
+) -> anyhow::Result<Value> {
+    if !cfg.node_hub_enabled {
+        bail!("remote nodes are disabled; enable the Node Hub in Settings and restart GnomeAI")
+    }
+    let client = nodes::local_client(cfg.node_hub_port, &cfg.node_hub_admin_token);
+    let action = value_string(args, "action").unwrap_or_else(|| "list".into());
+    match action.as_str() {
+        "list" => client.list().await,
+        "exec" => {
+            let node_id = required_string(args, "node_id")?;
+            let command = required_string(args, "command")?;
+            let timeout_secs = value_u64(args, "timeout").unwrap_or(60).clamp(1, 3_600);
+            client
+                .execute(
+                    &node_id,
+                    &QueueJobRequest {
+                        action: "shell".into(),
+                        command,
+                        stdin: String::new(),
+                        cwd: value_string(args, "cwd"),
+                        timeout_secs,
+                        root: value_bool(args, "root").unwrap_or(false),
+                        root_approved: centrally_approved,
+                    },
+                )
+                .await
+        }
+        other => bail!("unknown Node action `{other}`; use `list` or `exec`"),
+    }
+}
+
 fn tool_skill(paths: &AppPaths, args: &Map<String, Value>) -> anyhow::Result<Value> {
     let requested_name = value_string(args, "name")
         .map(|item| normalize_ws(&item))
@@ -2430,6 +2572,116 @@ fn tool_skill(paths: &AppPaths, args: &Map<String, Value>) -> anyhow::Result<Val
         "query": query,
         "total_skills": installed.len()
     }))
+}
+
+async fn tool_learn(args: &Map<String, Value>) -> anyhow::Result<Value> {
+    let platforms = args
+        .get("platforms")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let spec = skills::LearnedSkillSpec {
+        name: required_string(args, "name")?,
+        description: required_string(args, "description")?,
+        instructions: required_string(args, "instructions")?,
+        script: value_string(args, "script"),
+        platforms,
+        replace: value_bool(args, "replace").unwrap_or(false),
+    };
+    let summary = tokio::task::spawn_blocking(move || skills::learn(spec)).await??;
+    Ok(json!({"ok": true, "skill": summary}))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn tool_run_skill(
+    cfg: &AppConfig,
+    paths: &AppPaths,
+    args: &Map<String, Value>,
+    runtime: &RuntimeHandles,
+    tool_ctx: &ToolContext,
+    pending_approvals: &PendingApprovals,
+    turn: &TurnStream,
+) -> anyhow::Result<Value> {
+    let name = required_string(args, "name")?;
+    let entrypoint = skills::entrypoint(&paths.workspace_dir, &name)?;
+    let target = value_string(args, "target").unwrap_or_else(|| "local".into());
+    let timeout = value_u64(args, "timeout").unwrap_or(120).clamp(1, 120);
+    match target.as_str() {
+        "local" => {
+            if value_bool(args, "root").unwrap_or(false) {
+                bail!("local RunSkill root requires the dedicated Sudo tool")
+            }
+            let mut bash_args = Map::new();
+            bash_args.insert(
+                "command".into(),
+                json!(format!(
+                    "exec /bin/sh {}",
+                    shell_single_quote(&entrypoint.path.to_string_lossy())
+                )),
+            );
+            bash_args.insert(
+                "cwd".into(),
+                json!(value_string(args, "cwd").unwrap_or_else(|| ".".into())),
+            );
+            bash_args.insert("timeout".into(), json!(timeout));
+            tool_bash(
+                cfg,
+                paths,
+                &bash_args,
+                runtime,
+                &tool_ctx.session_key,
+                &tool_ctx.approval_scope,
+                pending_approvals,
+                turn,
+            )
+            .await
+        }
+        "node" => {
+            if !cfg.node_hub_enabled {
+                bail!("remote nodes are disabled")
+            }
+            let node_id = required_string(args, "node_id")?;
+            authorize_standard(
+                cfg,
+                pending_approvals,
+                &tool_ctx.approval_scope,
+                "RunSkill",
+                &format!("run skill {name} on node {node_id}"),
+                "The skill entrypoint will execute on the selected paired device.",
+                paths,
+            )
+            .await?;
+            let root_approved = matches!(
+                web_sandbox_mode(cfg),
+                SandboxMode::Normal | SandboxMode::IsolatedWorkspaceWrite
+            ) && !is_whatsapp_scope(&tool_ctx.approval_scope);
+            nodes::local_client(cfg.node_hub_port, &cfg.node_hub_admin_token)
+                .execute(
+                    &node_id,
+                    &QueueJobRequest {
+                        action: "script".into(),
+                        command: String::new(),
+                        stdin: entrypoint.script,
+                        cwd: value_string(args, "cwd"),
+                        timeout_secs: timeout,
+                        root: value_bool(args, "root").unwrap_or(false),
+                        root_approved,
+                    },
+                )
+                .await
+        }
+        other => bail!("unknown skill target `{other}`"),
+    }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 async fn tool_web_search(cfg: &AppConfig, args: &Map<String, Value>) -> anyhow::Result<Value> {
@@ -3060,6 +3312,53 @@ fn openai_tool_schemas() -> Vec<Value> {
             }),
         ),
         tool_schema(
+            "Desktop",
+            "Navigate the graphical Linux desktop. Prefer semantic AT-SPI: inspect returns controls with opaque targets; activate/set_text/focus acts without coordinates and returns the updated tree. Use observe and pixel actions only when a control is missing. Normal mode asks for approval; full-access runs automatically; read-only blocks it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["inspect", "activate", "set_text", "focus", "observe", "click", "double_click", "move", "type", "key", "scroll", "focus_window"]
+                    },
+                    "query": {"type": "string", "description": "Optional semantic name/role/action filter"},
+                    "limit": {"type": "integer", "default": 140, "minimum": 1, "maximum": 400},
+                    "target": {"type": "string", "description": "Opaque a11y: target returned by inspect"},
+                    "action_name": {"type": "string", "description": "Optional accessible action name"},
+                    "x": {"type": "integer"},
+                    "y": {"type": "integer"},
+                    "button": {"type": "integer", "default": 1},
+                    "text": {"type": "string"},
+                    "keys": {"type": "string", "description": "xdotool chord, e.g. ctrl+l, Return, alt+F4"},
+                    "amount": {"type": "integer", "description": "Positive scrolls down, negative scrolls up"},
+                    "window": {"type": "string", "description": "Window-title pattern"},
+                    "screenshot_after": {"type": "boolean", "default": true},
+                    "inspect_after": {"type": "boolean", "default": true},
+                    "after_query": {"type": "string"},
+                    "wait_ms": {"type": "integer", "description": "Default 120 ms for semantic actions and 350 ms for visual actions"}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        ),
+        tool_schema(
+            "Node",
+            "List paired GnomeAI nodes or execute on one weak/remote device. Models and credentials remain on the Hub. Root is controlled by the per-device policy in the main app; this tool never receives a password.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "exec"]},
+                    "node_id": {"type": "string"},
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string"},
+                    "timeout": {"type": "integer", "default": 60, "minimum": 1, "maximum": 3600},
+                    "root": {"type": "boolean", "default": false}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        ),
+        tool_schema(
             "Bash",
             "Run a shell command inside the selected workspace. Normal mode asks the user first; sudo is blocked here.",
             json!({
@@ -3126,6 +3425,40 @@ fn openai_tool_schemas() -> Vec<Value> {
                     "include_content": {"type": "boolean", "default": true},
                     "max_results": {"type": "integer", "default": 5}
                 },
+                "additionalProperties": false
+            }),
+        ),
+        tool_schema(
+            "Learn",
+            "Persist a reusable workflow as a managed skill only when the user explicitly asks to learn or remember it. An optional script is POSIX shell. Learning never executes it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "instructions": {"type": "string"},
+                    "script": {"type": "string"},
+                    "platforms": {"type": "array", "items": {"type": "string"}},
+                    "replace": {"type": "boolean", "default": false}
+                },
+                "required": ["name", "description", "instructions"],
+                "additionalProperties": false
+            }),
+        ),
+        tool_schema(
+            "RunSkill",
+            "Execute the declared shell entrypoint of an installed skill locally or on a paired node. This is a separate approved operation; remote root follows the per-device policy.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "target": {"type": "string", "enum": ["local", "node"], "default": "local"},
+                    "node_id": {"type": "string"},
+                    "cwd": {"type": "string"},
+                    "timeout": {"type": "integer", "default": 120, "minimum": 1, "maximum": 120},
+                    "root": {"type": "boolean", "default": false}
+                },
+                "required": ["name"],
                 "additionalProperties": false
             }),
         ),
@@ -3310,6 +3643,18 @@ fn tool_metadata() -> Vec<ToolMeta> {
             aliases: &[],
         },
         ToolMeta {
+            name: "Desktop",
+            description: "Inspect and control semantic desktop elements, with screenshot and coordinate fallback.",
+            search_hint: "desktop gui accessibility at-spi semantic controls screenshot click mouse keyboard type navigate window automation",
+            aliases: &["Computer", "ComputerUse"],
+        },
+        ToolMeta {
+            name: "Node",
+            description: "List and control paired lightweight GnomeAI execution nodes.",
+            search_hint: "remote node device raspberry pi weak pc distributed execute shell root hub",
+            aliases: &["Device", "RemoteDevice"],
+        },
+        ToolMeta {
             name: "Bash",
             description: "Run an approved shell command inside the selected workspace.",
             search_hint: "run shell command inspect environment terminal command",
@@ -3332,6 +3677,18 @@ fn tool_metadata() -> Vec<ToolMeta> {
             description: "Search and read local SKILL.md instruction files.",
             search_hint: "discover skills prompt libraries instruction packs",
             aliases: &[],
+        },
+        ToolMeta {
+            name: "Learn",
+            description: "Store a user-requested reusable workflow as a managed skill.",
+            search_hint: "learn remember reusable workflow create skill executable procedure",
+            aliases: &["LearnSkill"],
+        },
+        ToolMeta {
+            name: "RunSkill",
+            description: "Run an installed skill entrypoint locally or on a paired node.",
+            search_hint: "execute run learned skill script local remote node",
+            aliases: &["ExecuteSkill"],
         },
         ToolMeta {
             name: "StructuredOutput",

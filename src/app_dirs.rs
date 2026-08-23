@@ -7,7 +7,8 @@ use std::{
 use anyhow::{Context, bail};
 
 /// Resolve one writable, per-user state directory for both the terminal agent
-/// and WebTool. The selected workspace remains independent from this path.
+/// and the native desktop runtime. The selected workspace remains independent
+/// from this path.
 pub fn resolve_app_home(launch_dir: &Path) -> anyhow::Result<PathBuf> {
     let app_home = if let Some(explicit) = std::env::var_os("GNOMEF_RS_HOME") {
         PathBuf::from(explicit)

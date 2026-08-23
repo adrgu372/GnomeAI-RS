@@ -15,10 +15,10 @@ codex_tar_sha256="11239480f8e3efd1430f23bbe91c1a397856b8bbe6185ccbaee2382d25e03d
 codex_bin_sha256="a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14"
 
 if [[ "${GNOMEAI_SKIP_BUILD:-0}" != "1" ]]; then
-    cargo build --release --locked
+    cargo build --release --bins --locked
 fi
 
-for binary in gnomef-rs gnomef-web; do
+for binary in gnomef-rs gnomef-whatsapp gnomeai-desktop-a11y gnomeai-node gnomeai-hubctl; do
     if [[ ! -x "$binary_dir/$binary" ]]; then
         echo "Missing binary: $binary_dir/$binary" >&2
         exit 1
@@ -48,22 +48,27 @@ if [[ -d skills ]]; then
 fi
 
 install -m 0755 "$binary_dir/gnomef-rs" "$package_root/usr/lib/gnomeai-rs/gnomef-rs"
-install -m 0755 "$binary_dir/gnomef-web" "$package_root/usr/lib/gnomeai-rs/gnomef-web"
+install -m 0755 "$binary_dir/gnomef-whatsapp" \
+    "$package_root/usr/lib/gnomeai-rs/gnomef-whatsapp"
+install -m 0755 "$binary_dir/gnomeai-desktop-a11y" \
+    "$package_root/usr/lib/gnomeai-rs/gnomeai-desktop-a11y"
+install -m 0755 "$binary_dir/gnomeai-node" "$package_root/usr/bin/gnomeai-node"
+install -m 0755 "$binary_dir/gnomeai-hubctl" "$package_root/usr/bin/gnomeai-hubctl"
 if command -v strip >/dev/null 2>&1; then
-    strip --strip-unneeded \
-        "$package_root/usr/lib/gnomeai-rs/gnomef-rs" \
-        "$package_root/usr/lib/gnomeai-rs/gnomef-web"
+    strip --strip-unneeded "$package_root/usr/lib/gnomeai-rs/gnomef-rs"
+    strip --strip-unneeded "$package_root/usr/lib/gnomeai-rs/gnomef-whatsapp"
+    strip --strip-unneeded "$package_root/usr/lib/gnomeai-rs/gnomeai-desktop-a11y"
+    strip --strip-unneeded "$package_root/usr/bin/gnomeai-node"
+    strip --strip-unneeded "$package_root/usr/bin/gnomeai-hubctl"
 fi
 ln -s gnomef-rs "$package_root/usr/lib/gnomeai-rs/gnomef-agent"
 
 install -m 0755 packaging/debian/gnomef-rs "$package_root/usr/bin/gnomeai-rs"
 ln -s gnomeai-rs "$package_root/usr/bin/gnomef-rs"
 ln -s gnomeai-rs "$package_root/usr/bin/gnomef-agent"
-install -m 0755 packaging/debian/gnomef-web "$package_root/usr/bin/gnomef-web"
-install -m 0755 packaging/debian/gnomeai-webtool "$package_root/usr/bin/gnomeai-webtool"
 install -m 0755 scripts/gnomeai-firecrawl "$package_root/usr/bin/gnomeai-firecrawl"
+install -m 0755 scripts/gnomeai-desktop "$package_root/usr/bin/gnomeai-desktop"
 
-install -m 0644 index.html "$package_root/usr/share/gnomeai-rs/index.html"
 install -m 0644 config.example.json "$package_root/usr/share/gnomeai-rs/config.example.json"
 install -m 0644 whatsapp/bridge.mjs "$package_root/usr/share/gnomeai-rs/whatsapp/bridge.mjs"
 install -m 0644 whatsapp/package.json "$package_root/usr/share/gnomeai-rs/whatsapp/package.json"
@@ -134,12 +139,8 @@ fi
 
 install -m 0644 packaging/debian/gnomeai-rs-agent.desktop \
     "$package_root/usr/share/applications/gnomeai-rs-agent.desktop"
-install -m 0644 packaging/debian/gnomeai-rs-webtool.desktop \
-    "$package_root/usr/share/applications/gnomeai-rs-webtool.desktop"
 install -m 0644 packaging/icons/gnomeai-rs-agent.svg \
     "$package_root/usr/share/icons/hicolor/scalable/apps/gnomeai-rs-agent.svg"
-install -m 0644 packaging/icons/gnomeai-rs-webtool.svg \
-    "$package_root/usr/share/icons/hicolor/scalable/apps/gnomeai-rs-webtool.svg"
 
 install -m 0644 LICENSE "$package_root/usr/share/doc/gnomeai-rs/LICENSE"
 install -m 0644 README.md "$package_root/usr/share/doc/gnomeai-rs/README.md"
@@ -219,6 +220,7 @@ do
 done
 
 cp "$control_file" "$package_root/DEBIAN/control"
+install -m 0755 packaging/debian/postinst "$package_root/DEBIAN/postinst"
 installed_size="$(du -sk "$package_root/usr" | awk '{print $1}')"
 sed -i "s/^Installed-Size:.*/Installed-Size: $installed_size/" \
     "$package_root/DEBIAN/control"

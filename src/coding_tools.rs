@@ -17,7 +17,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::apply_patch;
 use crate::config::AppConfig;
+use crate::desktop;
 use crate::firecrawl::{firecrawl_fetch, firecrawl_search};
+use crate::node_protocol::QueueJobRequest;
+use crate::nodes;
 use crate::privilege::{PrivilegeBroker, command_requests_privilege};
 use crate::provider::ToolSpec;
 use crate::sandbox::{SandboxMode, SandboxPolicy, spawn_sandboxed_with_cancel};
@@ -60,9 +63,21 @@ pub fn build_system_prompt(root: &Path) -> String {
          command that genuinely needs root; never put `sudo` inside `shell`.\n\
          The interface collects authentication locally and the model never\n\
          receives or sees the password.\n\
+         For graphical tasks, use the `desktop` tool autonomously: observe the\n\
+         current screen, inspect the attached screenshot, perform one precise\n\
+         action, and inspect the returned screenshot before continuing. Never\n\
+         guess coordinates without a current capture.\n\
          In `read-only`, `web_search` and `web_fetch` are the only\n\
          network-capable tools; they work only while the user-visible Web\n\
-         Search switch is enabled.\n",
+         Search switch is enabled.\n\
+         Use `node` to list paired weak devices and to run work on one of\n\
+         them. Inspect the list before choosing a node. Remote root is a\n\
+         separate, centrally controlled permission and never follows ordinary\n\
+         full-access automatically.\n\
+         Use `learn_skill` only when the user explicitly asks to retain a\n\
+         reusable workflow. Learning stores instructions and an optional POSIX\n\
+         shell entrypoint; it never runs it. Use `run_skill` as a separate\n\
+         approved call when the user asks to execute one.\n",
     );
 
     for name in ["AGENTS.md", "CLAUDE.md", ".agentrc"] {
@@ -972,6 +987,325 @@ impl Tool for ReadSkillResourceTool {
     }
 }
 
+pub struct LearnSkillTool;
+
+#[async_trait::async_trait]
+impl Tool for LearnSkillTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::user_process(ToolSpec {
+            name: "learn_skill".into(),
+            description: "Create or update a persistent SKILL.md from a reusable workflow, but only when the user explicitly asks GnomeAI to learn or remember it. An optional script must be POSIX shell. This call stores the skill and never executes it.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Lowercase letters, digits and single hyphens"},
+                    "description": {"type": "string"},
+                    "instructions": {"type": "string"},
+                    "script": {"type": "string", "description": "Optional POSIX shell entrypoint"},
+                    "platforms": {"type": "array", "items": {"type": "string"}},
+                    "replace": {"type": "boolean", "default": false}
+                },
+                "required": ["name", "description", "instructions"],
+                "additionalProperties": false
+            }),
+        })
+    }
+
+    async fn call(&self, args: Value, _cancel: &CancellationToken) -> Result<ToolOutcome> {
+        let platforms = args["platforms"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let spec = skills::LearnedSkillSpec {
+            name: args["name"].as_str().unwrap_or_default().trim().into(),
+            description: args["description"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .into(),
+            instructions: args["instructions"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .into(),
+            script: args["script"].as_str().map(str::to_string),
+            platforms,
+            replace: args["replace"].as_bool().unwrap_or(false),
+        };
+        match tokio::task::spawn_blocking(move || skills::learn(spec)).await {
+            Ok(Ok(skill)) => Ok(ToolOutcome {
+                content: serde_json::to_string_pretty(&skill)?,
+                ok: true,
+                touched: Vec::new(),
+                patches: Vec::new(),
+            }),
+            Ok(Err(error)) => Ok(failed_outcome(&error.to_string())),
+            Err(error) => Ok(failed_outcome(&error.to_string())),
+        }
+    }
+}
+
+pub struct RunSkillTool {
+    pub workspace: PathBuf,
+    pub policy: SandboxPolicy,
+    pub config: Arc<RwLock<AppConfig>>,
+}
+
+#[async_trait::async_trait]
+impl Tool for RunSkillTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::user_process(ToolSpec {
+            name: "run_skill".into(),
+            description: "Run the declared POSIX-shell entrypoint of an installed skill, locally or on an exact paired node. This is separate from activation and always follows process approval. Remote root additionally follows the selected device policy.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "target": {"type": "string", "enum": ["local", "node"], "default": "local"},
+                    "node_id": {"type": "string"},
+                    "cwd": {"type": "string"},
+                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 3600},
+                    "root": {"type": "boolean", "default": false}
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        })
+    }
+
+    async fn call(&self, args: Value, cancel: &CancellationToken) -> Result<ToolOutcome> {
+        let name = args["name"].as_str().unwrap_or_default().trim();
+        let entrypoint = match skills::entrypoint(&self.workspace, name) {
+            Ok(entrypoint) => entrypoint,
+            Err(error) => return Ok(failed_outcome(&error.to_string())),
+        };
+        let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 3_600);
+        match args["target"].as_str().unwrap_or("local") {
+            "local" => {
+                if args["root"].as_bool().unwrap_or(false) {
+                    return Ok(failed_outcome(
+                        "local root is not implied by run_skill; use the dedicated sudo tool",
+                    ));
+                }
+                let mut policy = self.policy.clone();
+                policy.timeout_ms = timeout_secs * 1_000;
+                if let Some(cwd) = args["cwd"].as_str() {
+                    policy.cwd = PathBuf::from(cwd);
+                }
+                let output = spawn_sandboxed_with_cancel(
+                    &policy,
+                    "/bin/sh",
+                    &[entrypoint.path.to_string_lossy().into_owned()],
+                    cancel,
+                )
+                .await?;
+                let mut body = output.stdout;
+                if !output.stderr.is_empty() {
+                    body.push_str("\n--- stderr ---\n");
+                    body.push_str(&output.stderr);
+                }
+                let code = output.exit_code.unwrap_or(-1);
+                Ok(ToolOutcome {
+                    content: format!("{}: exit {code}\n\n{body}", entrypoint.relative),
+                    ok: code == 0 && !output.timed_out && !output.cancelled,
+                    touched: vec![policy.cwd],
+                    patches: Vec::new(),
+                })
+            }
+            "node" => {
+                let cfg = self.config.read().await.clone();
+                if !cfg.node_hub_enabled {
+                    return Ok(failed_outcome("remote nodes are disabled"));
+                }
+                let node_id = args["node_id"].as_str().unwrap_or_default().trim();
+                if node_id.is_empty() {
+                    return Ok(failed_outcome("node_id is required for target=node"));
+                }
+                let client = nodes::local_client(cfg.node_hub_port, &cfg.node_hub_admin_token);
+                match client
+                    .execute(
+                        node_id,
+                        &QueueJobRequest {
+                            action: "script".into(),
+                            command: String::new(),
+                            stdin: entrypoint.script,
+                            cwd: args["cwd"].as_str().map(str::to_string),
+                            timeout_secs,
+                            root: args["root"].as_bool().unwrap_or(false),
+                            root_approved: self.policy.mode == SandboxMode::Normal,
+                        },
+                    )
+                    .await
+                {
+                    Ok(value) => Ok(ToolOutcome {
+                        content: serde_json::to_string_pretty(&value)?,
+                        ok: value.get("ok").and_then(Value::as_bool).unwrap_or(true),
+                        touched: Vec::new(),
+                        patches: Vec::new(),
+                    }),
+                    Err(error) => Ok(failed_outcome(&error.to_string())),
+                }
+            }
+            other => Ok(failed_outcome(&format!("unknown skill target `{other}`"))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// graphical desktop
+// ---------------------------------------------------------------------------
+
+pub struct DesktopTool {
+    pub generated_dir: PathBuf,
+    pub enabled: bool,
+}
+
+#[async_trait::async_trait]
+impl Tool for DesktopTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::user_process(ToolSpec {
+            name: "desktop".into(),
+            description: "Navigate the graphical Linux desktop. Prefer semantic AT-SPI actions: inspect returns controls with opaque target IDs for the current UI, then activate/set_text/focus acts without pixel guessing and returns an updated semantic tree. Use observe and coordinate actions only for inaccessible/canvas UI. Desktop control is disabled in read-only mode and follows normal/full-access approval policy.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["inspect", "activate", "set_text", "focus", "observe", "click", "double_click", "move", "type", "key", "scroll", "focus_window"]
+                    },
+                    "query": {"type": "string", "description": "Optional semantic name/role/action filter"},
+                    "limit": {"type": "integer", "default": 140, "minimum": 1, "maximum": 400},
+                    "target": {"type": "string", "description": "Opaque a11y: target returned by inspect"},
+                    "action_name": {"type": "string", "description": "Optional accessible action; the default action is used when omitted"},
+                    "x": {"type": "integer"},
+                    "y": {"type": "integer"},
+                    "button": {"type": "integer", "default": 1},
+                    "text": {"type": "string"},
+                    "keys": {"type": "string", "description": "xdotool chord, e.g. ctrl+l, Return, alt+F4"},
+                    "amount": {"type": "integer", "description": "Positive scrolls down, negative scrolls up"},
+                    "window": {"type": "string", "description": "Window-title pattern"},
+                    "screenshot_after": {"type": "boolean", "default": true},
+                    "inspect_after": {"type": "boolean", "default": true},
+                    "after_query": {"type": "string"},
+                    "wait_ms": {"type": "integer", "description": "Default 120 ms for semantic actions and 350 ms for visual actions"}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        })
+    }
+
+    async fn call(&self, args: Value, cancel: &CancellationToken) -> Result<ToolOutcome> {
+        if !self.enabled {
+            return Ok(failed_outcome(
+                "desktop automation is disabled in read-only mode",
+            ));
+        }
+        let Some(args) = args.as_object() else {
+            return Ok(failed_outcome("desktop arguments must be an object"));
+        };
+        match desktop::perform(&self.generated_dir, args, cancel).await {
+            Ok(result) => Ok(ToolOutcome {
+                content: serde_json::to_string_pretty(&result)?,
+                ok: true,
+                touched: Vec::new(),
+                patches: Vec::new(),
+            }),
+            Err(error) => Ok(failed_outcome(&error.to_string())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// remote execution nodes
+// ---------------------------------------------------------------------------
+
+pub struct NodeTool {
+    pub config: Arc<RwLock<AppConfig>>,
+    pub mode: SandboxMode,
+}
+
+#[async_trait::async_trait]
+impl Tool for NodeTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::user_process(ToolSpec {
+            name: "node".into(),
+            description: "List paired lightweight GnomeAI devices or execute one shell command on a selected device. Nodes connect outbound and may use runit, OpenRC, s6, systemd, another supervisor, or no service manager. List first and use the exact node_id. Remote root also requires the per-device policy configured in the main app.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "exec"]},
+                    "node_id": {"type": "string"},
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string"},
+                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 3600},
+                    "root": {"type": "boolean", "default": false}
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        })
+    }
+
+    async fn call(&self, args: Value, _cancel: &CancellationToken) -> Result<ToolOutcome> {
+        let cfg = self.config.read().await.clone();
+        if !cfg.node_hub_enabled {
+            return Ok(failed_outcome(
+                "remote nodes are disabled; enable the Hub in Settings and restart GnomeAI",
+            ));
+        }
+        let client = nodes::local_client(cfg.node_hub_port, &cfg.node_hub_admin_token);
+        let action = args["action"].as_str().unwrap_or("list");
+        let result = match action {
+            "list" => client.list().await,
+            "exec" => {
+                let node_id = args["node_id"].as_str().unwrap_or_default().trim();
+                let command = args["command"].as_str().unwrap_or_default().trim();
+                if node_id.is_empty() || command.is_empty() {
+                    return Ok(failed_outcome("node_id and command are required for exec"));
+                }
+                client
+                    .execute(
+                        node_id,
+                        &QueueJobRequest {
+                            action: "shell".into(),
+                            command: command.into(),
+                            stdin: String::new(),
+                            cwd: args["cwd"].as_str().map(str::to_string),
+                            timeout_secs: args["timeout_secs"]
+                                .as_u64()
+                                .unwrap_or(60)
+                                .clamp(1, 3_600),
+                            root: args["root"].as_bool().unwrap_or(false),
+                            // In normal mode this call only starts after the
+                            // user approved this particular remote command.
+                            // Full access remains user-level and never implies
+                            // a one-shot root approval.
+                            root_approved: self.mode == SandboxMode::Normal,
+                        },
+                    )
+                    .await
+            }
+            other => return Ok(failed_outcome(&format!("unknown node action `{other}`"))),
+        };
+        match result {
+            Ok(value) => Ok(ToolOutcome {
+                content: serde_json::to_string_pretty(&value)?,
+                ok: value.get("ok").and_then(Value::as_bool).unwrap_or(true),
+                touched: Vec::new(),
+                patches: Vec::new(),
+            }),
+            Err(error) => Ok(failed_outcome(&error.to_string())),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
@@ -979,11 +1313,26 @@ impl Tool for ReadSkillResourceTool {
 pub fn register_all(
     registry: &mut Registry,
     root: &Path,
+    generated_dir: &Path,
     policy: SandboxPolicy,
     config: Arc<RwLock<AppConfig>>,
     output_store: Arc<ToolOutputStore>,
     privilege_broker: Arc<PrivilegeBroker>,
 ) {
+    registry.register(Arc::new(DesktopTool {
+        generated_dir: generated_dir.to_path_buf(),
+        enabled: policy.mode != SandboxMode::ReadOnly,
+    }));
+    registry.register(Arc::new(NodeTool {
+        config: config.clone(),
+        mode: policy.mode,
+    }));
+    registry.register(Arc::new(LearnSkillTool));
+    registry.register(Arc::new(RunSkillTool {
+        workspace: root.to_path_buf(),
+        policy: policy.clone(),
+        config: config.clone(),
+    }));
     registry.register(Arc::new(ListFilesTool {
         root: root.to_path_buf(),
     }));

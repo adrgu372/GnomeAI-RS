@@ -3,12 +3,17 @@ mod chat_logic;
 mod codex_app_server;
 mod config;
 mod consistency;
+mod desktop;
+#[cfg(target_os = "linux")]
+mod desktop_a11y;
 mod embeddings;
 mod firecrawl;
 mod generation;
 mod llama;
 mod memory;
 mod memory_engine;
+mod node_protocol;
+mod nodes;
 mod openrouter;
 mod privilege;
 mod protocol;
@@ -47,6 +52,7 @@ use std::{
 };
 
 use async_stream::stream;
+use anyhow::Context as _;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, Request, State},
@@ -57,7 +63,7 @@ use axum::{
     middleware,
     middleware::Next,
     response::{
-        Html, IntoResponse, Response,
+        IntoResponse, Response,
         sse::{Event, Sse},
     },
     routing::{get, post},
@@ -80,8 +86,10 @@ use crate::{
     llama::LlamaClient,
     memory_engine::{DreamHandle, MemoryEngine, spawn_dream_worker},
     protocol::Event as TurnEvent,
+    provider::{Delta as ProviderDelta, Message as ProviderMessage, Request as ProviderRequest},
     provider_catalog::{
-        AuthKind, PROVIDERS, ProviderSelection, ProviderSettingsStore, WireProtocol, preset,
+        AuthKind, PROVIDERS, ProviderSelection, ProviderSettingsStore, WireProtocol,
+        build_provider, preset,
     },
     questions::PendingQuestions,
     runtime::RuntimeHandles,
@@ -97,7 +105,7 @@ use crate::{
         transcribe_media, write_unique_private,
     },
     web_approvals::{ApprovalAnswerPayload, PendingApprovals},
-    whatsapp::{WhatsAppBridge, qr_svg, self_whatsapp_jid, send_whatsapp_message},
+    whatsapp::{WhatsAppBridge, qr_svg, self_whatsapp_jids, send_whatsapp_message},
     workspaces::{WorkspaceHistory, resolve_startup_workspace},
 };
 
@@ -188,7 +196,7 @@ async fn web_main() -> anyhow::Result<()> {
     let startup_trace = std::env::var_os("GNOMEF_STARTUP_TRACE").is_some();
     let trace_startup = |stage: &str| {
         if startup_trace {
-            eprintln!("gnomef-web startup: {stage}");
+            eprintln!("gnomef-whatsapp startup: {stage}");
         }
     };
     tracing_subscriber::fmt()
@@ -217,6 +225,10 @@ async fn web_main() -> anyhow::Result<()> {
     let memory = MemoryEngine::open(paths.as_ref())?;
     trace_startup("memory ready");
     let mut config = AppConfig::load(&paths.config_file)?;
+    // Persist a newly generated node enrollment token before the native GUI
+    // starts any companion process, so every process sees the same secret.
+    config.save(&paths.config_file)?;
+    apply_native_service_overrides(&mut config);
     let configured_api_token = std::env::var("GNOMEF_WEB_TOKEN")
         .ok()
         .filter(|token| token.len() >= 16);
@@ -240,7 +252,7 @@ async fn web_main() -> anyhow::Result<()> {
     if !bind_addr.ip().is_loopback() {
         if !allow_remote || !has_configured_api_token {
             anyhow::bail!(
-                "refusing to expose WebTool on non-loopback address {bind_addr}; \
+                "refusing to expose the native background service on non-loopback address {bind_addr}; \
                  set GNOMEF_ALLOW_REMOTE=1 and a GNOMEF_WEB_TOKEN of at least 16 characters"
             );
         }
@@ -271,6 +283,26 @@ async fn web_main() -> anyhow::Result<()> {
     };
     trace_startup("application state ready");
 
+    if state.config.read().await.node_hub_enabled {
+        let cfg = state.config.read().await.clone();
+        let bind: SocketAddr = format!("{}:{}", cfg.node_hub_bind, cfg.node_hub_port)
+            .parse()
+            .context("invalid node Hub bind address")?;
+        let hub = nodes::NodeHub::open(state.paths.store_dir.join("nodes.json"))?;
+        tokio::spawn(async move {
+            if let Err(error) = nodes::serve(
+                hub,
+                bind,
+                cfg.node_hub_token,
+                cfg.node_hub_admin_token,
+            )
+            .await
+            {
+                error!(%error, "GnomeAI node Hub stopped");
+            }
+        });
+    }
+
     {
         let cfg = state.config.read().await.clone();
         if cfg.whatsapp_enabled {
@@ -281,8 +313,8 @@ async fn web_main() -> anyhow::Result<()> {
         }
     }
 
-    // Poll the local bridge and publish only meaningful status changes. This
-    // lives in WebTool because the TUI and WebTool are separate processes.
+    // Poll the local bridge and publish only meaningful status changes for
+    // the native GUI and any authenticated local automation client.
     {
         let monitor_state = state.clone();
         tokio::spawn(async move {
@@ -304,7 +336,6 @@ async fn web_main() -> anyhow::Result<()> {
 
     let shutdown_state = state.clone();
     let app = Router::new()
-        .route("/", get(index))
         .route("/api/config", get(api_get_config).post(api_set_config))
         .route("/api/workspace", get(api_workspace).post(api_set_workspace))
         .route("/api/workspace/browse", get(api_browse_workspace))
@@ -369,6 +400,7 @@ async fn web_main() -> anyhow::Result<()> {
         .route("/api/whatsapp/events", get(api_whatsapp_events))
         .route("/api/whatsapp/start", post(api_whatsapp_start))
         .route("/api/whatsapp/stop", post(api_whatsapp_stop))
+        .route("/api/whatsapp/reload", post(api_whatsapp_reload))
         .route("/api/whatsapp/qr", get(api_whatsapp_qr))
         .route("/api/whatsapp/qr/refresh", post(api_whatsapp_qr_refresh))
         .route("/api/whatsapp/inbound", post(api_whatsapp_inbound))
@@ -381,7 +413,7 @@ async fn web_main() -> anyhow::Result<()> {
         .with_state(state);
     trace_startup("router ready");
 
-    info!("Gnomef Rust backend listening on http://{bind_addr}");
+    info!("GnomeAI native background service listening on http://{bind_addr}");
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     trace_startup("listener bound");
     axum::serve(listener, app)
@@ -393,39 +425,6 @@ async fn web_main() -> anyhow::Result<()> {
         })
         .await?;
     Ok(())
-}
-
-async fn index(State(state): State<AppState>) -> Result<Response, AppError> {
-    let mut html = if state.paths.index_file.exists() {
-        fs::read_to_string(&state.paths.index_file)?
-    } else {
-        "<h1>Gnomef Rust backend</h1><p>Place index.html next to the project or set GNOMEF_RS_HOME.</p>".into()
-    };
-    let bootstrap = format!(
-        "<script>window.__GNOMEF_TOKEN__={};</script>",
-        serde_json::to_string(state.api_token.as_ref())?
-    );
-    if let Some(position) = html.find("<head>") {
-        html.insert_str(position + "<head>".len(), &bootstrap);
-    } else {
-        html.insert_str(0, &bootstrap);
-    }
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "content-security-policy",
-        HeaderValue::from_static(
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; \
-             style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
-             connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
-        ),
-    );
-    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
-    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
-    headers.insert(
-        "x-content-type-options",
-        HeaderValue::from_static("nosniff"),
-    );
-    Ok((headers, Html(html)).into_response())
 }
 
 async fn protect_local_api(
@@ -447,28 +446,19 @@ async fn protect_local_api(
             .into_response();
     }
 
-    // On loopback, `/` bootstraps the per-process token into the local page.
-    // A remotely exposed root must already know the configured token; otherwise
-    // serving the bootstrap page would disclose the very credential meant to
-    // protect every API route.
-    if request.uri().path() != "/" || !loopback_host {
-        let supplied = request
-            .headers()
-            .get("x-gnomef-token")
-            .and_then(|value| value.to_str().ok())
-            .or_else(|| query_value(request.uri().query(), "token"));
-        if !supplied.is_some_and(|token| constant_time_eq(token, state.api_token.as_ref())) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"ok": false, "error": "missing or invalid WebTool token"})),
-            )
-                .into_response();
-        }
-        // Query tokens are necessary for EventSource and direct downloads,
-        // which cannot attach our custom header. Remove the secret before the
-        // trace layer and route extractors see the URI.
-        strip_query_key(&mut request, "token");
+    let supplied = request
+        .headers()
+        .get("x-gnomef-token")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| query_value(request.uri().query(), "token"));
+    if !supplied.is_some_and(|token| constant_time_eq(token, state.api_token.as_ref())) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"ok": false, "error": "missing or invalid native-service token"})),
+        )
+            .into_response();
     }
+    strip_query_key(&mut request, "token");
     next.run(request).await
 }
 
@@ -537,14 +527,57 @@ fn public_config_value(config: &AppConfig) -> Value {
 }
 
 async fn runtime_paths(state: &AppState) -> AppPaths {
-    let workspace = state.workspace.read().await.current.clone();
+    let workspace = refresh_workspace(state).await;
     let mut paths = state.paths.as_ref().clone();
     paths.workspace_dir = workspace;
     paths
 }
 
 async fn current_workspace(state: &AppState) -> PathBuf {
+    refresh_workspace(state).await
+}
+
+async fn refresh_workspace(state: &AppState) -> PathBuf {
+    let history = WorkspaceHistory::load(state.paths.store_dir.join("workspaces.json"));
+    if let Some(last) = history.last() {
+        let mut workspace = state.workspace.write().await;
+        workspace.current = last;
+        workspace.history = history;
+        return workspace.current.clone();
+    }
     state.workspace.read().await.current.clone()
+}
+
+async fn reload_native_config(state: &AppState) -> anyhow::Result<AppConfig> {
+    let mut config = AppConfig::load(&state.paths.config_file)?;
+    apply_native_service_overrides(&mut config);
+    config.web_api_token = state.api_token.to_string();
+    let providers = ProviderSettingsStore::new(state.paths.store_dir.join("providers.json"));
+    if let Some(selection) = providers.load()? {
+        apply_provider_selection(&selection, &mut config);
+    }
+    *state.config.write().await = config.clone();
+    Ok(config)
+}
+
+fn apply_native_service_overrides(config: &mut AppConfig) {
+    if std::env::var_os("GNOMEF_NATIVE_HELPER").is_none() {
+        return;
+    }
+    config.host = "127.0.0.1".into();
+    if let Some(port) = native_port_from_env("GNOMEF_NATIVE_API_PORT") {
+        config.port = port;
+    }
+    if let Some(port) = native_port_from_env("GNOMEF_NATIVE_BRIDGE_PORT") {
+        config.whatsapp_bridge_port = port;
+    }
+}
+
+fn native_port_from_env(name: &str) -> Option<u16> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
 }
 
 async fn api_workspace(State(state): State<AppState>) -> Json<Value> {
@@ -565,7 +598,7 @@ async fn api_set_workspace(
             StatusCode::FORBIDDEN,
             Json(json!({
                 "ok": false,
-                "error": "Workspace selection is available only on the local WebTool"
+                "error": "Workspace selection is available only in the local native app"
             })),
         )
             .into_response());
@@ -625,7 +658,7 @@ async fn api_browse_workspace(
             StatusCode::FORBIDDEN,
             Json(json!({
                 "ok": false,
-                "error": "Folder browsing is available only on the local WebTool"
+                "error": "Folder browsing is available only in the local native app"
             })),
         )
             .into_response());
@@ -776,7 +809,7 @@ async fn api_set_provider(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "ok": false,
-                "error": "Account login is available in the terminal agent. WebTool supports API providers."
+                "error": "Account login is available in the native app; this background service uses API providers."
             })),
         )
             .into_response());
@@ -1709,7 +1742,10 @@ async fn api_log(Json(payload): Json<Value>) -> Json<Value> {
 }
 
 async fn api_whatsapp_status(State(state): State<AppState>) -> Json<Value> {
-    let cfg = state.config.read().await.clone();
+    let cfg = match reload_native_config(&state).await {
+        Ok(config) => config,
+        Err(_) => state.config.read().await.clone(),
+    };
     Json(state.whatsapp.status(&cfg, &state.paths).await)
 }
 
@@ -1732,7 +1768,7 @@ async fn api_whatsapp_events(
 }
 
 async fn api_whatsapp_start(State(state): State<AppState>) -> Result<Response, AppError> {
-    let cfg = state.config.read().await.clone();
+    let cfg = reload_native_config(&state).await?;
     match state.whatsapp.start(&cfg, &state.paths, false).await {
         Ok(message) => Ok(Json(json!({"ok": true, "message": message})).into_response()),
         Err(err) => Ok((
@@ -1740,6 +1776,23 @@ async fn api_whatsapp_start(State(state): State<AppState>) -> Result<Response, A
             Json(json!({"ok": false, "error": err.to_string()})),
         )
             .into_response()),
+    }
+}
+
+async fn api_whatsapp_reload(State(state): State<AppState>) -> Result<Response, AppError> {
+    let cfg = reload_native_config(&state).await?;
+    if cfg.whatsapp_enabled {
+        match state.whatsapp.start(&cfg, &state.paths, true).await {
+            Ok(message) => Ok(Json(json!({"ok": true, "message": message})).into_response()),
+            Err(error) => Ok((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response()),
+        }
+    } else {
+        state.whatsapp.stop(&cfg).await;
+        Ok(Json(json!({"ok": true, "message": "stopped"})).into_response())
     }
 }
 
@@ -1789,6 +1842,7 @@ async fn api_whatsapp_inbound(
     State(state): State<AppState>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
+    let cfg = reload_native_config(&state).await?;
     let message_id = payload
         .get("id")
         .and_then(Value::as_str)
@@ -1808,9 +1862,13 @@ async fn api_whatsapp_inbound(
     if chat_jid.is_empty() {
         return Ok(Json(json!({"ok": false, "error": "chat_jid is required"})));
     }
-    let cfg = state.config.read().await.clone();
-    if !should_process_whatsapp_message(&cfg, &state.paths, &payload) {
-        return Ok(Json(json!({"ok": true, "skipped": true})));
+    let reply_jid = whatsapp_reply_jid(&payload, chat_jid);
+    if let Some(reason) = whatsapp_message_skip_reason(&cfg, &state.paths, &payload) {
+        return Ok(Json(json!({
+            "ok": true,
+            "skipped": true,
+            "reason": reason
+        })));
     }
 
     let cid = whatsapp_chat_id(chat_jid);
@@ -1836,7 +1894,7 @@ async fn api_whatsapp_inbound(
     if content.starts_with('/') {
         let reply = handle_whatsapp_command(&state, &cid, &content).await;
         if let Some(reply_text) = reply {
-            send_whatsapp_message(&cfg, chat_jid, &reply_text).await;
+            send_whatsapp_message(&cfg, reply_jid, &reply_text).await;
             return Ok(Json(json!({"ok": true, "command_handled": true})));
         }
     }
@@ -1946,7 +2004,7 @@ async fn api_whatsapp_inbound(
     if content.eq_ignore_ascii_case("/skills") {
         let workspace = current_workspace(&state).await;
         let reply = skills::render_catalog(&workspace);
-        send_whatsapp_message(&cfg, chat_jid, &reply).await;
+        send_whatsapp_message(&cfg, reply_jid, &reply).await;
         return Ok(Json(
             json!({"ok": true, "reply": reply, "command": "skills"}),
         ));
@@ -1985,12 +2043,12 @@ async fn api_whatsapp_inbound(
                 .unwrap_or_else(|error| format!("Nu pot inspecta skillul: {error}")),
             "install" | "update" | "remove" | "uninstall" => {
                 "Din motive de securitate, instalarea și ștergerea skillurilor se confirmă \
-                 local în Agent sau WebTool."
+                 local în aplicația GnomeAI-RS."
                     .into()
             }
             _ => "Folosește `/skills`, `/skill use NUME` sau `/skill inspect NUME`.".into(),
         };
-        send_whatsapp_message(&cfg, chat_jid, &reply).await;
+        send_whatsapp_message(&cfg, reply_jid, &reply).await;
         return Ok(Json(
             json!({"ok": true, "reply": reply, "command": "skill"}),
         ));
@@ -2005,30 +2063,34 @@ async fn api_whatsapp_inbound(
         extra,
     )?;
     let chat = load_chat(&state.paths, &cid)?;
-    let execution_paths = runtime_paths(&state).await;
-    let runtime_profile = RuntimeProfile::detect(&execution_paths);
     let (model, known_models) = resolve_model(&state.llama, &cfg, None).await;
-    let reply = generate_chat_response_with_uploads(
-        &state.llama,
-        &cfg,
-        &execution_paths,
-        Some(state.memory.clone()),
-        &runtime_profile,
-        &model,
-        &known_models,
-        &content,
-        &chat.messages,
-        Some(&cid),
-        &state.pending_questions,
-        &state.pending_approvals,
-        &state.runtime,
-        Some(state.config.clone()),
-        state.local_web,
-        // WhatsApp delivers one finished message; there is nothing to stream
-        // progress into and no browser connection to interrupt.
-        &TurnStream::detached(),
-    )
-    .await;
+    let reply = if account_provider_supports_whatsapp(&cfg) {
+        generate_account_whatsapp_response(&state, &cfg, &model, &chat).await
+    } else {
+        let execution_paths = runtime_paths(&state).await;
+        let runtime_profile = RuntimeProfile::detect(&execution_paths);
+        generate_chat_response_with_uploads(
+            &state.llama,
+            &cfg,
+            &execution_paths,
+            Some(state.memory.clone()),
+            &runtime_profile,
+            &model,
+            &known_models,
+            &content,
+            &chat.messages,
+            Some(&cid),
+            &state.pending_questions,
+            &state.pending_approvals,
+            &state.runtime,
+            Some(state.config.clone()),
+            state.local_web,
+            // WhatsApp delivers one finished message; there is nothing to stream
+            // progress into and no browser connection to interrupt.
+            &TurnStream::detached(),
+        )
+        .await
+    };
     append_msg(
         &state.paths,
         &cfg,
@@ -2046,9 +2108,94 @@ async fn api_whatsapp_inbound(
             .memory
             .update_recent_conversation(&updated_chat, &cfg)?;
     }
-    spawn_memory_refresh(state.clone(), updated_chat, model);
-    send_whatsapp_message(&cfg, chat_jid, &reply).await;
+    if !account_provider_supports_whatsapp(&cfg) {
+        spawn_memory_refresh(state.clone(), updated_chat, model);
+    }
+    send_whatsapp_message(&cfg, reply_jid, &reply).await;
     Ok(Json(json!({"ok": true})))
+}
+
+fn account_provider_supports_whatsapp(cfg: &AppConfig) -> bool {
+    matches!(cfg.provider_protocol.as_str(), "codex" | "claude-cli")
+}
+
+fn whatsapp_account_sandbox(cfg: &AppConfig) -> crate::sandbox::SandboxMode {
+    match cfg.web_sandbox_mode.as_str() {
+        "read-only" => crate::sandbox::SandboxMode::ReadOnly,
+        "full-access" => crate::sandbox::SandboxMode::FullAccess,
+        _ => crate::sandbox::SandboxMode::Normal,
+    }
+}
+
+fn whatsapp_provider_message(message: &storage::ChatMessage) -> ProviderMessage {
+    let content = message
+        .content
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| message.content.to_string());
+    match message.role.as_str() {
+        "system" => ProviderMessage::System { content },
+        "user" => ProviderMessage::User { content },
+        _ => ProviderMessage::Assistant {
+            content,
+            tool_calls: Vec::new(),
+        },
+    }
+}
+
+async fn generate_account_whatsapp_response(
+    state: &AppState,
+    cfg: &AppConfig,
+    model: &str,
+    chat: &storage::Chat,
+) -> String {
+    let workspace = state.workspace.read().await.current.clone();
+    let mut selection = match ProviderSelection::from_choice(&cfg.provider_id, None, None) {
+        Ok(selection) => selection,
+        Err(error) => return format!("[Eroare provider cont: {error}]"),
+    };
+    selection.model = model.to_string();
+    let provider = match build_provider(&selection, &workspace, whatsapp_account_sandbox(cfg)) {
+        Ok(provider) => provider,
+        Err(error) => return format!("[Eroare provider cont: {error}]"),
+    };
+
+    let mut messages = Vec::new();
+    let skill_catalog = skills::catalog_prompt(&workspace);
+    let memory_block = state.memory.agent_memory_block(cfg);
+    let host_context = memory::append_memory_block(&skill_catalog, Some(&memory_block));
+    if !host_context.trim().is_empty() {
+        messages.push(ProviderMessage::System {
+            content: host_context,
+        });
+    }
+    let start = chat.messages.len().saturating_sub(cfg.max_messages);
+    messages.extend(chat.messages[start..].iter().map(whatsapp_provider_message));
+
+    let request = ProviderRequest {
+        model: model.to_string(),
+        messages,
+        tools: Vec::new(),
+        max_tokens: cfg.llama_max_tokens,
+    };
+    let mut stream = match provider.stream(request).await {
+        Ok(stream) => stream,
+        Err(error) => return format!("[Eroare provider cont: {error}]"),
+    };
+    let mut reply = String::new();
+    while let Some(delta) = stream.next().await {
+        match delta {
+            Ok(ProviderDelta::Text(text)) => reply.push_str(&text),
+            Ok(ProviderDelta::Done { .. }) => break,
+            Ok(ProviderDelta::Reasoning(_) | ProviderDelta::ToolCall(_)) => {}
+            Err(error) => return format!("[Eroare provider cont: {error}]"),
+        }
+    }
+    if reply.trim().is_empty() {
+        "[Providerul contului a returnat un răspuns gol.]".to_string()
+    } else {
+        reply
+    }
 }
 
 fn whatsapp_chat_id(chat_jid: &str) -> String {
@@ -2065,6 +2212,22 @@ fn whatsapp_chat_id(chat_jid: &str) -> String {
         .trim_matches('_')
         .to_string();
     format!("wa_{}", if safe.is_empty() { "chat" } else { &safe })
+}
+
+fn whatsapp_reply_jid<'a>(payload: &'a Value, chat_jid: &'a str) -> &'a str {
+    ["reply_jid", "raw_chat_jid"]
+        .into_iter()
+        .filter_map(|key| payload.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|jid| {
+            !jid.is_empty()
+                && jid.len() <= 200
+                && !jid.chars().any(char::is_whitespace)
+                && ["@lid", "@s.whatsapp.net", "@g.us"]
+                    .iter()
+                    .any(|suffix| jid.ends_with(suffix))
+        })
+        .unwrap_or(chat_jid)
 }
 
 fn ensure_whatsapp_chat(
@@ -2091,7 +2254,57 @@ fn ensure_whatsapp_chat(
     save_chat(&state.paths, &chat)
 }
 
-fn should_process_whatsapp_message(cfg: &AppConfig, paths: &AppPaths, payload: &Value) -> bool {
+fn normalize_whatsapp_jid(jid: &str) -> String {
+    let jid = jid.trim().to_ascii_lowercase();
+    if jid.is_empty() {
+        return String::new();
+    }
+    if !jid.contains('@') {
+        let phone = jid.trim_start_matches('+');
+        return if phone.chars().all(|ch| ch.is_ascii_digit()) {
+            format!("{phone}@s.whatsapp.net")
+        } else {
+            jid
+        };
+    }
+    let Some((user, server)) = jid.split_once('@') else {
+        return jid;
+    };
+    let user = user.split(':').next().unwrap_or("").trim();
+    let server = server.trim();
+    if user.is_empty() || server.is_empty() {
+        String::new()
+    } else {
+        format!("{user}@{server}")
+    }
+}
+
+fn whatsapp_jid_candidates(payload: &Value) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for key in ["chat_jid", "raw_chat_jid"] {
+        if let Some(jid) = payload.get(key).and_then(Value::as_str) {
+            let jid = normalize_whatsapp_jid(jid);
+            if !jid.is_empty() && !candidates.contains(&jid) {
+                candidates.push(jid);
+            }
+        }
+    }
+    if let Some(aliases) = payload.get("chat_jid_aliases").and_then(Value::as_array) {
+        for alias in aliases.iter().filter_map(Value::as_str) {
+            let jid = normalize_whatsapp_jid(alias);
+            if !jid.is_empty() && !candidates.contains(&jid) {
+                candidates.push(jid);
+            }
+        }
+    }
+    candidates
+}
+
+fn whatsapp_message_skip_reason(
+    cfg: &AppConfig,
+    paths: &AppPaths,
+    payload: &Value,
+) -> Option<&'static str> {
     let content = payload
         .get("content")
         .and_then(Value::as_str)
@@ -2104,27 +2317,37 @@ fn should_process_whatsapp_message(cfg: &AppConfig, paths: &AppPaths, payload: &
         .trim();
     let has_media = payload.get("media").and_then(Value::as_object).is_some();
     if (content.is_empty() && !has_media) || chat_jid.is_empty() {
-        return false;
+        return Some("empty_message");
     }
     if payload
         .get("is_bot_message")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return false;
+        return Some("bot_message");
     }
 
+    let candidates = whatsapp_jid_candidates(payload);
     if !cfg.whatsapp_allowed_jids.is_empty() {
-        return cfg
+        let allowed = cfg
             .whatsapp_allowed_jids
             .iter()
-            .any(|allowed| allowed.trim() == chat_jid);
+            .map(|jid| normalize_whatsapp_jid(jid))
+            .any(|allowed| !allowed.is_empty() && candidates.contains(&allowed));
+        return (!allowed).then_some("jid_not_allowed");
     }
 
-    // Never trust identity fields supplied by the inbound payload. The only
-    // authoritative self JID is the credential state written by Baileys.
-    let own_jid = self_whatsapp_jid(paths);
-    !own_jid.is_empty() && own_jid == chat_jid
+    // The authoritative self identities are the PN and LID written by
+    // Baileys to the local credential state. Payload aliases are only used as
+    // candidates and must match one of those stored identities.
+    let own_jids = self_whatsapp_jids(paths);
+    let is_self_chat = own_jids.iter().any(|own| candidates.contains(own));
+    (!is_self_chat).then_some("not_self_chat")
+}
+
+#[cfg(test)]
+fn should_process_whatsapp_message(cfg: &AppConfig, paths: &AppPaths, payload: &Value) -> bool {
+    whatsapp_message_skip_reason(cfg, paths, payload).is_none()
 }
 
 fn compact_ws(text: &str) -> Option<String> {
@@ -2267,7 +2490,7 @@ async fn handle_whatsapp_command(state: &AppState, chat_id: &str, command: &str)
         "/workspace" => {
             let workspace = current_workspace(state).await;
             Some(format!(
-                "📁 Folderul comun WebTool + WhatsApp este:\n{}\n\nSchimbă-l din selectorul local WebTool.",
+                "📁 Folderul comun GnomeAI-RS + WhatsApp este:\n{}\n\nSchimbă-l din selectorul de workspace al aplicației.",
                 workspace.display()
             ))
         }
@@ -2491,6 +2714,134 @@ mod web_security_tests {
         assert!(seen.ids.len() <= WA_SEEN_LIMIT);
         assert!(seen.order.len() <= WA_SEEN_LIMIT);
         assert!(!seen.remember("first".into()));
+    }
+
+    #[test]
+    fn whatsapp_accepts_both_account_provider_protocols() {
+        let mut config = AppConfig::default();
+        config.provider_protocol = "codex".into();
+        assert!(account_provider_supports_whatsapp(&config));
+
+        config.provider_protocol = "claude-cli".into();
+        assert!(account_provider_supports_whatsapp(&config));
+
+        config.provider_protocol = "openai".into();
+        assert!(!account_provider_supports_whatsapp(&config));
+    }
+
+    #[test]
+    fn whatsapp_account_provider_uses_the_shared_sandbox_setting() {
+        let mut config = AppConfig::default();
+        config.web_sandbox_mode = "read-only".into();
+        assert_eq!(
+            whatsapp_account_sandbox(&config),
+            crate::sandbox::SandboxMode::ReadOnly
+        );
+        config.web_sandbox_mode = "full-access".into();
+        assert_eq!(
+            whatsapp_account_sandbox(&config),
+            crate::sandbox::SandboxMode::FullAccess
+        );
+    }
+
+    fn whatsapp_test_paths(name: &str) -> AppPaths {
+        let root = std::env::temp_dir().join(format!(
+            "gnomeai-whatsapp-{name}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        AppPaths::new(root).unwrap()
+    }
+
+    #[test]
+    fn whatsapp_self_chat_accepts_baileys_pn_and_lid_aliases() {
+        let paths = whatsapp_test_paths("self-aliases");
+        std::fs::write(
+            paths.whatsapp_auth_dir.join("creds.json"),
+            serde_json::to_vec(&json!({
+                "me": {
+                    "id": "40700111222:17@s.whatsapp.net",
+                    "lid": "123456789012345:0@lid"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let payload = json!({
+            "chat_jid": "123456789012345@lid",
+            "chat_jid_aliases": [
+                "123456789012345:0@lid",
+                "40700111222:17@s.whatsapp.net"
+            ],
+            "content": "/status",
+            "is_bot_message": false
+        });
+
+        assert!(should_process_whatsapp_message(
+            &AppConfig::default(),
+            &paths,
+            &payload
+        ));
+    }
+
+    #[test]
+    fn whatsapp_self_chat_rejects_an_unrelated_lid() {
+        let paths = whatsapp_test_paths("unrelated-lid");
+        std::fs::write(
+            paths.whatsapp_auth_dir.join("creds.json"),
+            serde_json::to_vec(&json!({
+                "me": {
+                    "id": "40700111222:17@s.whatsapp.net",
+                    "lid": "123456789012345:0@lid"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let payload = json!({
+            "chat_jid": "999999999999999@lid",
+            "chat_jid_aliases": ["40700999888@s.whatsapp.net"],
+            "content": "Salut",
+            "is_bot_message": false
+        });
+
+        assert_eq!(
+            whatsapp_message_skip_reason(&AppConfig::default(), &paths, &payload),
+            Some("not_self_chat")
+        );
+    }
+
+    #[test]
+    fn whatsapp_allowed_number_matches_remote_jid_alt() {
+        let paths = whatsapp_test_paths("allowed-alias");
+        let mut config = AppConfig::default();
+        config.whatsapp_allowed_jids = vec!["+40700111222".into()];
+        let payload = json!({
+            "chat_jid": "987654321012345@lid",
+            "chat_jid_aliases": ["40700111222:3@s.whatsapp.net"],
+            "content": "Salut",
+            "is_bot_message": false
+        });
+
+        assert!(should_process_whatsapp_message(&config, &paths, &payload));
+    }
+
+    #[test]
+    fn whatsapp_replies_through_the_original_lid_route() {
+        let payload = json!({
+            "chat_jid": "40700111222@s.whatsapp.net",
+            "raw_chat_jid": "123456789012345@lid",
+            "reply_jid": "123456789012345@lid"
+        });
+        assert_eq!(
+            whatsapp_reply_jid(&payload, "40700111222@s.whatsapp.net"),
+            "123456789012345@lid"
+        );
+
+        let invalid = json!({"reply_jid": "status@broadcast"});
+        assert_eq!(
+            whatsapp_reply_jid(&invalid, "40700111222@s.whatsapp.net"),
+            "40700111222@s.whatsapp.net"
+        );
     }
 
     #[test]

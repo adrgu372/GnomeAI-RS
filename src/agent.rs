@@ -73,6 +73,12 @@ pub struct Agent {
     always_allow: Arc<Mutex<Vec<String>>>,
 }
 
+#[derive(Default)]
+struct CompletedToolCall {
+    touched: Vec<PathBuf>,
+    desktop_screenshot: Option<PathBuf>,
+}
+
 impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -117,6 +123,7 @@ impl Agent {
 
     pub async fn run_turn(&self, user_text: String, cancel: CancellationToken) -> Result<()> {
         let started = Instant::now();
+        let visible_user_text = crate::provider::user_content_for_display(&user_text);
         let first_user_turn = !self
             .store
             .live_turns(&self.session_id)?
@@ -126,9 +133,15 @@ impl Agent {
             &self.session_id,
             "user",
             &user_text,
-            estimate(&crate::provider::user_content_for_display(&user_text)),
+            estimate(&visible_user_text),
             first_user_turn,
         )?;
+        if first_user_turn {
+            self.store.rename_session(
+                &self.session_id,
+                &automatic_session_title(&visible_user_text),
+            )?;
+        }
 
         let _ = self
             .events
@@ -275,6 +288,7 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> Result<Vec<PathBuf>> {
         let mut touched = Vec::new();
+        let mut desktop_screenshots = Vec::new();
 
         // Split by side effects. Reads fan out; writes stay in the order the
         // model asked for, because it is often editing the same file twice.
@@ -294,8 +308,11 @@ impl Agent {
             }));
         }
         for h in handles {
-            if let Ok(Ok(mut t)) = h.await {
-                touched.append(&mut t);
+            if let Ok(Ok(mut completed)) = h.await {
+                touched.append(&mut completed.touched);
+                if let Some(path) = completed.desktop_screenshot {
+                    desktop_screenshots.push(path);
+                }
             }
         }
 
@@ -303,7 +320,19 @@ impl Agent {
             if cancel.is_cancelled() {
                 break;
             }
-            touched.append(&mut self.run_one(call, turn_id, cancel).await?);
+            let mut completed = self.run_one(call, turn_id, cancel).await?;
+            touched.append(&mut completed.touched);
+            if let Some(path) = completed.desktop_screenshot {
+                desktop_screenshots.push(path);
+            }
+        }
+
+        // Every tool result must immediately follow the assistant's tool-call
+        // message. Attach visual feedback only after the whole batch has been
+        // recorded, otherwise a screenshot user turn could split parallel tool
+        // results and make the next provider request invalid.
+        for path in desktop_screenshots {
+            self.record_desktop_screenshot(&path)?;
         }
 
         Ok(touched)
@@ -314,7 +343,7 @@ impl Agent {
         call: ToolCall,
         turn_id: i64,
         cancel: &CancellationToken,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<CompletedToolCall> {
         let Some(tool) = self.registry.find(&call.name) else {
             self.record_result(
                 &call,
@@ -323,7 +352,7 @@ impl Agent {
                 false,
             )
             .await?;
-            return Ok(Vec::new());
+            return Ok(CompletedToolCall::default());
         };
 
         let summary = summarise(&call);
@@ -342,14 +371,14 @@ impl Agent {
             Err(e) => {
                 self.record_result(&call, turn_id, &format!("invalid arguments: {e}"), false)
                     .await?;
-                return Ok(Vec::new());
+                return Ok(CompletedToolCall::default());
             }
         };
 
         if !self.approved(&call, &tool, &summary).await? {
             self.record_result(&call, turn_id, "denied by the user", false)
                 .await?;
-            return Ok(Vec::new());
+            return Ok(CompletedToolCall::default());
         }
 
         let started = Instant::now();
@@ -409,7 +438,17 @@ impl Agent {
             });
         self.record_result(&call, turn_id, &presented, outcome.ok)
             .await?;
-        Ok(outcome.touched)
+        let desktop_screenshot = if outcome.ok && call.name.eq_ignore_ascii_case("desktop") {
+            serde_json::from_str::<Value>(&outcome.content)
+                .ok()
+                .and_then(|result| crate::desktop::screenshot_path(&result))
+        } else {
+            None
+        };
+        Ok(CompletedToolCall {
+            touched: outcome.touched,
+            desktop_screenshot,
+        })
     }
 
     async fn approved(&self, call: &ToolCall, tool: &Arc<dyn Tool>, summary: &str) -> Result<bool> {
@@ -517,6 +556,21 @@ impl Agent {
             false,
         )?;
         let _ = turn_id;
+        Ok(())
+    }
+
+    fn record_desktop_screenshot(&self, path: &std::path::Path) -> Result<()> {
+        let content = crate::desktop::screenshot_user_content(path)?;
+        let msg = Message::User {
+            content: content.clone(),
+        };
+        self.store.append_turn(
+            &self.session_id,
+            "user",
+            &serde_json::to_string(&msg)?,
+            estimate("desktop screenshot"),
+            false,
+        )?;
         Ok(())
     }
 
@@ -679,6 +733,36 @@ impl Agent {
     }
 }
 
+pub(crate) fn automatic_session_title(text: &str) -> String {
+    let compact = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("Conversație nouă")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = compact.chars();
+    let mut title = chars.by_ref().take(64).collect::<String>();
+    if chars.next().is_some() {
+        title.push('…');
+    }
+    title
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::automatic_session_title;
+
+    #[test]
+    fn first_user_line_becomes_a_compact_title() {
+        assert_eq!(
+            automatic_session_title("  Repară   bara providerului\nmai multe detalii"),
+            "Repară bara providerului"
+        );
+        assert!(automatic_session_title(&"ă".repeat(100)).ends_with('…'));
+    }
+}
+
 /// Good enough. Correct it from the provider's `usage` once the turn lands —
 /// wiring a real tokeniser is wasted effort when every local model ships a
 /// different one.
@@ -703,6 +787,15 @@ fn summarise(call: &ToolCall) -> String {
             v["handle"].as_str().unwrap_or("?")
         ),
         "search" => format!("search {:?}", v["pattern"].as_str().unwrap_or("?")),
+        "desktop" => match v["action"].as_str().unwrap_or("observe") {
+            "click" | "double_click" | "move" => format!(
+                "desktop {} at {},{}",
+                v["action"].as_str().unwrap_or("action"),
+                v["x"].as_i64().unwrap_or(-1),
+                v["y"].as_i64().unwrap_or(-1)
+            ),
+            action => format!("desktop {action}"),
+        },
         "activate_skill" => format!("activate skill {}", v["name"].as_str().unwrap_or("?")),
         "read_skill_resource" => format!(
             "read skill resource {}/{}",

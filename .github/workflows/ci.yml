@@ -20,6 +20,13 @@ jobs:
       - name: Install Rust (stable)
         run: rustup toolchain install stable --profile minimal && rustup default stable
 
+      - name: Install native GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
+            libgl1-mesa-dev libdbus-1-dev
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -40,37 +47,13 @@ jobs:
           mkdir -p "$HOME/.local/bin" "$HOME/.local/share/gnomeai-rs"
           install -m 0755 target/release/gnomef-rs "$HOME/.local/bin/"
           install -m 0755 target/release/gnomef-agent "$HOME/.local/bin/"
-          install -m 0755 target/release/gnomef-web "$HOME/.local/bin/"
-          install -m 0644 index.html "$HOME/.local/share/gnomeai-rs/index.html"
+          test -x target/release/gnomef-whatsapp
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Smoke run · terminal agent
+      - name: Smoke run · native agent CLI
         run: |
           gnomef-rs --help
           gnomef-agent --help
-
-      - name: Smoke run · web backend
-        run: |
-          export GNOMEF_RS_HOME="$RUNNER_TEMP/gnomeai-state"
-          export GNOMEF_RS_ASSETS="$HOME/.local/share/gnomeai-rs"
-          export GNOMEF_WEB_TOKEN="ci-local-webtool-token"
-          mkdir -p "$GNOMEF_RS_HOME"
-          gnomef-web &
-          WEB_PID=$!
-          for i in $(seq 1 30); do
-            if curl -fs -H "X-Gnomef-Token: $GNOMEF_WEB_TOKEN" \
-              http://127.0.0.1:8787/api/config > /dev/null; then
-              break
-            fi
-            sleep 1
-          done
-          curl -fs -H "X-Gnomef-Token: $GNOMEF_WEB_TOKEN" \
-            http://127.0.0.1:8787/api/config | head -c 400; echo
-          curl -fs http://127.0.0.1:8787/ | grep -qi "GnomeAI" || (echo "UI missing" && exit 1)
-          curl -fs -H "X-Gnomef-Token: $GNOMEF_WEB_TOKEN" -X POST \
-            http://127.0.0.1:8787/api/chats/new | grep -q '"id"'
-          kill "$WEB_PID"
-          wait "$WEB_PID" || true
 
   # Debian: container starts as root, so create and switch to a regular user —
   # the applications must build, install and run without any privileges.
@@ -84,7 +67,8 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential curl ca-certificates git pkg-config sudo
+            build-essential curl ca-certificates git pkg-config sudo \
+            libx11-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev libdbus-1-dev
           useradd -m -s /bin/bash builder
 
       - uses: actions/checkout@v4
@@ -104,24 +88,6 @@ jobs:
           cargo test --release --locked
           mkdir -p "$HOME/.local/bin" "$HOME/.local/share/gnomeai-rs"
           install -m 0755 target/release/gnomef-rs "$HOME/.local/bin/"
-          install -m 0755 target/release/gnomef-web "$HOME/.local/bin/"
-          install -m 0644 index.html "$HOME/.local/share/gnomeai-rs/index.html"
           export PATH="$HOME/.local/bin:$PATH"
           gnomef-rs --help
-          export GNOMEF_RS_HOME="$HOME/gnomeai-state"
-          export GNOMEF_RS_ASSETS="$HOME/.local/share/gnomeai-rs"
-          export GNOMEF_WEB_TOKEN="ci-local-webtool-token"
-          mkdir -p "$GNOMEF_RS_HOME"
-          gnomef-web &
-          WEB_PID=$!
-          for i in $(seq 1 30); do
-            curl -fs -H "X-Gnomef-Token: $GNOMEF_WEB_TOKEN" \
-              http://127.0.0.1:8787/api/config > /dev/null && break
-            sleep 1
-          done
-          curl -fs -H "X-Gnomef-Token: $GNOMEF_WEB_TOKEN" \
-            http://127.0.0.1:8787/api/config > /dev/null
-          curl -fs http://127.0.0.1:8787/ | grep -qi "GnomeAI"
-          kill "$WEB_PID"
-          wait "$WEB_PID" || true
           SCRIPT

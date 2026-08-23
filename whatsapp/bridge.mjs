@@ -35,9 +35,13 @@ let sock;
 let connected = false;
 let shuttingDown = false;
 let reconnectTimer = null;
+let outgoingRetryTimer = null;
 let flushing = false;
 const outgoingQueue = [];
 const lidToPhoneMap = {};
+const outboundMessageIds = new Set();
+const outboundMessageOrder = [];
+const maxRememberedOutboundMessages = 512;
 
 const state = {
   bridge_running: true,
@@ -45,6 +49,7 @@ const state = {
   authenticated: false,
   qr: '',
   own_jid: '',
+  own_lid: '',
   own_phone: '',
   assistant_name: assistantName,
   has_own_number: hasOwnNumber,
@@ -54,7 +59,18 @@ const state = {
 
 function clearOwnIdentity() {
   state.own_jid = '';
+  state.own_lid = '';
   state.own_phone = '';
+}
+
+function rememberOutboundMessage(message) {
+  const id = String(message?.key?.id || '').trim();
+  if (!id || outboundMessageIds.has(id)) return;
+  outboundMessageIds.add(id);
+  outboundMessageOrder.push(id);
+  while (outboundMessageOrder.length > maxRememberedOutboundMessages) {
+    outboundMessageIds.delete(outboundMessageOrder.shift());
+  }
 }
 
 function disconnectErrorText(error) {
@@ -140,12 +156,13 @@ async function translateJid(jid) {
 function updateOwnIdentity() {
   if (!sock?.user?.id) return;
   const phoneUser = sock.user.id.split(':')[0].split('@')[0];
-  const lidUser = sock.user.lid?.split(':')[0];
+  const lidUser = sock.user.lid?.split(':')[0].split('@')[0];
   if (lidUser && phoneUser) {
     lidToPhoneMap[lidUser] = `${phoneUser}@s.whatsapp.net`;
   }
   state.own_phone = phoneUser || '';
   state.own_jid = phoneUser ? `${phoneUser}@s.whatsapp.net` : '';
+  state.own_lid = lidUser ? `${lidUser}@lid` : '';
 }
 
 async function flushOutgoingQueue() {
@@ -153,13 +170,34 @@ async function flushOutgoingQueue() {
   flushing = true;
   try {
     while (outgoingQueue.length > 0) {
-      const item = outgoingQueue.shift();
-      state.queue_size = outgoingQueue.length;
-      await sock.sendMessage(item.jid, { text: item.text });
+      const item = outgoingQueue[0];
+      try {
+        const sent = await sock.sendMessage(item.jid, { text: item.text });
+        rememberOutboundMessage(sent);
+        outgoingQueue.shift();
+        state.queue_size = outgoingQueue.length;
+        state.last_error = '';
+      } catch (err) {
+        state.last_error = `send_failed:${err?.message || String(err)}`;
+        logger.warn({ err, jid: item.jid }, 'Queued WhatsApp send failed');
+        scheduleOutgoingRetry();
+        break;
+      }
     }
   } finally {
     flushing = false;
   }
+}
+
+function scheduleOutgoingRetry(delayMs = 5000) {
+  if (shuttingDown || outgoingRetryTimer) return;
+  outgoingRetryTimer = setTimeout(() => {
+    outgoingRetryTimer = null;
+    flushOutgoingQueue().catch((err) => {
+      logger.warn({ err }, 'Failed to retry queued WhatsApp messages');
+      scheduleOutgoingRetry();
+    });
+  }, delayMs);
 }
 
 async function sendMessage(jid, text) {
@@ -170,13 +208,17 @@ async function sendMessage(jid, text) {
     return { queued: true };
   }
   try {
-    await sock.sendMessage(jid, { text: outbound });
+    const sent = await sock.sendMessage(jid, { text: outbound });
+    rememberOutboundMessage(sent);
     state.queue_size = outgoingQueue.length;
+    state.last_error = '';
     return { queued: false };
   } catch (err) {
     outgoingQueue.push({ jid, text: outbound });
     state.queue_size = outgoingQueue.length;
+    state.last_error = `send_failed:${err?.message || String(err)}`;
     logger.warn({ err, jid }, 'WhatsApp send failed, message queued');
+    scheduleOutgoingRetry();
     return { queued: true };
   }
 }
@@ -196,6 +238,18 @@ async function forwardInbound(payload) {
       logger.warn(
         { status: resp.status, text: text.slice(0, 200) },
         'Inbound delivery failed',
+      );
+      return;
+    }
+    const result = await resp.json().catch(() => ({}));
+    if (result?.skipped) {
+      logger.warn(
+        {
+          reason: result.reason || 'unknown',
+          chat_jid: payload.chat_jid,
+          chat_jid_aliases: payload.chat_jid_aliases,
+        },
+        'Inbound WhatsApp message was ignored',
       );
     }
   } catch (err) {
@@ -406,7 +460,6 @@ async function connectInternal() {
       state.qr = '';
       state.last_error = '';
       updateOwnIdentity();
-      sock.sendPresenceUpdate('available').catch(() => {});
       flushOutgoingQueue().catch((err) => {
         logger.warn({ err }, 'Failed to flush queued WhatsApp messages');
       });
@@ -440,7 +493,9 @@ async function connectInternal() {
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    // History syncs can contain old messages and must never trigger new replies.
+    if (type && type !== 'notify') return;
     for (const msg of messages) {
       if (!msg.message) continue;
       const normalized = normalizeMessageContent(msg.message);
@@ -467,17 +522,37 @@ async function connectInternal() {
 
       if (!content && !media) continue;
 
-      const chatJid = await translateJid(rawJid);
-      const sender = msg.key.participant || msg.key.remoteJid || '';
+      const alternateJid = String(msg.key.remoteJidAlt || '').trim();
+      const translatedJid = await translateJid(rawJid);
+      const translatedAlternateJid = alternateJid
+        ? await translateJid(alternateJid)
+        : '';
+      const chatJid = [rawJid, alternateJid, translatedJid, translatedAlternateJid]
+        .find((jid) => jid?.endsWith('@s.whatsapp.net')) || translatedJid || rawJid;
+      const chatJidAliases = [
+        rawJid,
+        alternateJid,
+        translatedJid,
+        translatedAlternateJid,
+      ].filter((jid, index, all) => jid && all.indexOf(jid) === index);
+      const sender =
+        msg.key.participantAlt ||
+        msg.key.participant ||
+        msg.key.remoteJidAlt ||
+        msg.key.remoteJid ||
+        '';
       const senderName = msg.pushName || sender.split('@')[0] || 'WhatsApp';
       const fromMe = Boolean(msg.key.fromMe);
-      const isBotMessage = hasOwnNumber
-        ? fromMe
-        : content.startsWith(`${assistantName}:`);
+      const isBotMessage =
+        outboundMessageIds.has(String(msg.key.id || '')) ||
+        (!hasOwnNumber && content.startsWith(`${assistantName}:`));
 
       await forwardInbound({
         id: msg.key.id || '',
         chat_jid: chatJid,
+        chat_jid_aliases: chatJidAliases,
+        raw_chat_jid: rawJid,
+        reply_jid: rawJid,
         sender,
         sender_name: senderName,
         content,
@@ -487,6 +562,7 @@ async function connectInternal() {
         is_from_me: fromMe,
         is_bot_message: isBotMessage,
         own_jid: state.own_jid,
+        own_lid: state.own_lid,
         own_phone: state.own_phone,
         media,
       });
@@ -501,6 +577,10 @@ async function gracefulShutdown() {
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
+  }
+  if (outgoingRetryTimer) {
+    clearTimeout(outgoingRetryTimer);
+    outgoingRetryTimer = null;
   }
   try {
     sock?.end(undefined);

@@ -1,15 +1,17 @@
 # macOS installer and signing
 
 `scripts/build-macos-arm64.sh` creates a real flat installer package and a DMG
-that contains it. The package installs the following menu applications:
+that contains it. The package installs the following native application:
 
 - `/Applications/GnomeAI-RS.app`
-- `/Applications/GnomeAI-RS Agent.app`
-- `/Applications/GnomeAI-RS Web.app`
 
-It also installs `gnomef-rs`, `gnomef-agent`, and `gnomef-web` under
-`/usr/local/bin`. Runtime state belongs to the current user and is stored under
+It also installs the compatible `gnomef-rs` and `gnomef-agent` commands under
+`/usr/local/bin`. Both open the native graphical interface; no Terminal or
+browser window is used. Runtime state belongs to the current user and is stored under
 `~/Library/Application Support/GnomeAI-RS`.
+
+The bundle also contains the private `gnomef-whatsapp` loopback helper used by
+the native WhatsApp settings and QR dialog. It has no HTML interface.
 
 ## Local build
 
@@ -50,7 +52,7 @@ The workflow builds ad-hoc-signed artifacts when Apple credentials are absent,
 including for version tags. Such a release is published with a prominent
 Gatekeeper warning and first-open instructions. When all secrets are
 configured, artifacts are instead Developer ID signed and notarized. A tag
-must exactly match the Cargo package version, for example `v1.2.4`.
+must exactly match the Cargo package version, for example `v2.0.0`.
 
 Apple's requirements and command-line notarization workflow are documented in
 [Notarizing macOS software before distribution](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
