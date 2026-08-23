@@ -1706,7 +1706,7 @@ impl GuiApp {
                             self.send(Op::MemoryShow);
                             ui.close();
                         }
-                        if ui.button("Diagnosticss").clicked() {
+                        if ui.button("Diagnostics").clicked() {
                             self.send(Op::Doctor);
                             ui.close();
                         }
@@ -2299,7 +2299,7 @@ impl GuiApp {
                     if ui.button("Rollback patches").clicked() {
                         self.send(Op::Rollback);
                     }
-                    if ui.button("Diagnosticss").clicked() {
+                    if ui.button("Diagnostics").clicked() {
                         self.send(Op::Doctor);
                     }
                     if ui.button("Tokens").clicked() {
