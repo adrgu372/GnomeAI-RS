@@ -660,13 +660,9 @@ impl Agent {
 
     async fn compact_if_needed(&self) -> Result<()> {
         let context_budget = context_budget_for_model(&self.model);
-        let Some(plan) = self
-            .store
-            .plan_compaction(
-                &self.session_id,
-                context_budget,
-                RECENT_TURNS_TO_KEEP,
-            )?
+        let Some(plan) =
+            self.store
+                .plan_compaction(&self.session_id, context_budget, RECENT_TURNS_TO_KEEP)?
         else {
             return Ok(());
         };
