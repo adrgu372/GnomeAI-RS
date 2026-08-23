@@ -206,9 +206,10 @@ done
 component_pkg="$build_root/GnomeAI-RS-component.pkg"
 component_plist="$build_root/components.plist"
 pkgbuild --analyze --root "$payload_root" "$component_plist"
-for index in 0 1 2; do
-    plutil -replace "${index}.BundleIsRelocatable" -bool NO "$component_plist"
-done
+# Version 2.0 installs one native application bundle. The old package contained
+# three bundles and unconditionally addressed plist indexes 0, 1 and 2; modern
+# `plutil` aborts when an index is outside the generated array.
+plutil -replace "0.BundleIsRelocatable" -bool NO "$component_plist"
 pkgbuild \
     --root "$payload_root" \
     --component-plist "$component_plist" \
