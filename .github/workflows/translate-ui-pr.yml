@@ -29,9 +29,12 @@ jobs:
           Path('/tmp/translate_gui.py').write_text(code, encoding='utf-8')
           BOOT
           python3 /tmp/translate_gui.py
+          python3 scripts/fix-ui-translation.py
 
       - name: Format
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
 
       - name: Run GUI unit tests
         run: cargo test --locked gui::tests --no-fail-fast
