@@ -1,3 +1,34 @@
+# GnomeAI-RS 2.0.2 - 2026-08-23
+
+## English native interface
+
+- Translated the complete native `eframe`/`egui` interface to English,
+  including conversations, settings, provider and account login, model
+  selection, attachments, approvals, activity, WhatsApp and paired devices.
+- Kept Romanian natural-language workspace detection intact, so Romanian
+  requests that change the active project continue to work.
+- Preserved Unicode and Romanian-diacritic regression coverage while leaving
+  command names, provider IDs, protocol values and internal keys unchanged.
+
+## Persistent context compaction
+
+- Improved the SQLite-backed compactor used by the actual native `Agent`
+  instead of maintaining a second compaction path in the WhatsApp helper.
+- Automatic compaction now starts at 80% of the configured context window,
+  keeps the newest eight turns and preserves assistant/tool-result boundaries.
+- Added `GNOMEF_CONTEXT_WINDOW_TOKENS` for local and custom models, with a
+  128k-token fallback when no override is configured.
+- Compaction checkpoints now preserve decisions, file paths, key code, tool
+  results, open tasks and explicit user preferences in a structured format.
+- Checkpoints are persisted and reused, so older history is summarized once
+  instead of being sent through another compaction call on every later turn.
+  Long conversations can recursively compact earlier checkpoints without
+  deleting the original SQLite turns.
+- Compacted material is treated as untrusted data and credentials, tokens and
+  private keys are explicitly excluded from generated checkpoints.
+
+---
+
 # GnomeAI-RS 2.0.1 - 2026-08-23
 
 - Fixed OpenAI Account requests inheriting a custom provider such as
