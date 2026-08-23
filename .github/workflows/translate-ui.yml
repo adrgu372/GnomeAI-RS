@@ -1,0 +1,260 @@
+name: Translate native UI to English
+
+on:
+  push:
+    branches:
+      - agent/english-ui
+
+permissions:
+  contents: write
+
+jobs:
+  translate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/english-ui
+
+      - name: Translate user-facing GUI strings
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/gui.rs')
+          text = path.read_text(encoding='utf-8')
+
+          replacements = [
+              ('Nu pot porni serviciul WhatsApp {}: {error}', 'Cannot start WhatsApp service {}: {error}'),
+              ('Se actualizează permisiunea root…', 'Updating root permission…'),
+              ('Se aplică setările WhatsApp…', 'Applying WhatsApp settings…'),
+              ('Se generează un cod QR nou…', 'Generating a new QR code…'),
+              ('Completează JID-ul și mesajul de test.', 'Enter the JID and test message.'),
+              ('Se trimite mesajul…', 'Sending message…'),
+              ('Pagina OpenAI a fost deschisă; codul a fost copiat.', 'The OpenAI page was opened; the code was copied.'),
+              ('Autentificare finalizată; activez providerul…', 'Authentication complete; activating provider…'),
+              ('Autentificare eșuată: {error}', 'Authentication failed: {error}'),
+              ('Setările WhatsApp au fost aplicate.', 'WhatsApp settings were applied.'),
+              ('Mesajul a fost pus în coada WhatsApp.', 'The message was queued for WhatsApp.'),
+              ('Mesajul WhatsApp a fost trimis.', 'The WhatsApp message was sent.'),
+              ('Permisiunea root a fost actualizată.', 'Root permission was updated.'),
+              ('Setările au fost salvate. Repornește GnomeAI pentru a aplica listenerul.', 'Settings were saved. Restart GnomeAI to apply the listener.'),
+              ('Folosește /resume ID sau fereastra Sessions.', 'Use /resume ID or the Sessions window.'),
+              ('Folosește /skill use|inspect|install|update|verify|remove ARG.', 'Use /skill use|inspect|install|update|verify|remove ARG.'),
+              ('Ultimul răspuns al asistentului a fost copiat.', 'The last assistant reply was copied.'),
+              ('Nu există încă un răspuns de copiat.', 'There is no assistant reply to copy yet.'),
+              ('Mouse-ul este activ permanent în interfața grafică.', 'Mouse input is always enabled in the graphical interface.'),
+              ('Instalează SKILL.md', 'Install SKILL.md'),
+              ('Selectează un fișier numit exact SKILL.md.', 'Select a file named exactly SKILL.md.'),
+              ('SKILL.md nu are un director părinte valid.', 'SKILL.md does not have a valid parent directory.'),
+              ('Atașează un fișier', 'Attach a file'),
+              ('Fișiere acceptate', 'Supported files'),
+              ('Documente', 'Documents'),
+              ('Cod și text', 'Code and text'),
+              ('Imagini', 'Images'),
+              ('Fișierul tras nu oferă o cale locală; folosește butonul + pentru a-l selecta.', 'The dropped file does not provide a local path; use the + button to select it.'),
+              ('Pornesc autentificarea în browser…', 'Starting authentication in your browser…'),
+              ('Conversație fără titlu', 'Untitled conversation'),
+              ('Alege proiectul', 'Choose project'),
+              ('Conversație nouă', 'New conversation'),
+              ('CONVERSAȚII', 'CONVERSATIONS'),
+              ('Conversațiile recente vor apărea aici.', 'Recent conversations will appear here.'),
+              ('Toate conversațiile', 'All conversations'),
+              ('Setări', 'Settings'),
+              ('Lucru în {name}', 'Working in {name}'),
+              ('Lucrează · {elapsed:.1}s', 'Working · {elapsed:.1}s'),
+              ('Nucleu oprit', 'Core stopped'),
+              ('Pregătit', 'Ready'),
+              ('Modificări', 'Changes'),
+              ('Arată activitatea și diff-urile', 'Show activity and diffs'),
+              ('{} în așteptare', '{} queued'),
+              ('Schimbă modelul', 'Change model'),
+              ('Închide', 'Close'),
+              ('Actualizează diff', 'Refresh diff'),
+              ('Acțiuni', 'Actions'),
+              ('Memorie', 'Memory'),
+              ('Diagnostic', 'Diagnostics'),
+              ('FIȘIERE', 'FILES'),
+              ('Există modificări în sesiune.', 'There are changes in this session.'),
+              ('PREVIZUALIZARE DIFF', 'DIFF PREVIEW'),
+              ('Nu există încă modificări în această sesiune.', 'There are no changes in this session yet.'),
+              ('ACTIVITATE', 'ACTIVITY'),
+              ('Comenzile și verificările vor apărea aici.', 'Commands and verification results will appear here.'),
+              ('Cu ce lucrăm astăzi?', 'What are we working on today?'),
+              ('Cere o modificare, atașează o imagine sau alege o acțiune rapidă.', 'Ask for a change, attach an image, or choose a quick action.'),
+              ('Analizează proiectul curent', 'Analyze the current project'),
+              ('Structură, probleme și îmbunătățiri', 'Structure, issues, and improvements'),
+              ('Analizează proiectul curent și spune-mi ce ar trebui îmbunătățit.', 'Analyze the current project and tell me what should be improved.'),
+              ('Arată modificările Git', 'Show Git changes'),
+              ('Fișiere schimbate și diff', 'Changed files and diff'),
+              ('Configurează WhatsApp', 'Configure WhatsApp'),
+              ('Conectare, QR și numere permise', 'Connection, QR, and allowed numbers'),
+              ('Fișier · {}', 'File · {}'),
+              ('Elimină', 'Remove'),
+              ('Întreabă GnomeAI…', 'Ask GnomeAI…'),
+              ('Atașează un fișier', 'Attach a file'),
+              ('web activ', 'web on'),
+              ('web oprit', 'web off'),
+              ('Oprește', 'Stop'),
+              ('Trimite (Enter)', 'Send (Enter)'),
+              ('Enter trimite · Shift+Enter adaugă un rând', 'Enter sends · Shift+Enter adds a new line'),
+              ('Conectare OpenAI Codex', 'Connect OpenAI Codex'),
+              ('Pagina de autentificare a fost deschisă în browser.', 'The sign-in page was opened in your browser.'),
+              ('Introdu acest cod unic:', 'Enter this one-time code:'),
+              ('Browserul nu a putut fi deschis automat: {error}', 'The browser could not be opened automatically: {error}'),
+              ('Copiază codul', 'Copy code'),
+              ('Deschide browserul', 'Open browser'),
+              ('Aștept confirmarea OpenAI…', 'Waiting for OpenAI confirmation…'),
+              ('MODEL ȘI CONEXIUNI', 'MODEL AND CONNECTIONS'),
+              ('Schimbă providerul', 'Change provider'),
+              ('Schimbă modelul', 'Change model'),
+              ('Dispozitive', 'Devices'),
+              ('EXECUȚIE', 'EXECUTION'),
+              ('Căutare web', 'Web search'),
+              ('Doar citire', 'Read only'),
+              ('Acces complet', 'Full access'),
+              ('Hub pentru dispozitive slabe', 'Hub for lightweight devices'),
+              ('Adresă', 'Address'),
+              ('Salvează Hub', 'Save Hub'),
+              ('Administrează dispozitivele', 'Manage devices'),
+              ('Modificarea listenerului se aplică după repornirea aplicației.', 'Listener changes take effect after restarting the application.'),
+              ('INTERFAȚĂ', 'INTERFACE'),
+              ('Notificări desktop', 'Desktop notifications'),
+              ('Contrast ridicat', 'High contrast'),
+              ('Caută în conversația curentă', 'Search the current conversation'),
+              ('Caută…', 'Search…'),
+              ('INSTRUMENTE', 'TOOLS'),
+              ('Compactează contextul', 'Compact context'),
+              ('Anulează patch-urile', 'Rollback patches'),
+              ('Tokeni', 'Tokens'),
+              ('{} tokeni intrare · {} tokeni ieșire', '{} input tokens · {} output tokens'),
+              ('Sesiunea este memorată de aplicația oficială și se reutilizează cât timp rămâne validă.', 'The session is stored by the official application and reused while it remains valid.'),
+              ('Activează contul', 'Activate account'),
+              ('Lasă gol pentru cheia memorată', 'Leave blank to reuse the saved key'),
+              ('Cheia nouă este salvată privat; câmpul gol reutilizează cheia existentă.', 'A new key is stored privately; leaving the field blank reuses the existing key.'),
+              ('Serviciu', 'Service'),
+              ('Autentificat', 'Authenticated'),
+              ('Conectat', 'Connected'),
+              ('Număr: +{own_phone}', 'Number: +{own_phone}'),
+              ('Activează integrarea WhatsApp', 'Enable WhatsApp integration'),
+              ('Numele afișat al asistentului', 'Assistant display name'),
+              ('Asistentul folosește un număr WhatsApp dedicat', 'The assistant uses a dedicated WhatsApp number'),
+              ('Conversații permise (JID-uri, câte unul pe rând)', 'Allowed conversations (JIDs, one per line)'),
+              ('Dacă lista rămâne goală, sunt acceptate numai mesajele către propriul cont.', 'If the list is empty, only messages to the account itself are accepted.'),
+              ('Salvează și aplică', 'Save and apply'),
+              ('Repornește bridge-ul', 'Restart bridge'),
+              ('Cod QR nou', 'New QR code'),
+              ('Scanează codul QR din WhatsApp', 'Scan the QR code in WhatsApp'),
+              ('Trimite un mesaj de test', 'Send a test message'),
+              ('JID destinatar', 'Recipient JID'),
+              ('Mesaj', 'Message'),
+              ('Trimite pe WhatsApp', 'Send on WhatsApp'),
+              ('Jurnal recent', 'Recent log'),
+              ('Jurnalul este gol.', 'The log is empty.'),
+              ('Se salvează setările…', 'Saving settings…'),
+              ('Hub-ul este oprit. Activează-l în Setări și repornește aplicația.', 'The Hub is disabled. Enable it in Settings and restart the application.'),
+              ('Reîmprospătează', 'Refresh'),
+              ('CONECTEAZĂ UN CLIENT', 'CONNECT A CLIENT'),
+              ('Instalează pachetul minimal pe dispozitiv, apoi rulează una dintre comenzile de mai jos. Înlocuiește IP-PC și NUME.', 'Install the minimal package on the device, then run one of the commands below. Replace PC-IP and NAME.'),
+              ('Copiază comanda normală', 'Copy normal command'),
+              ('Copiază cu root local', 'Copy with local root'),
+              ('Clientul rulează în foreground: manual sau cu runit, OpenRC, s6 ori alt supervisor. Nu depinde de systemd.', 'The client runs in the foreground: manually or with runit, OpenRC, s6, or another supervisor. It does not depend on systemd.'),
+              ('Exemplu runit', 'runit example'),
+              ('Folosește o rețea de încredere/VPN (de exemplu Tailscale); nu expune portul HTTP direct pe internet.', 'Use a trusted network/VPN (for example Tailscale); do not expose the HTTP port directly to the internet.'),
+              ('DISPOZITIVE ASOCIATE', 'PAIRED DEVICES'),
+              ('Niciun dispozitiv asociat încă.', 'No devices paired yet.'),
+              ('Blocat', 'Blocked'),
+              ('Sesiune', 'Session'),
+              ('Permis mereu', 'Always allowed'),
+              ('Întreabă', 'Ask'),
+              ('Root local disponibil', 'Local root available'),
+              ('Root local indisponibil', 'Local root unavailable'),
+              ('Politică root', 'Root policy'),
+              ('Întreabă la fiecare comandă', 'Ask for every command'),
+              ('Permis în sesiunea Hub', 'Allowed for the Hub session'),
+              ('Comanda a fost copiată.', 'The command was copied.'),
+              ('Codul QR nu poate fi afișat.', 'The QR code cannot be displayed.'),
+              ('Nu pot determina executabilul curent: {error}', 'Cannot determine the current executable: {error}'),
+              ('Lipsește serviciul WhatsApp: {}. Rulează `cargo build --bins` sau reinstalează pachetul.', 'WhatsApp service is missing: {}. Run `cargo build --bins` or reinstall the package.'),
+              ('Serviciul WhatsApp nu răspunde: {error}', 'WhatsApp service is not responding: {error}'),
+              ('Răspuns WhatsApp invalid: {error}', 'Invalid WhatsApp response: {error}'),
+              ('Operația WhatsApp a eșuat.', 'The WhatsApp operation failed.'),
+              ('"TU"', '"YOU"'),
+              ('Procesare', 'Reasoning'),
+              ('Se așteaptă rezultatul…', 'Waiting for the result…'),
+              ('Modificări în patch · {} fișiere', 'Patch changes · {} files'),
+              ('Nu pot citi {}: {error}', 'Cannot read {}: {error}'),
+              ('Analizează imaginea atașată „{name}”.', 'Analyze the attached image “{name}”.'),
+              ('Nu pot pregăti imaginea: {error}', 'Cannot prepare the image: {error}'),
+              ('Nu pot citi {name}: {error:#}', 'Cannot read {name}: {error:#}'),
+              ('Nu am găsit text lizibil în {name}.', 'No readable text was found in {name}.'),
+              ('Analizează fișierul atașat „{name}”.', 'Analyze the attached file “{name}”.'),
+              ('adresa de autentificare nu este HTTP/HTTPS', 'the authentication address is not HTTP/HTTPS'),
+              ('deschiderea automată a browserului nu este disponibilă pe acest sistem', 'automatic browser opening is not available on this system'),
+          ]
+
+          missing = []
+          for old, new in replacements:
+              if old not in text:
+                  # Duplicates in the replacement list are allowed after an earlier replacement.
+                  if not any(prev_old == old for prev_old, _ in replacements[:replacements.index((old, new))]):
+                      missing.append(old)
+                  continue
+              text = text.replace(old, new)
+
+          # These Romanian phrases are intentionally retained in the parser/tests so
+          # users can still change workspaces using natural Romanian instructions.
+          intentional = [
+              'director', 'proiect', 'schimb', 'mută', 'muta', 'seteaz',
+              'proiectul meu este', 'proiectul meu e', 'folderul meu este',
+              'folderul meu e', 'directorul meu este', 'directorul meu e',
+              'workspace-ul este', 'workspace-ul e', 'Vreau să schimb folderul',
+              'Citește /tmp/README.md', 'explică acest cod', 'salut',
+              'Conversație nouă', 'ăîâșț foarte lung',
+          ]
+
+          # Targeted fixes that must not alter Romanian natural-language parsing.
+          text = text.replace('unwrap_or("proiect")\n                        .to_string()', 'unwrap_or("project")\n                        .to_string()')
+          text = text.replace('format!(\n            "gnomeai-node enroll --server http://IP-PC:{} --token {} --name NUME",', 'format!(\n            "gnomeai-node enroll --server http://PC-IP:{} --token {} --name NAME",')
+
+          path.write_text(text, encoding='utf-8')
+
+          if missing:
+              print('Warning: replacement source strings not found:')
+              for item in missing:
+                  print(' -', item)
+
+          # Fail on Romanian UI phrases that should have disappeared. Natural-language
+          # parser/test strings listed above are intentionally not part of this check.
+          forbidden = [
+              'Se aplică setările', 'Conversațiile recente', 'Toate conversațiile',
+              'Cu ce lucrăm', 'Atașează un fișier', 'Căutare web', 'Notificări desktop',
+              'Activează integrarea', 'Scanează codul', 'CONECTEAZĂ UN CLIENT',
+              'DISPOZITIVE ASOCIATE', 'Politică root', 'Se așteaptă rezultatul',
+              'Modificări în patch', 'Nu pot porni serviciul WhatsApp',
+          ]
+          leftovers = [item for item in forbidden if item in text]
+          if leftovers:
+              raise SystemExit('Untranslated GUI strings remain: ' + ', '.join(leftovers))
+          PY
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Run GUI unit tests
+        run: cargo test --locked gui::tests --no-fail-fast
+
+      - name: Commit translation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/gui.rs
+          if git diff --cached --quiet; then
+            echo "No translation changes to commit"
+            exit 0
+          fi
+          git commit -m "Translate native GUI to English"
+          git push origin HEAD:agent/english-ui
