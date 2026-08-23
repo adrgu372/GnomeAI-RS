@@ -642,8 +642,11 @@ async fn handle_idle_op(
                         port,
                     })
                     .await;
-                notice(events, "Node Hub settings saved; restart GnomeAI to apply the listener")
-                    .await;
+                notice(
+                    events,
+                    "Node Hub settings saved; restart GnomeAI to apply the listener",
+                )
+                .await;
             }
         },
         Op::ListSessions => {

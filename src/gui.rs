@@ -2243,10 +2243,7 @@ impl GuiApp {
                     .corner_radius(9.0)
                     .inner_margin(10.0)
                     .show(ui, |ui| {
-                        ui.checkbox(
-                            &mut self.node_enabled,
-                            "Hub pentru dispozitive slabe",
-                        );
+                        ui.checkbox(&mut self.node_enabled, "Hub pentru dispozitive slabe");
                         ui.horizontal(|ui| {
                             ui.label("Adresă");
                             ui.add(
@@ -2255,10 +2252,7 @@ impl GuiApp {
                                     .desired_width(120.0),
                             );
                             ui.label("Port");
-                            ui.add(
-                                egui::DragValue::new(&mut self.node_port)
-                                    .range(1..=u16::MAX),
-                            );
+                            ui.add(egui::DragValue::new(&mut self.node_port).range(1..=u16::MAX));
                         });
                         ui.horizontal_wrapped(|ui| {
                             save_node_hub = ui.small_button("Salvează Hub").clicked();

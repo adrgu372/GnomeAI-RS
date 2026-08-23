@@ -132,7 +132,11 @@ impl NodeHub {
                     node.last_seen_unix = unix_now();
                     node.root_policy
                 };
-                if let Some(job) = state.queues.entry(node_id.to_string()).or_default().pop_front()
+                if let Some(job) = state
+                    .queues
+                    .entry(node_id.to_string())
+                    .or_default()
+                    .pop_front()
                 {
                     return Ok(NodePollResponse {
                         job: Some(job),
@@ -369,10 +373,7 @@ async fn set_policy(
     AxumPath(node_id): AxumPath<String>,
     Json(request): Json<SetRootPolicyRequest>,
 ) -> Result<Json<Value>, NodeApiError> {
-    state
-        .hub
-        .set_root_policy(&node_id, request.policy)
-        .await?;
+    state.hub.set_root_policy(&node_id, request.policy).await?;
     Ok(Json(json!({"ok": true, "root_policy": request.policy})))
 }
 

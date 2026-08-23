@@ -306,20 +306,21 @@ pub fn learn(spec: LearnedSkillSpec) -> Result<SkillSummary> {
         bail!("learned skill text contains a NUL byte")
     }
     if spec.platforms.len() > 32
-        || spec
-            .platforms
-            .iter()
-            .any(|item| {
-                item.chars().count() > 64
-                    || item.is_empty()
-                    || !item.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-                    })
-            })
+        || spec.platforms.iter().any(|item| {
+            item.chars().count() > 64
+                || item.is_empty()
+                || !item
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
     {
         bail!("learned skill platforms are invalid")
     }
-    let script = spec.script.as_deref().map(str::trim).filter(|body| !body.is_empty());
+    let script = spec
+        .script
+        .as_deref()
+        .map(str::trim)
+        .filter(|body| !body.is_empty());
     if script.is_some_and(|body| body.len() > 512 * 1024 || body.contains('\0')) {
         bail!("learned skill script exceeds 512 KiB or contains a NUL byte")
     }
@@ -332,11 +333,7 @@ pub fn learn(spec: LearnedSkillSpec) -> Result<SkillSummary> {
             spec.name
         )
     }
-    let staging = managed.join(format!(
-        ".learn-{}-{}",
-        spec.name,
-        Uuid::new_v4().simple()
-    ));
+    let staging = managed.join(format!(".learn-{}-{}", spec.name, Uuid::new_v4().simple()));
     fs::create_dir(&staging)?;
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
 
@@ -350,16 +347,13 @@ pub fn learn(spec: LearnedSkillSpec) -> Result<SkillSummary> {
             .filter(|item| !item.is_empty())
             .collect::<Vec<_>>()
             .join(", ");
-        let mut markdown = format!(
-            "---\nname: {name}\ndescription: {description}\ngnomeai-learned: true\n"
-        );
+        let mut markdown =
+            format!("---\nname: {name}\ndescription: {description}\ngnomeai-learned: true\n");
         if !platforms.is_empty() {
             markdown.push_str(&format!("platforms: [{}]\n", platforms));
         }
         if script.is_some() {
-            markdown.push_str(
-                "allowed-tools: [Bash, Node]\nentrypoint: scripts/run.sh\n",
-            );
+            markdown.push_str("allowed-tools: [Bash, Node]\nentrypoint: scripts/run.sh\n");
         }
         markdown.push_str("---\n\n");
         markdown.push_str(instructions);
@@ -387,11 +381,7 @@ pub fn learn(spec: LearnedSkillSpec) -> Result<SkillSummary> {
         load_skill_dir(&staging, "source")?;
 
         if destination.exists() {
-            let backup = managed.join(format!(
-                ".backup-{}-{}",
-                spec.name,
-                Uuid::new_v4().simple()
-            ));
+            let backup = managed.join(format!(".backup-{}-{}", spec.name, Uuid::new_v4().simple()));
             fs::rename(&destination, &backup)?;
             if let Err(error) = fs::rename(&staging, &destination) {
                 let _ = fs::rename(&backup, &destination);

@@ -64,7 +64,9 @@ fn node_client(config: &AppConfig) -> Result<nodes::NodeClient> {
 }
 
 fn learn(args: &[String]) -> Result<serde_json::Value> {
-    let path = args.first().context("usage: gnomeai-hubctl learn SPEC.json")?;
+    let path = args
+        .first()
+        .context("usage: gnomeai-hubctl learn SPEC.json")?;
     let input: LearnFile = serde_json::from_slice(
         &std::fs::read(path).with_context(|| format!("cannot read learning spec `{path}`"))?,
     )?;
@@ -84,9 +86,9 @@ async fn run_skill(
     workspace: &std::path::Path,
     args: &[String],
 ) -> Result<serde_json::Value> {
-    let name = args.first().context(
-        "usage: gnomeai-hubctl run-skill NAME [--node ID] [--cwd PATH] [--root]",
-    )?;
+    let name = args
+        .first()
+        .context("usage: gnomeai-hubctl run-skill NAME [--node ID] [--cwd PATH] [--root]")?;
     let entrypoint = skills::entrypoint(workspace, name)?;
     let timeout_secs = flag(args, "--timeout")
         .and_then(|value| value.parse().ok())

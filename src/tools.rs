@@ -1061,7 +1061,10 @@ async fn execute_tool_call(
                 pending_approvals,
                 &tool_ctx.approval_scope,
                 "Learn",
-                &format!("learn skill {}", value_string(args, "name").unwrap_or_default()),
+                &format!(
+                    "learn skill {}",
+                    value_string(args, "name").unwrap_or_default()
+                ),
                 "The agent will create or replace a persistent user-managed skill.",
                 paths,
             )
@@ -1069,16 +1072,7 @@ async fn execute_tool_call(
             tool_learn(args).await
         }
         "RunSkill" => {
-            tool_run_skill(
-                cfg,
-                paths,
-                args,
-                runtime,
-                tool_ctx,
-                pending_approvals,
-                turn,
-            )
-            .await
+            tool_run_skill(cfg, paths, args, runtime, tool_ctx, pending_approvals, turn).await
         }
         "StructuredOutput" => Ok(json!({"structured_output": args})),
         "TodoWrite" => tasks::todo_write(

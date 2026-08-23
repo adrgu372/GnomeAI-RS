@@ -5,7 +5,9 @@
 mod node_protocol;
 
 use anyhow::{Context, Result, bail};
-use node_protocol::{NODE_PROTOCOL_VERSION, NodeHello, NodeJob, NodePoll, NodePollResponse, NodeResult};
+use node_protocol::{
+    NODE_PROTOCOL_VERSION, NodeHello, NodeJob, NodePoll, NodePollResponse, NodeResult,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -301,14 +303,12 @@ fn save_config(config: &NodeConfig) -> Result<()> {
 
 fn load_config() -> Result<NodeConfig> {
     let path = config_path()?;
-    let mut config: NodeConfig = serde_json::from_slice(
-        &fs::read(&path).with_context(|| {
-            format!(
-                "node is not enrolled; run `gnomeai-node enroll --server URL --token TOKEN` ({})",
-                path.display()
-            )
-        })?,
-    )?;
+    let mut config: NodeConfig = serde_json::from_slice(&fs::read(&path).with_context(|| {
+        format!(
+            "node is not enrolled; run `gnomeai-node enroll --server URL --token TOKEN` ({})",
+            path.display()
+        )
+    })?)?;
     normalize_config(&mut config)?;
     Ok(config)
 }
@@ -394,9 +394,10 @@ fn command_exists(name: &str) -> bool {
         return false;
     };
     std::env::split_paths(&path).any(|directory| {
-        directory.join(name).metadata().is_ok_and(|metadata| {
-            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-        })
+        directory
+            .join(name)
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
     })
 }
 

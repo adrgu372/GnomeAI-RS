@@ -28,12 +28,23 @@ jobs:
           version="$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "gnomef-rs") | .version')"
           tag="v${version}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "${tag} already exists; leaving it unchanged."
-            exit 0
-          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+              echo "${tag} already belongs to a published release; leaving it unchanged."
+              exit 0
+            fi
+            git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+            if [[ "$(git rev-list -n 1 "$tag")" == "$GITHUB_SHA" ]]; then
+              echo "${tag} already points at this validated release commit."
+              exit 0
+            fi
+            echo "${tag} is not published yet; moving it to the corrected release commit."
+            git tag -f -a "$tag" -m "GnomeAI-RS ${tag}" "$GITHUB_SHA"
+            git push --force origin "refs/tags/${tag}"
+            exit 0
+          fi
           git tag -a "$tag" -m "GnomeAI-RS ${tag}"
           git push origin "$tag"
 
@@ -215,7 +226,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu file dpkg-dev jq
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross file dpkg-dev jq
           rustup target add aarch64-unknown-linux-gnu
           cargo install cross --locked
       - name: Build amd64, arm64, musl and XBPS node packages

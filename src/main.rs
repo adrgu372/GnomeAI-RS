@@ -51,8 +51,8 @@ use std::{
     sync::Arc,
 };
 
-use async_stream::stream;
 use anyhow::Context as _;
+use async_stream::stream;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, Request, State},
@@ -290,13 +290,8 @@ async fn web_main() -> anyhow::Result<()> {
             .context("invalid node Hub bind address")?;
         let hub = nodes::NodeHub::open(state.paths.store_dir.join("nodes.json"))?;
         tokio::spawn(async move {
-            if let Err(error) = nodes::serve(
-                hub,
-                bind,
-                cfg.node_hub_token,
-                cfg.node_hub_admin_token,
-            )
-            .await
+            if let Err(error) =
+                nodes::serve(hub, bind, cfg.node_hub_token, cfg.node_hub_admin_token).await
             {
                 error!(%error, "GnomeAI node Hub stopped");
             }
