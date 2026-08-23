@@ -28,6 +28,17 @@ use crate::sandbox::SandboxMode;
 pub const UPSTREAM_VERSION: &str = "0.145.0";
 pub const UPSTREAM_COMMIT: &str = "25af12f7e61572b0bc18ddb1008be543b91519b0";
 
+// GnomeAI's account-backed provider must remain independent from provider
+// routing in the user's normal Codex config.  In particular, a user may keep
+// `model_provider = "openrouter"` in ~/.codex/config.toml for the Codex CLI;
+// inheriting it here would make an authenticated ChatGPT request incorrectly
+// require OPENROUTER_API_KEY.  CLI overrides have the highest precedence while
+// CODEX_HOME still points at the persistent Codex-owned account state.
+const ACCOUNT_CONFIG_OVERRIDES: &[&str] = &[
+    r#"model_provider="openai""#,
+    r#"forced_login_method="chatgpt""#,
+];
+
 pub struct CodexAppServer {
     name: String,
     workspace: PathBuf,
@@ -429,11 +440,8 @@ impl AppServerSession {
         let executable = codex_executable();
         let codex_home = prepare_codex_home()?;
         let mut command = Command::new(&executable);
-        if !is_standalone_app_server(&executable) {
-            command.arg("app-server");
-        }
+        command.args(app_server_arguments(is_standalone_app_server(&executable)));
         let mut child = command
-            .args(["--listen", "stdio://"])
             .env("CODEX_HOME", codex_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -850,6 +858,18 @@ fn is_standalone_app_server(executable: &Path) -> bool {
         .is_some_and(|name| name == "codex-app-server")
 }
 
+fn app_server_arguments(standalone: bool) -> Vec<&'static str> {
+    let mut arguments = Vec::with_capacity(ACCOUNT_CONFIG_OVERRIDES.len() * 2 + 3);
+    for value in ACCOUNT_CONFIG_OVERRIDES {
+        arguments.extend(["--config", *value]);
+    }
+    if !standalone {
+        arguments.push("app-server");
+    }
+    arguments.extend(["--listen", "stdio://"]);
+    arguments
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,6 +892,30 @@ mod tests {
             "/opt/gnomeai/codex-app-server"
         )));
         assert!(!is_standalone_app_server(Path::new("/opt/gnomeai/codex")));
+    }
+
+    #[test]
+    fn account_app_server_ignores_custom_provider_routing() {
+        let expected_overrides = [
+            "--config",
+            r#"model_provider="openai""#,
+            "--config",
+            r#"forced_login_method="chatgpt""#,
+        ];
+
+        let standalone = app_server_arguments(true);
+        assert_eq!(&standalone[..4], &expected_overrides);
+        assert_eq!(&standalone[4..], &["--listen", "stdio://"]);
+
+        let full_cli = app_server_arguments(false);
+        assert_eq!(&full_cli[..4], &expected_overrides);
+        assert_eq!(&full_cli[4..], &["app-server", "--listen", "stdio://"]);
+        assert!(
+            full_cli
+                .iter()
+                .all(|argument| !argument.contains("openrouter")),
+            "the ChatGPT account adapter must never select OpenRouter"
+        );
     }
 
     #[test]

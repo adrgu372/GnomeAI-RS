@@ -1,3 +1,15 @@
+# GnomeAI-RS 2.0.1 - 2026-08-23
+
+- Fixed OpenAI Account requests inheriting a custom provider such as
+  OpenRouter from `~/.codex/config.toml` and incorrectly asking for
+  `OPENROUTER_API_KEY`. The embedded Codex app-server now explicitly selects
+  the built-in OpenAI provider and ChatGPT authentication while continuing to
+  reuse the persistent account session in `CODEX_HOME`.
+- Added regression coverage for both supported sidecar layouts: the complete
+  `codex app-server` CLI and the standalone `codex-app-server` executable.
+
+---
+
 # GnomeAI-RS 2.0.0 - 2026-08-23
 
 GnomeAI-RS 2.0 replaces the terminal/browser-first product with a polished
