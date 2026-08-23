@@ -1706,7 +1706,7 @@ impl GuiApp {
                             self.send(Op::MemoryShow);
                             ui.close();
                         }
-                        if ui.button("Diagnostics").clicked() {
+                        if ui.button("Diagnosticss").clicked() {
                             self.send(Op::Doctor);
                             ui.close();
                         }
@@ -2299,7 +2299,7 @@ impl GuiApp {
                     if ui.button("Rollback patches").clicked() {
                         self.send(Op::Rollback);
                     }
-                    if ui.button("Diagnostics").clicked() {
+                    if ui.button("Diagnosticss").clicked() {
                         self.send(Op::Doctor);
                     }
                     if ui.button("Tokens").clicked() {
@@ -3537,7 +3537,7 @@ fn session_row(
         painter.text(
             egui::pos2(rect.left() + 11.0, rect.bottom() - 16.0),
             egui::Align2::LEFT_CENTER,
-            "Ștergi?",
+            "Delete?",
             FontId::new(11.5, FontFamily::Proportional),
             Color32::from_rgb(222, 150, 159),
         );
@@ -3573,14 +3573,14 @@ fn session_row(
         painter.text(
             delete_rect.center(),
             egui::Align2::CENTER_CENTER,
-            "Șterge",
+            "Delete",
             FontId::new(11.0, FontFamily::Proportional),
             Color32::WHITE,
         );
         painter.text(
             cancel_rect.center(),
             egui::Align2::CENTER_CENTER,
-            "Anulează",
+            "Cancel",
             FontId::new(11.0, FontFamily::Proportional),
             Color32::from_rgb(222, 211, 214),
         );
