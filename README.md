@@ -5,7 +5,7 @@ application keeps the proven agent core and `Op`/`Event` protocol of the former
 terminal interface while replacing the TUI and browser page with one native
 window.
 
-Current package version: **2.0.1**. See [CHANGELOG.md](CHANGELOG.md) for the
+Current package version: **2.0.2**. See [CHANGELOG.md](CHANGELOG.md) for the
 historical release notes.
 
 ## What changed in 2.0
