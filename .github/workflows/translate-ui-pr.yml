@@ -1,0 +1,50 @@
+name: Apply English UI translation
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  translate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/english-ui
+
+      - name: Extract and run one-shot translation script
+        shell: bash
+        run: |
+          python3 - <<'BOOT'
+          from pathlib import Path
+          source = Path('.github/workflows/translate-ui.yml').read_text(encoding='utf-8').splitlines()
+          start = next(i for i, line in enumerate(source) if "python3 - <<'PY'" in line) + 1
+          end = next(i for i in range(start, len(source)) if source[i].strip() == 'PY')
+          code = '\n'.join(line[10:] if line.startswith('          ') else line for line in source[start:end]) + '\n'
+          Path('/tmp/translate_gui.py').write_text(code, encoding='utf-8')
+          BOOT
+          python3 /tmp/translate_gui.py
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Run GUI unit tests
+        run: cargo test --locked gui::tests --no-fail-fast
+
+      - name: Commit translation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/gui.rs
+          if git diff --cached --quiet; then
+            echo "No translation changes to commit"
+            exit 0
+          fi
+          git commit -m "Translate native GUI to English"
+          git push origin HEAD:agent/english-ui
