@@ -227,7 +227,7 @@ impl WhatsAppService {
                 Ok(child) => service.child = Some(child),
                 Err(error) => {
                     service.launch_error = Some(format!(
-                        "Nu pot porni serviciul WhatsApp {}: {error}",
+                        "Cannot start WhatsApp service {}: {error}",
                         executable.display()
                     ));
                 }
@@ -545,7 +545,7 @@ impl GuiApp {
     }
 
     fn set_node_policy(&mut self, node_id: String, policy: String) {
-        self.node_feedback = Some("Se actualizează permisiunea root…".into());
+        self.node_feedback = Some("Updating root permission…".into());
         let sender = self.node_tx.clone();
         let url = format!("{}/v1/nodes/{node_id}/policy", self.node_api_base);
         let token = self.node_admin_token.clone();
@@ -562,7 +562,7 @@ impl GuiApp {
     }
 
     fn reload_whatsapp_service(&mut self) {
-        self.whatsapp_feedback = Some("Se aplică setările WhatsApp…".into());
+        self.whatsapp_feedback = Some("Applying WhatsApp settings…".into());
         let sender = self.whatsapp_tx.clone();
         let url = format!("{}/api/whatsapp/reload", self.whatsapp_service.api_base);
         let token = self.whatsapp_service.token.clone();
@@ -578,7 +578,7 @@ impl GuiApp {
     }
 
     fn refresh_whatsapp_qr(&mut self) {
-        self.whatsapp_feedback = Some("Se generează un cod QR nou…".into());
+        self.whatsapp_feedback = Some("Generating a new QR code…".into());
         let sender = self.whatsapp_tx.clone();
         let url = format!("{}/api/whatsapp/qr/refresh", self.whatsapp_service.api_base);
         let token = self.whatsapp_service.token.clone();
@@ -597,10 +597,10 @@ impl GuiApp {
         let jid = self.whatsapp_test_jid.trim().to_string();
         let message = self.whatsapp_test_message.trim().to_string();
         if jid.is_empty() || message.is_empty() {
-            self.whatsapp_feedback = Some("Completează JID-ul și mesajul de test.".into());
+            self.whatsapp_feedback = Some("Enter the JID and test message.".into());
             return;
         }
-        self.whatsapp_feedback = Some("Se trimite mesajul…".into());
+        self.whatsapp_feedback = Some("Sending message…".into());
         let sender = self.whatsapp_tx.clone();
         let url = format!("{}/send", self.whatsapp_service.bridge_base);
         let token = self.whatsapp_service.token.clone();
@@ -629,7 +629,7 @@ impl GuiApp {
                     let browser_error = open_external_url(&verification_url).err();
                     self.copy_request = Some(user_code.clone());
                     self.login_status =
-                        Some("Pagina OpenAI a fost deschisă; codul a fost copiat.".into());
+                        Some("The OpenAI page was opened; the code was copied.".into());
                     self.device_login = Some(DeviceLoginDialog {
                         verification_url,
                         user_code,
@@ -643,7 +643,7 @@ impl GuiApp {
                     Ok(()) => {
                         self.device_login = None;
                         self.login_status =
-                            Some("Autentificare finalizată; activez providerul…".into());
+                            Some("Authentication complete; activating provider…".into());
                         self.send(Op::SetProvider {
                             provider_id,
                             api_key: None,
@@ -651,7 +651,7 @@ impl GuiApp {
                         });
                     }
                     Err(error) => {
-                        self.login_status = Some(format!("Autentificare eșuată: {error}"));
+                        self.login_status = Some(format!("Authentication failed: {error}"));
                         self.blocks.push(Block::Error(error));
                     }
                 },
@@ -672,7 +672,7 @@ impl GuiApp {
                         value
                             .get("message")
                             .and_then(Value::as_str)
-                            .unwrap_or("Setările WhatsApp au fost aplicate.")
+                            .unwrap_or("WhatsApp settings were applied.")
                             .to_string(),
                     );
                     self.poll_whatsapp(true);
@@ -687,9 +687,9 @@ impl GuiApp {
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     self.whatsapp_feedback = Some(if queued {
-                        "Mesajul a fost pus în coada WhatsApp.".into()
+                        "The message was queued for WhatsApp.".into()
                     } else {
-                        "Mesajul WhatsApp a fost trimis.".into()
+                        "The WhatsApp message was sent.".into()
                     });
                     self.whatsapp_test_message.clear();
                 }
@@ -705,7 +705,7 @@ impl GuiApp {
                 }
                 NodeReply::List(Err(error)) => self.node_feedback = Some(error),
                 NodeReply::Policy(Ok(_)) => {
-                    self.node_feedback = Some("Permisiunea root a fost actualizată.".into());
+                    self.node_feedback = Some("Root permission was updated.".into());
                     self.poll_nodes(true);
                 }
                 NodeReply::Policy(Err(error)) => self.node_feedback = Some(error),
@@ -804,10 +804,8 @@ impl GuiApp {
                 self.node_bind = bind;
                 self.node_port = port;
                 self.node_api_base = format!("http://127.0.0.1:{port}");
-                self.node_feedback = Some(
-                    "Setările au fost salvate. Repornește GnomeAI pentru a aplica listenerul."
-                        .into(),
-                );
+                self.node_feedback =
+                    Some("Settings were saved. Restart GnomeAI to apply the listener.".into());
             }
             Event::TurnStarted { .. } => {
                 self.busy = true;
@@ -1022,9 +1020,9 @@ impl GuiApp {
             "/help" | "/?" | "/commands" => self.show_help = true,
             "/new" => self.send(Op::NewSession),
             "/sessions" => self.send(Op::ListSessions),
-            "/resume" => self.blocks.push(Block::Note(
-                "Folosește /resume ID sau fereastra Sessions.".into(),
-            )),
+            "/resume" => self
+                .blocks
+                .push(Block::Note("Use /resume ID or the Sessions window.".into())),
             "/fork" => self.send(Op::ForkSession),
             "/compact" => self.send(Op::Compact),
             "/rollback" => self.send(Op::Rollback),
@@ -1047,7 +1045,7 @@ impl GuiApp {
             )),
             "/skills" => self.send(Op::SkillsList),
             "/skill" => self.blocks.push(Block::Note(
-                "Folosește /skill use|inspect|install|update|verify|remove ARG.".into(),
+                "Use /skill use|inspect|install|update|verify|remove ARG.".into(),
             )),
             "/memory" => self.send(Op::MemoryShow),
             "/copy" => {
@@ -1056,18 +1054,18 @@ impl GuiApp {
                     _ => None,
                 }) {
                     self.copy_request = Some(text);
-                    self.blocks.push(Block::Note(
-                        "Ultimul răspuns al asistentului a fost copiat.".into(),
-                    ));
-                } else {
                     self.blocks
-                        .push(Block::Note("Nu există încă un răspuns de copiat.".into()));
+                        .push(Block::Note("The last assistant reply was copied.".into()));
+                } else {
+                    self.blocks.push(Block::Note(
+                        "There is no assistant reply to copy yet.".into(),
+                    ));
                 }
             }
             "/contrast" => self.high_contrast = !self.high_contrast,
             "/notify" => self.notifications = !self.notifications,
             "/mouse" => self.blocks.push(Block::Note(
-                "Mouse-ul este activ permanent în interfața grafică.".into(),
+                "Mouse input is always enabled in the graphical interface.".into(),
             )),
             "/tokens" => self.show_token_usage(),
             "/doctor" => self.send(Op::Doctor),
@@ -1199,7 +1197,7 @@ impl GuiApp {
 
     fn choose_skill_file(&mut self) {
         let mut dialog = rfd::FileDialog::new()
-            .set_title("Instalează SKILL.md")
+            .set_title("Install SKILL.md")
             .add_filter("Agent Skill", &["md"]);
         if self.workspace.is_dir() {
             dialog = dialog.set_directory(&self.workspace);
@@ -1208,14 +1206,13 @@ impl GuiApp {
             return;
         };
         if path.file_name().and_then(|name| name.to_str()) != Some("SKILL.md") {
-            self.blocks.push(Block::Error(
-                "Selectează un fișier numit exact SKILL.md.".into(),
-            ));
+            self.blocks
+                .push(Block::Error("Select a file named exactly SKILL.md.".into()));
             return;
         }
         let Some(directory) = path.parent() else {
             self.blocks.push(Block::Error(
-                "SKILL.md nu are un director părinte valid.".into(),
+                "SKILL.md does not have a valid parent directory.".into(),
             ));
             return;
         };
@@ -1230,11 +1227,11 @@ impl GuiApp {
         supported.extend_from_slice(OOXML_EXTS);
         supported.extend_from_slice(TEXT_EXTS);
         let mut dialog = rfd::FileDialog::new()
-            .set_title("Atașează un fișier")
-            .add_filter("Fișiere acceptate", &supported)
-            .add_filter("Documente", &["pdf", "docx", "xlsx", "pptx"])
-            .add_filter("Cod și text", TEXT_EXTS)
-            .add_filter("Imagini", IMAGE_EXTS);
+            .set_title("Attach a file")
+            .add_filter("Supported files", &supported)
+            .add_filter("Documents", &["pdf", "docx", "xlsx", "pptx"])
+            .add_filter("Code and text", TEXT_EXTS)
+            .add_filter("Images", IMAGE_EXTS);
         if self.workspace.is_dir() {
             dialog = dialog.set_directory(&self.workspace);
         }
@@ -1252,7 +1249,7 @@ impl GuiApp {
         let path = file.path().to_path_buf();
         if path.as_os_str().is_empty() {
             self.blocks.push(Block::Error(
-                "Fișierul tras nu oferă o cale locală; folosește butonul + pentru a-l selecta."
+                "The dropped file does not provide a local path; use the + button to select it."
                     .into(),
             ));
             return;
@@ -1352,7 +1349,7 @@ impl GuiApp {
     fn spawn_login(&mut self, provider_id: String) {
         let sender = self.login_tx.clone();
         let login_id = provider_id.clone();
-        self.login_status = Some("Pornesc autentificarea în browser…".into());
+        self.login_status = Some("Starting authentication in your browser…".into());
         self.device_login = None;
         self.show_provider = false;
         self.runtime.spawn(async move {
@@ -1391,12 +1388,12 @@ impl GuiApp {
                     session
                         .title
                         .clone()
-                        .unwrap_or_else(|| "Conversație fără titlu".into()),
+                        .unwrap_or_else(|| "Untitled conversation".into()),
                     session
                         .workspace
                         .file_name()
                         .and_then(|name| name.to_str())
-                        .unwrap_or("proiect")
+                        .unwrap_or("project")
                         .to_string(),
                     session.is_current,
                 )
@@ -1406,7 +1403,7 @@ impl GuiApp {
             .workspace
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("Alege proiectul")
+            .unwrap_or("Choose project")
             .to_string();
         let whatsapp_connected = whatsapp_bool(&self.whatsapp_status, "connected");
         let confirming_delete = self.confirm_delete_session.clone();
@@ -1449,12 +1446,12 @@ impl GuiApp {
                 });
                 ui.add_space(18.0);
 
-                if new_conversation_button(ui, "Conversație nouă").clicked() {
+                if new_conversation_button(ui, "New conversation").clicked() {
                     self.send(Op::NewSession);
                 }
                 ui.add_space(18.0);
                 ui.label(
-                    RichText::new("CONVERSAȚII")
+                    RichText::new("CONVERSATIONS")
                         .size(10.0)
                         .strong()
                         .color(Color32::from_rgb(120, 120, 128)),
@@ -1469,7 +1466,7 @@ impl GuiApp {
                     .show(ui, |ui| {
                         if session_rows.is_empty() {
                             ui.label(
-                                RichText::new("Conversațiile recente vor apărea aici.")
+                                RichText::new("Recent conversations will appear here.")
                                     .small()
                                     .color(Color32::from_rgb(118, 118, 126)),
                             );
@@ -1489,7 +1486,7 @@ impl GuiApp {
                         }
                     });
 
-                if nav_button(ui, "Toate conversațiile", false, NavIcon::More).clicked() {
+                if nav_button(ui, "All conversations", false, NavIcon::More).clicked() {
                     self.show_sessions = true;
                     self.send(Op::ListSessions);
                 }
@@ -1508,7 +1505,7 @@ impl GuiApp {
                     self.show_whatsapp = true;
                     self.poll_whatsapp(true);
                 }
-                if nav_button(ui, "Setări", self.show_settings, NavIcon::Settings).clicked() {
+                if nav_button(ui, "Settings", self.show_settings, NavIcon::Settings).clicked() {
                     self.show_settings = true;
                 }
             });
@@ -1540,9 +1537,9 @@ impl GuiApp {
                 self.workspace
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .map(|name| format!("Lucru în {name}"))
+                    .map(|name| format!("Working in {name}"))
             })
-            .unwrap_or_else(|| "Conversație nouă".into());
+            .unwrap_or_else(|| "New conversation".into());
         egui::Panel::top("status")
             .exact_size(64.0)
             .show_separator_line(true)
@@ -1571,25 +1568,25 @@ impl GuiApp {
                                 .started
                                 .map_or(0.0, |time| time.elapsed().as_secs_f32());
                             (
-                                format!("Lucrează · {elapsed:.1}s"),
+                                format!("Working · {elapsed:.1}s"),
                                 Color32::from_rgb(230, 183, 88),
                             )
                         } else if self.fatal {
-                            ("Nucleu oprit".into(), Color32::from_rgb(241, 112, 127))
+                            ("Core stopped".into(), Color32::from_rgb(241, 112, 127))
                         } else {
-                            ("Pregătit".into(), Color32::from_rgb(105, 205, 153))
+                            ("Ready".into(), Color32::from_rgb(105, 205, 153))
                         };
                         status_indicator(ui, &status, status_color);
                         if ui
-                            .selectable_label(self.show_activity, "Modificări")
-                            .on_hover_text("Arată activitatea și diff-urile")
+                            .selectable_label(self.show_activity, "Changes")
+                            .on_hover_text("Show activity and diffs")
                             .clicked()
                         {
                             self.show_activity = !self.show_activity;
                         }
                         if !self.queue.is_empty() {
                             ui.label(
-                                RichText::new(format!("{} în așteptare", self.queue.len()))
+                                RichText::new(format!("{} queued", self.queue.len()))
                                     .small()
                                     .color(Color32::from_rgb(162, 163, 171)),
                             );
@@ -1599,7 +1596,7 @@ impl GuiApp {
                                 &format!("{} · {}", self.provider, self.model),
                                 34,
                             ))
-                            .on_hover_text("Schimbă modelul")
+                            .on_hover_text("Change model")
                             .clicked()
                         {
                             self.show_models = true;
@@ -1688,28 +1685,28 @@ impl GuiApp {
             )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading(RichText::new(format!("Modificări ({file_count})")).size(16.0));
+                    ui.heading(RichText::new(format!("Changes ({file_count})")).size(16.0));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("Închide").clicked() {
+                        if ui.small_button("Close").clicked() {
                             self.show_activity = false;
                         }
                     });
                 });
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
-                    if ui.small_button("Actualizează diff").clicked() {
+                    if ui.small_button("Refresh diff").clicked() {
                         self.send(Op::ShowDiff);
                     }
-                    ui.menu_button("Acțiuni", |ui| {
+                    ui.menu_button("Actions", |ui| {
                         if ui.button("Skills").clicked() {
                             self.send(Op::SkillsList);
                             ui.close();
                         }
-                        if ui.button("Memorie").clicked() {
+                        if ui.button("Memory").clicked() {
                             self.send(Op::MemoryShow);
                             ui.close();
                         }
-                        if ui.button("Diagnostic").clicked() {
+                        if ui.button("Diagnostics").clicked() {
                             self.send(Op::Doctor);
                             ui.close();
                         }
@@ -1723,7 +1720,7 @@ impl GuiApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new("FIȘIERE")
+                            RichText::new("FILES")
                                 .size(10.0)
                                 .strong()
                                 .color(Color32::from_rgb(120, 120, 128)),
@@ -1734,7 +1731,7 @@ impl GuiApp {
                                 let files = diff_file_names(diff);
                                 if files.is_empty() {
                                     ui.label(
-                                        RichText::new("Există modificări în sesiune.")
+                                        RichText::new("There are changes in this session.")
                                             .small()
                                             .color(Color32::GRAY),
                                     );
@@ -1753,7 +1750,7 @@ impl GuiApp {
 
                                 ui.add_space(10.0);
                                 ui.label(
-                                    RichText::new("PREVIZUALIZARE DIFF")
+                                    RichText::new("DIFF PREVIEW")
                                         .size(10.0)
                                         .strong()
                                         .color(Color32::from_rgb(120, 120, 128)),
@@ -1778,7 +1775,7 @@ impl GuiApp {
                             }
                             None => {
                                 ui.label(
-                                    RichText::new("Nu există încă modificări în această sesiune.")
+                                    RichText::new("There are no changes in this session yet.")
                                         .small()
                                         .color(Color32::GRAY),
                                 );
@@ -1787,7 +1784,7 @@ impl GuiApp {
 
                         ui.add_space(14.0);
                         ui.label(
-                            RichText::new("ACTIVITATE")
+                            RichText::new("ACTIVITY")
                                 .size(10.0)
                                 .strong()
                                 .color(Color32::from_rgb(120, 120, 128)),
@@ -1795,9 +1792,11 @@ impl GuiApp {
                         ui.add_space(5.0);
                         if activities.is_empty() {
                             ui.label(
-                                RichText::new("Comenzile și verificările vor apărea aici.")
-                                    .small()
-                                    .color(Color32::GRAY),
+                                RichText::new(
+                                    "Commands and verification results will appear here.",
+                                )
+                                .small()
+                                .color(Color32::GRAY),
                             );
                         }
                         for (text, color) in activities {
@@ -1848,11 +1847,11 @@ impl GuiApp {
                                         );
                                         ui.add_space(12.0);
                                         ui.heading(
-                                            RichText::new("Cu ce lucrăm astăzi?").size(25.0),
+                                            RichText::new("What are we working on today?").size(25.0),
                                         );
                                         ui.label(
                                             RichText::new(
-                                                "Cere o modificare, atașează o imagine sau alege o acțiune rapidă.",
+                                                "Ask for a change, attach an image, or choose a quick action.",
                                             )
                                             .color(Color32::from_rgb(151, 152, 161)),
                                         );
@@ -1860,18 +1859,18 @@ impl GuiApp {
 
                                         if suggestion_button(
                                             ui,
-                                            "Analizează proiectul curent",
-                                            "Structură, probleme și îmbunătățiri",
+                                            "Analyze the current project",
+                                            "Structure, issues, and improvements",
                                         )
                                         .clicked()
                                         {
-                                            self.composer = "Analizează proiectul curent și spune-mi ce ar trebui îmbunătățit.".into();
+                                            self.composer = "Analyze the current project and tell me what should be improved.".into();
                                             self.request_focus = true;
                                         }
                                         if suggestion_button(
                                             ui,
-                                            "Arată modificările Git",
-                                            "Fișiere schimbate și diff",
+                                            "Show Git changes",
+                                            "Changed files and diff",
                                         )
                                         .clicked()
                                         {
@@ -1880,8 +1879,8 @@ impl GuiApp {
                                         }
                                         if suggestion_button(
                                             ui,
-                                            "Configurează WhatsApp",
-                                            "Conectare, QR și numere permise",
+                                            "Configure WhatsApp",
+                                            "Connection, QR, and allowed numbers",
                                         )
                                         .clicked()
                                         {
@@ -1934,11 +1933,11 @@ impl GuiApp {
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(
-                                            RichText::new(format!("Fișier · {}", path.display()))
+                                            RichText::new(format!("File · {}", path.display()))
                                                 .small()
                                                 .color(Color32::from_rgb(183, 184, 191)),
                                         );
-                                        if ui.small_button("Elimină").clicked() {
+                                        if ui.small_button("Remove").clicked() {
                                             self.pending_attachment = None;
                                         }
                                     });
@@ -1993,7 +1992,7 @@ impl GuiApp {
                                     .frame(egui::Frame::NONE)
                                     .desired_rows(rows)
                                     .desired_width(f32::INFINITY)
-                                    .hint_text("Întreabă GnomeAI…")
+                                    .hint_text("Ask GnomeAI…")
                                     .return_key(KeyboardShortcut::new(
                                         Modifiers::SHIFT,
                                         Key::Enter,
@@ -2015,15 +2014,15 @@ impl GuiApp {
                             ui.add_space(3.0);
                             ui.horizontal(|ui| {
                                 if composer_icon_button(ui, ComposerIcon::Attach, false)
-                                    .on_hover_text("Atașează un fișier")
+                                    .on_hover_text("Attach a file")
                                     .clicked()
                                 {
                                     self.choose_attachment();
                                 }
                                 let web = if self.web_search_enabled {
-                                    "web activ"
+                                    "web on"
                                 } else {
-                                    "web oprit"
+                                    "web off"
                                 };
                                 ui.label(
                                     RichText::new(format!("{} · {web}", self.sandbox))
@@ -2033,7 +2032,7 @@ impl GuiApp {
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if self.busy {
                                         if composer_icon_button(ui, ComposerIcon::Stop, true)
-                                            .on_hover_text("Oprește")
+                                            .on_hover_text("Stop")
                                             .clicked()
                                         {
                                             self.send(Op::Interrupt);
@@ -2044,7 +2043,7 @@ impl GuiApp {
                                         !self.composer.trim().is_empty()
                                             || self.pending_attachment.is_some(),
                                     )
-                                    .on_hover_text("Trimite (Enter)")
+                                    .on_hover_text("Send (Enter)")
                                     .clicked()
                                     {
                                         self.dispatch_composer();
@@ -2076,7 +2075,7 @@ impl GuiApp {
                         ui.add_space(2.0);
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new("Enter trimite · Shift+Enter adaugă un rând")
+                                RichText::new("Enter sends · Shift+Enter adds a new line")
                                     .small()
                                     .color(Color32::from_rgb(83, 84, 92)),
                             );
@@ -2113,7 +2112,7 @@ impl GuiApp {
         let mut open = true;
         let mut copy_code = false;
         let mut open_browser = false;
-        egui::Window::new("Conectare OpenAI Codex")
+        egui::Window::new("Connect OpenAI Codex")
             .id(egui::Id::new("codex_device_login_v1"))
             .open(&mut open)
             .collapsible(false)
@@ -2121,8 +2120,8 @@ impl GuiApp {
             .default_size(Vec2::new(420.0, 210.0))
             .min_size(Vec2::new(340.0, 180.0))
             .show(ctx, |ui| {
-                ui.label("Pagina de autentificare a fost deschisă în browser.");
-                ui.label("Introdu acest cod unic:");
+                ui.label("The sign-in page was opened in your browser.");
+                ui.label("Enter this one-time code:");
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(&dialog.user_code)
@@ -2139,15 +2138,15 @@ impl GuiApp {
                 if let Some(error) = &dialog.browser_error {
                     ui.colored_label(
                         Color32::LIGHT_RED,
-                        format!("Browserul nu a putut fi deschis automat: {error}"),
+                        format!("The browser could not be opened automatically: {error}"),
                     );
                 }
                 ui.horizontal(|ui| {
-                    copy_code = ui.button("Copiază codul").clicked();
-                    open_browser = ui.button("Deschide browserul").clicked();
+                    copy_code = ui.button("Copy code").clicked();
+                    open_browser = ui.button("Open browser").clicked();
                 });
                 ui.label(
-                    RichText::new("Aștept confirmarea OpenAI…")
+                    RichText::new("Waiting for OpenAI confirmation…")
                         .small()
                         .color(Color32::GRAY),
                 );
@@ -2174,7 +2173,7 @@ impl GuiApp {
         let mut save_node_hub = false;
 
         let dialog_size = Vec2::new(420.0, 360.0);
-        egui::Window::new("Setări")
+        egui::Window::new("Settings")
             // A new id intentionally discards geometry saved by the older
             // dialog, whose labelled Sandbox combo could make the body wider
             // than the title bar.
@@ -2188,7 +2187,7 @@ impl GuiApp {
             .resizable(true)
             .scroll([false, true])
             .show(ctx, |ui| {
-                ui.label(RichText::new("MODEL ȘI CONEXIUNI").small().strong());
+                ui.label(RichText::new("MODEL AND CONNECTIONS").small().strong());
                 ui.add_space(5.0);
                 egui::Frame::default()
                     .fill(Color32::from_rgb(27, 27, 31))
@@ -2197,18 +2196,18 @@ impl GuiApp {
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(format!("Provider: {}", self.provider));
-                            if ui.small_button("Schimbă providerul").clicked() {
+                            if ui.small_button("Change provider").clicked() {
                                 self.show_provider = true;
                             }
                             ui.label(format!("Model: {}", self.model));
-                            if ui.small_button("Schimbă modelul").clicked() {
+                            if ui.small_button("Change model").clicked() {
                                 self.show_models = true;
                             }
                             if ui.small_button("WhatsApp").clicked() {
                                 self.show_whatsapp = true;
                                 self.poll_whatsapp(true);
                             }
-                            if ui.small_button("Dispozitive").clicked() {
+                            if ui.small_button("Devices").clicked() {
                                 self.show_nodes = true;
                                 self.poll_nodes(true);
                             }
@@ -2216,24 +2215,20 @@ impl GuiApp {
                     });
 
                 ui.add_space(12.0);
-                ui.label(RichText::new("EXECUȚIE").small().strong());
-                ui.checkbox(&mut self.web_search_enabled, "Căutare web");
+                ui.label(RichText::new("EXECUTION").small().strong());
+                ui.checkbox(&mut self.web_search_enabled, "Web search");
                 ui.horizontal(|ui| {
                     ui.label("Sandbox");
                     egui::ComboBox::from_id_salt("settings_sandbox")
                         .selected_text(&self.sandbox)
                         .width(ui.available_width())
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.sandbox,
-                                "read-only".into(),
-                                "Doar citire",
-                            );
+                            ui.selectable_value(&mut self.sandbox, "read-only".into(), "Read only");
                             ui.selectable_value(&mut self.sandbox, "normal".into(), "Normal");
                             ui.selectable_value(
                                 &mut self.sandbox,
                                 "full-access".into(),
-                                "Acces complet",
+                                "Full access",
                             );
                         });
                 });
@@ -2243,9 +2238,9 @@ impl GuiApp {
                     .corner_radius(9.0)
                     .inner_margin(10.0)
                     .show(ui, |ui| {
-                        ui.checkbox(&mut self.node_enabled, "Hub pentru dispozitive slabe");
+                        ui.checkbox(&mut self.node_enabled, "Hub for lightweight devices");
                         ui.horizontal(|ui| {
-                            ui.label("Adresă");
+                            ui.label("Address");
                             ui.add(
                                 TextEdit::singleline(&mut self.node_bind)
                                     .hint_text("0.0.0.0")
@@ -2255,15 +2250,15 @@ impl GuiApp {
                             ui.add(egui::DragValue::new(&mut self.node_port).range(1..=u16::MAX));
                         });
                         ui.horizontal_wrapped(|ui| {
-                            save_node_hub = ui.small_button("Salvează Hub").clicked();
-                            if ui.small_button("Administrează dispozitivele").clicked() {
+                            save_node_hub = ui.small_button("Save Hub").clicked();
+                            if ui.small_button("Manage devices").clicked() {
                                 self.show_nodes = true;
                                 self.poll_nodes(true);
                             }
                         });
                         ui.label(
                             RichText::new(
-                                "Modificarea listenerului se aplică după repornirea aplicației.",
+                                "Listener changes take effect after restarting the application.",
                             )
                             .small()
                             .color(Color32::GRAY),
@@ -2271,43 +2266,43 @@ impl GuiApp {
                     });
 
                 ui.add_space(12.0);
-                ui.label(RichText::new("INTERFAȚĂ").small().strong());
-                ui.checkbox(&mut self.notifications, "Notificări desktop");
-                ui.checkbox(&mut self.high_contrast, "Contrast ridicat");
+                ui.label(RichText::new("INTERFACE").small().strong());
+                ui.checkbox(&mut self.notifications, "Desktop notifications");
+                ui.checkbox(&mut self.high_contrast, "High contrast");
                 ui.label(
-                    RichText::new("Caută în conversația curentă")
+                    RichText::new("Search the current conversation")
                         .small()
                         .color(Color32::GRAY),
                 );
                 ui.add(
                     TextEdit::singleline(&mut self.search)
                         .id(egui::Id::new("transcript_search"))
-                        .hint_text("Caută…")
+                        .hint_text("Search…")
                         .desired_width(f32::INFINITY),
                 );
 
                 ui.add_space(12.0);
-                ui.label(RichText::new("INSTRUMENTE").small().strong());
+                ui.label(RichText::new("TOOLS").small().strong());
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Skills").clicked() {
                         self.send(Op::SkillsList);
                     }
-                    if ui.button("Instalează SKILL.md").clicked() {
+                    if ui.button("Install SKILL.md").clicked() {
                         self.choose_skill_file();
                     }
-                    if ui.button("Memorie").clicked() {
+                    if ui.button("Memory").clicked() {
                         self.send(Op::MemoryShow);
                     }
-                    if ui.button("Compactează contextul").clicked() {
+                    if ui.button("Compact context").clicked() {
                         self.send(Op::Compact);
                     }
-                    if ui.button("Anulează patch-urile").clicked() {
+                    if ui.button("Rollback patches").clicked() {
                         self.send(Op::Rollback);
                     }
-                    if ui.button("Diagnostic").clicked() {
+                    if ui.button("Diagnostics").clicked() {
                         self.send(Op::Doctor);
                     }
-                    if ui.button("Tokeni").clicked() {
+                    if ui.button("Tokens").clicked() {
                         self.show_token_usage();
                     }
                     if ui.button("Export Markdown").clicked() {
@@ -2317,7 +2312,7 @@ impl GuiApp {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(format!(
-                        "{} tokeni intrare · {} tokeni ieșire",
+                        "{} input tokens · {} output tokens",
                         self.tokens_in, self.tokens_out
                     ))
                     .small()
@@ -2469,9 +2464,9 @@ impl GuiApp {
                 match provider.auth {
                     AuthKind::Account => {
                         ui.label(
-                            "Sesiunea este memorată de aplicația oficială și se reutilizează cât timp rămâne validă.",
+                            "The session is stored by the official application and reused while it remains valid.",
                         );
-                        if ui.button("Activează contul").clicked() {
+                        if ui.button("Activate account").clicked() {
                             login = Some(provider.id.to_string());
                         }
                     }
@@ -2484,12 +2479,12 @@ impl GuiApp {
                         ui.add(
                             TextEdit::singleline(&mut self.provider_api_key)
                                 .password(true)
-                                .hint_text("Lasă gol pentru cheia memorată")
+                                .hint_text("Leave blank to reuse the saved key")
                                 .desired_width(f32::INFINITY),
                         );
                         ui.label(
                             RichText::new(
-                                "Cheia nouă este salvată privat; câmpul gol reutilizează cheia existentă.",
+                                "A new key is stored privately; leaving the field blank reuses the existing key.",
                             )
                             .small()
                             .color(Color32::GRAY),
@@ -2687,11 +2682,11 @@ impl GuiApp {
             .scroll([false, true])
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    status_badge(ui, "Serviciu", running);
-                    status_badge(ui, "Autentificat", authenticated);
-                    status_badge(ui, "Conectat", connected);
+                    status_badge(ui, "Service", running);
+                    status_badge(ui, "Authenticated", authenticated);
+                    status_badge(ui, "Connected", connected);
                     if !own_phone.is_empty() {
-                        ui.label(RichText::new(format!("Număr: +{own_phone}")).small());
+                        ui.label(RichText::new(format!("Number: +{own_phone}")).small());
                     }
                 });
                 if let Some(error) = &self.whatsapp_service.launch_error {
@@ -2705,20 +2700,17 @@ impl GuiApp {
                 }
 
                 ui.separator();
-                ui.checkbox(
-                    &mut self.whatsapp_enabled,
-                    "Activează integrarea WhatsApp",
-                );
-                ui.label("Numele afișat al asistentului");
+                ui.checkbox(&mut self.whatsapp_enabled, "Enable WhatsApp integration");
+                ui.label("Assistant display name");
                 ui.add(
                     TextEdit::singleline(&mut self.whatsapp_assistant_name)
                         .desired_width(f32::INFINITY),
                 );
                 ui.checkbox(
                     &mut self.whatsapp_has_own_number,
-                    "Asistentul folosește un număr WhatsApp dedicat",
+                    "The assistant uses a dedicated WhatsApp number",
                 );
-                ui.label("Conversații permise (JID-uri, câte unul pe rând)");
+                ui.label("Allowed conversations (JIDs, one per line)");
                 ui.add(
                     TextEdit::multiline(&mut self.whatsapp_allowed_jids)
                         .desired_rows(3)
@@ -2727,30 +2719,30 @@ impl GuiApp {
                 );
                 ui.label(
                     RichText::new(
-                        "Dacă lista rămâne goală, sunt acceptate numai mesajele către propriul cont.",
+                        "If the list is empty, only messages to the account itself are accepted.",
                     )
                     .small()
                     .color(Color32::GRAY),
                 );
                 ui.horizontal(|ui| {
-                    save = ui.button("Salvează și aplică").clicked();
-                    stop = ui.button("Oprește").clicked();
-                    reload = ui.button("Repornește bridge-ul").clicked();
+                    save = ui.button("Save and apply").clicked();
+                    stop = ui.button("Stop").clicked();
+                    reload = ui.button("Restart bridge").clicked();
                     if self.whatsapp_enabled && !connected {
-                        refresh_qr = ui.button("Cod QR nou").clicked();
+                        refresh_qr = ui.button("New QR code").clicked();
                     }
                 });
 
                 if !qr.is_empty() && !connected {
                     ui.separator();
-                    ui.heading("Scanează codul QR din WhatsApp");
+                    ui.heading("Scan the QR code in WhatsApp");
                     render_qr(ui, &qr);
                 }
 
                 if connected {
                     ui.separator();
-                    ui.collapsing("Trimite un mesaj de test", |ui| {
-                        ui.label("JID destinatar");
+                    ui.collapsing("Send a test message", |ui| {
+                        ui.label("Recipient JID");
                         ui.add(
                             TextEdit::singleline(&mut self.whatsapp_test_jid)
                                 .desired_width(f32::INFINITY)
@@ -2760,17 +2752,17 @@ impl GuiApp {
                                     own_jid.clone()
                                 }),
                         );
-                        ui.label("Mesaj");
+                        ui.label("Message");
                         ui.add(
                             TextEdit::multiline(&mut self.whatsapp_test_message)
                                 .desired_rows(2)
                                 .desired_width(f32::INFINITY),
                         );
-                        send_test = ui.button("Trimite pe WhatsApp").clicked();
+                        send_test = ui.button("Send on WhatsApp").clicked();
                     });
                 }
                 ui.separator();
-                ui.collapsing("Jurnal recent", |ui| {
+                ui.collapsing("Recent log", |ui| {
                     ui.label(
                         RichText::new(self.whatsapp_log_file.display().to_string())
                             .small()
@@ -2778,12 +2770,11 @@ impl GuiApp {
                     );
                     let log = read_log_tail(&self.whatsapp_log_file, 12 * 1024);
                     if log.is_empty() {
-                        ui.label("Jurnalul este gol.");
+                        ui.label("The log is empty.");
                     } else {
                         ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
                             ui.add(
-                                egui::Label::new(RichText::new(log).monospace())
-                                    .selectable(true),
+                                egui::Label::new(RichText::new(log).monospace()).selectable(true),
                             );
                         });
                     }
@@ -2801,7 +2792,7 @@ impl GuiApp {
                 .collect::<Vec<_>>();
             allowed_jids.sort();
             allowed_jids.dedup();
-            self.whatsapp_feedback = Some("Se salvează setările…".into());
+            self.whatsapp_feedback = Some("Saving settings…".into());
             self.send(Op::SetWhatsApp {
                 enabled: self.whatsapp_enabled,
                 assistant_name: self.whatsapp_assistant_name.clone(),
@@ -2849,12 +2840,12 @@ impl GuiApp {
             .cloned()
             .unwrap_or_default();
         let enroll = format!(
-            "gnomeai-node enroll --server http://IP-PC:{} --token {} --name NUME",
+            "gnomeai-node enroll --server http://PC-IP:{} --token {} --name NAME",
             self.node_port, self.node_enrollment_token
         );
         let enroll_root = format!("{enroll} --allow-root");
 
-        egui::Window::new("Dispozitive")
+        egui::Window::new("Devices")
             .id(egui::Id::new("nodes_dialog_v1"))
             .open(&mut open)
             .default_size(Vec2::new(540.0, 430.0))
@@ -2865,13 +2856,13 @@ impl GuiApp {
                 if !self.node_enabled {
                     ui.colored_label(
                         Color32::LIGHT_YELLOW,
-                        "Hub-ul este oprit. Activează-l în Setări și repornește aplicația.",
+                        "The Hub is disabled. Enable it in Settings and restart the application.",
                     );
                 } else {
                     ui.horizontal_wrapped(|ui| {
                         status_badge(ui, "Hub", self.node_feedback.is_none());
                         ui.label(format!("{}:{}", self.node_bind, self.node_port));
-                        if ui.small_button("Reîmprospătează").clicked() {
+                        if ui.small_button("Refresh").clicked() {
                             self.poll_nodes(true);
                         }
                     });
@@ -2881,30 +2872,30 @@ impl GuiApp {
                 }
 
                 ui.separator();
-                ui.label(RichText::new("CONECTEAZĂ UN CLIENT").small().strong());
+                ui.label(RichText::new("CONNECT A CLIENT").small().strong());
                 ui.label(
                     RichText::new(
-                        "Instalează pachetul minimal pe dispozitiv, apoi rulează una dintre comenzile de mai jos. Înlocuiește IP-PC și NUME.",
+                        "Install the minimal package on the device, then run one of the commands below. Replace PC-IP and NAME.",
                     )
                     .small()
                     .color(Color32::GRAY),
                 );
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("Copiază comanda normală").clicked() {
+                    if ui.button("Copy normal command").clicked() {
                         copy_command = Some(enroll.clone());
                     }
-                    if ui.button("Copiază cu root local").clicked() {
+                    if ui.button("Copy with local root").clicked() {
                         copy_command = Some(enroll_root.clone());
                     }
                 });
                 ui.label(
                     RichText::new(
-                        "Clientul rulează în foreground: manual sau cu runit, OpenRC, s6 ori alt supervisor. Nu depinde de systemd.",
+                        "The client runs in the foreground: manually or with runit, OpenRC, s6, or another supervisor. It does not depend on systemd.",
                     )
                     .small()
                     .color(Color32::GRAY),
                 );
-                ui.collapsing("Exemplu runit", |ui| {
+                ui.collapsing("runit example", |ui| {
                     ui.add(
                         egui::Label::new(
                             RichText::new("#!/bin/sh\nexec /usr/bin/gnomeai-node run")
@@ -2915,16 +2906,16 @@ impl GuiApp {
                 });
                 ui.label(
                     RichText::new(
-                        "Folosește o rețea de încredere/VPN (de exemplu Tailscale); nu expune portul HTTP direct pe internet.",
+                        "Use a trusted network/VPN (for example Tailscale); do not expose the HTTP port directly to the internet.",
                     )
                     .small()
                     .color(Color32::LIGHT_YELLOW),
                 );
 
                 ui.separator();
-                ui.label(RichText::new("DISPOZITIVE ASOCIATE").small().strong());
+                ui.label(RichText::new("PAIRED DEVICES").small().strong());
                 if nodes.is_empty() {
-                    ui.label("Niciun dispozitiv asociat încă.");
+                    ui.label("No devices paired yet.");
                 }
                 for node in &nodes {
                     let node_id = node
@@ -2957,10 +2948,10 @@ impl GuiApp {
                         .to_string();
                     let mut policy = original_policy.clone();
                     let policy_label = match policy.as_str() {
-                        "disabled" => "Blocat",
-                        "session" => "Sesiune",
-                        "always" => "Permis mereu",
-                        _ => "Întreabă",
+                        "disabled" => "Blocked",
+                        "session" => "Session",
+                        "always" => "Always allowed",
+                        _ => "Ask",
                     }
                     .to_string();
                     egui::Frame::default()
@@ -2983,11 +2974,11 @@ impl GuiApp {
                             );
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(if root_available {
-                                    "Root local disponibil"
+                                    "Local root available"
                                 } else {
-                                    "Root local indisponibil"
+                                    "Local root unavailable"
                                 });
-                                ui.label("Politică root");
+                                ui.label("Root policy");
                                 egui::ComboBox::from_id_salt(format!(
                                     "node_root_policy_{node_id}"
                                 ))
@@ -2996,22 +2987,22 @@ impl GuiApp {
                                     ui.selectable_value(
                                         &mut policy,
                                         "disabled".into(),
-                                        "Blocat",
+                                        "Blocked",
                                     );
                                     ui.selectable_value(
                                         &mut policy,
                                         "ask".into(),
-                                        "Întreabă la fiecare comandă",
+                                        "Ask for every command",
                                     );
                                     ui.selectable_value(
                                         &mut policy,
                                         "session".into(),
-                                        "Permis în sesiunea Hub",
+                                        "Allowed for the Hub session",
                                     );
                                     ui.selectable_value(
                                         &mut policy,
                                         "always".into(),
-                                        "Permis mereu",
+                                        "Always allowed",
                                     );
                                 });
                             });
@@ -3025,7 +3016,7 @@ impl GuiApp {
         self.show_nodes = open;
         if let Some(command) = copy_command {
             self.copy_request = Some(command);
-            self.node_feedback = Some("Comanda a fost copiată.".into());
+            self.node_feedback = Some("The command was copied.".into());
         }
         if let Some((node_id, policy)) = policy_change {
             self.set_node_policy(node_id, policy);
@@ -3790,7 +3781,7 @@ fn whatsapp_text<'a>(status: &'a Value, key: &str) -> &'a str {
 
 fn render_qr(ui: &mut egui::Ui, payload: &str) {
     let Ok(code) = QrCode::new(payload.as_bytes()) else {
-        ui.colored_label(Color32::LIGHT_RED, "Codul QR nu poate fi afișat.");
+        ui.colored_label(Color32::LIGHT_RED, "The QR code cannot be displayed.");
         return;
     };
     let modules = code.width();
@@ -3822,13 +3813,13 @@ fn render_qr(ui: &mut egui::Ui, payload: &str) {
 
 fn companion_executable(name: &str) -> std::result::Result<PathBuf, String> {
     let current = std::env::current_exe()
-        .map_err(|error| format!("Nu pot determina executabilul curent: {error}"))?;
+        .map_err(|error| format!("Cannot determine the current executable: {error}"))?;
     let candidate = current.with_file_name(name);
     if candidate.is_file() {
         Ok(candidate)
     } else {
         Err(format!(
-            "Lipsește serviciul WhatsApp: {}. Rulează `cargo build --bins` sau reinstalează pachetul.",
+            "WhatsApp service is missing: {}. Run `cargo build --bins` or reinstall the package.",
             candidate.display()
         ))
     }
@@ -3839,12 +3830,12 @@ async fn http_json(request: reqwest::RequestBuilder) -> std::result::Result<Valu
         .timeout(Duration::from_secs(20))
         .send()
         .await
-        .map_err(|error| format!("Serviciul WhatsApp nu răspunde: {error}"))?;
+        .map_err(|error| format!("WhatsApp service is not responding: {error}"))?;
     let status = response.status();
     let text = response
         .text()
         .await
-        .map_err(|error| format!("Răspuns WhatsApp invalid: {error}"))?;
+        .map_err(|error| format!("Invalid WhatsApp response: {error}"))?;
     let value = serde_json::from_str::<Value>(&text)
         .unwrap_or_else(|_| serde_json::json!({"message": text}));
     if status.is_success() {
@@ -3853,7 +3844,7 @@ async fn http_json(request: reqwest::RequestBuilder) -> std::result::Result<Valu
         Err(value
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("Operația WhatsApp a eșuat.")
+            .unwrap_or("The WhatsApp operation failed.")
             .to_string())
     }
 }
@@ -3884,7 +3875,7 @@ fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
                 .show(ui, |ui| {
                     ui.set_min_width((width - 30.0).max(120.0));
                     ui.label(
-                        RichText::new("TU")
+                        RichText::new("YOU")
                             .size(10.0)
                             .strong()
                             .color(Color32::from_rgb(126, 207, 164)),
@@ -3926,7 +3917,7 @@ fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
                 .inner_margin(Margin::symmetric(10, 7))
                 .show(ui, |ui| {
                     egui::CollapsingHeader::new(
-                        RichText::new("Procesare")
+                        RichText::new("Reasoning")
                             .italics()
                             .color(Color32::from_rgb(148, 149, 158)),
                     )
@@ -3984,7 +3975,7 @@ fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
                         .show(ui, |ui| {
                             if output.is_empty() {
                                 ui.label(
-                                    RichText::new("Se așteaptă rezultatul…").color(Color32::GRAY),
+                                    RichText::new("Waiting for the result…").color(Color32::GRAY),
                                 );
                             } else {
                                 egui::Frame::default()
@@ -4012,7 +4003,7 @@ fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
                 .show(ui, |ui| {
                     egui::CollapsingHeader::new(
                         RichText::new(format!(
-                            "Modificări în patch · {} fișiere",
+                            "Patch changes · {} files",
                             diff_file_names(diff).len()
                         ))
                         .color(Color32::from_rgb(128, 190, 245)),
@@ -4112,13 +4103,13 @@ fn encode_attachment(path: &Path, prompt: &str) -> std::result::Result<String, S
         .unwrap_or("attachment");
     if file_type_from_name(name) == "image" {
         let bytes = std::fs::read(path)
-            .map_err(|error| format!("Nu pot citi {}: {error}", path.display()))?;
+            .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
         let media_type = mime_guess::from_path(path)
             .first_raw()
             .unwrap_or("application/octet-stream");
         let data = base64::engine::general_purpose::STANDARD.encode(bytes);
         let prompt = if prompt.trim().is_empty() {
-            format!("Analizează imaginea atașată „{name}”.")
+            format!("Analyze the attached image “{name}”.")
         } else {
             prompt.trim().to_string()
         };
@@ -4126,16 +4117,16 @@ fn encode_attachment(path: &Path, prompt: &str) -> std::result::Result<String, S
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": format!("data:{media_type};base64,{data}")}}
         ]))
-        .map_err(|error| format!("Nu pot pregăti imaginea: {error}"));
+        .map_err(|error| format!("Cannot prepare the image: {error}"));
     }
 
     let extracted =
-        extract_text_attachment(path).map_err(|error| format!("Nu pot citi {name}: {error:#}"))?;
+        extract_text_attachment(path).map_err(|error| format!("Cannot read {name}: {error:#}"))?;
     if extracted.trim().is_empty() {
-        return Err(format!("Nu am găsit text lizibil în {name}."));
+        return Err(format!("No readable text was found in {name}."));
     }
     let prompt = if prompt.trim().is_empty() {
-        format!("Analizează fișierul atașat „{name}”.")
+        format!("Analyze the attached file “{name}”.")
     } else {
         prompt.trim().to_string()
     };
@@ -4172,7 +4163,7 @@ fn desktop_notify(title: &str, body: &str) {
 fn open_external_url(url: &str) -> std::result::Result<(), String> {
     let url = url.trim();
     if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err("adresa de autentificare nu este HTTP/HTTPS".into());
+        return Err("the authentication address is not HTTP/HTTPS".into());
     }
 
     #[cfg(target_os = "linux")]
@@ -4199,7 +4190,7 @@ fn open_external_url(url: &str) -> std::result::Result<(), String> {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    Err("deschiderea automată a browserului nu este disponibilă pe acest sistem".into())
+    Err("automatic browser opening is not available on this system".into())
 }
 
 fn unquote(value: &str) -> &str {
@@ -4349,7 +4340,7 @@ mod tests {
 
     #[test]
     fn sidebar_labels_preserve_romanian_characters() {
-        assert_eq!(ellipsize("Conversație nouă", 40), "Conversație nouă");
+        assert_eq!(ellipsize("New conversation", 40), "New conversation");
         assert_eq!(ellipsize("ăîâșț foarte lung", 8), "ăîâșț f…");
     }
 
