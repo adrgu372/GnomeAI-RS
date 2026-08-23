@@ -12,6 +12,9 @@ fixes = {
     "Servicel WhatsApp nu răspunde: {error}":
         "WhatsApp service is not responding: {error}",
     "Changes în patch · {} fișiere": "Patch changes · {} files",
+    "Ștergi?": "Delete?",
+    "Șterge": "Delete",
+    "Anulează": "Cancel",
 }
 
 for old, new in fixes.items():
@@ -44,6 +47,9 @@ forbidden = [
     "Servicel WhatsApp",
     "Analizează proiectul curent",
     "Hub-ul este oprit",
+    "Ștergi?",
+    "Șterge",
+    "Anulează",
 ]
 leftovers = [item for item in forbidden if item in text]
 if leftovers:
