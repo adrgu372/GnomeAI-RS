@@ -21,6 +21,8 @@ mod firecrawl;
 mod gui;
 #[path = "../llama.rs"]
 mod llama;
+#[path = "../mcp_client.rs"]
+mod mcp_client;
 #[path = "../memory.rs"]
 mod memory;
 #[path = "../memory_engine.rs"]
@@ -96,6 +98,12 @@ struct ActiveTurn {
 }
 
 fn main() -> Result<()> {
+    // sudo invokes this executable as its askpass helper for interactive PAM
+    // conversations. Exit before argument parsing, sandboxing or Tokio so the
+    // helper can only relay one local credential response.
+    if privilege::maybe_run_as_askpass()? {
+        return Ok(());
+    }
     if !cfg!(any(target_os = "linux", target_os = "macos")) {
         bail!("gnomef-agent currently supports Linux and macOS");
     }
@@ -238,6 +246,9 @@ async fn async_main() -> Result<()> {
         output_store.clone(),
         privilege_broker.clone(),
     );
+    let mcp_config = config_state.read().await.clone();
+    let mcp_runtime = mcp_client::register_configured(&mut registry, &mcp_config).await;
+    let mcp_notices = mcp_runtime.notices().to_vec();
 
     let agent = Agent::new(
         provider,
@@ -249,6 +260,7 @@ async fn async_main() -> Result<()> {
         workspace,
         policy.clone(),
         output_store,
+        mcp_config.mcp_servers.clone(),
         event_tx.clone(),
         approval_rx,
     );
@@ -260,8 +272,12 @@ async fn async_main() -> Result<()> {
             .send(Event::Notice { message: note })
             .await;
     }
+    for message in mcp_notices {
+        let _ = agent.event_sender().send(Event::Notice { message }).await;
+    }
     let core = tokio::spawn(core_loop(
         agent,
+        mcp_runtime,
         policy,
         provider_selection,
         provider_settings,
@@ -299,6 +315,7 @@ enum IdleOutcome {
 /// an op and the drain loop can replay it against identical state.
 struct Core {
     agent: Agent,
+    mcp_runtime: mcp_client::McpRuntime,
     policy: SandboxPolicy,
     provider_selection: ProviderSelection,
     provider_settings: ProviderSettingsStore,
@@ -317,6 +334,7 @@ struct Core {
 #[allow(clippy::too_many_arguments)]
 async fn core_loop(
     agent: Agent,
+    mcp_runtime: mcp_client::McpRuntime,
     policy: SandboxPolicy,
     provider_selection: ProviderSelection,
     provider_settings: ProviderSettingsStore,
@@ -335,6 +353,7 @@ async fn core_loop(
     let events = agent.event_sender();
     let mut core = Core {
         agent,
+        mcp_runtime,
         policy,
         provider_selection,
         provider_settings,
@@ -576,6 +595,9 @@ async fn handle_idle_op(
         }
         Op::SetWebSearch { enabled } => {
             set_web_search(core, enabled, events).await?;
+        }
+        Op::SetMcpServers { servers } => {
+            set_mcp_servers(core, servers, events).await?;
         }
         Op::SetSandbox { mode } => {
             set_sandbox(core, &mode, events).await?;
@@ -964,6 +986,32 @@ async fn set_provider(
     Ok(())
 }
 
+async fn build_registry(
+    core: &Core,
+    workspace: &Path,
+    policy: SandboxPolicy,
+) -> (Registry, mcp_client::McpRuntime) {
+    let mut registry = Registry::default();
+    tools::register_all(
+        &mut registry,
+        workspace,
+        &core.app_paths.generated_dir,
+        policy,
+        core.config_state.clone(),
+        core.agent.output_store.clone(),
+        core.privilege_broker.clone(),
+    );
+    let config = core.config_state.read().await.clone();
+    let mcp_runtime = mcp_client::register_configured(&mut registry, &config).await;
+    (registry, mcp_runtime)
+}
+
+async fn report_mcp_runtime(runtime: &mcp_client::McpRuntime, events: &mpsc::Sender<Event>) {
+    for message in runtime.notices() {
+        notice(events, message).await;
+    }
+}
+
 async fn set_sandbox(core: &mut Core, mode: &str, events: &mpsc::Sender<Event>) -> Result<()> {
     let mode = match parse_sandbox(mode) {
         Ok(mode) => mode,
@@ -973,17 +1021,9 @@ async fn set_sandbox(core: &mut Core, mode: &str, events: &mpsc::Sender<Event>) 
         }
     };
     let policy = policy_for(mode, &core.agent.workspace);
-    let mut registry = Registry::default();
-    tools::register_all(
-        &mut registry,
-        &core.agent.workspace,
-        &core.app_paths.generated_dir,
-        policy.clone(),
-        core.config_state.clone(),
-        core.agent.output_store.clone(),
-        core.privilege_broker.clone(),
-    );
+    let (registry, mcp_runtime) = build_registry(core, &core.agent.workspace, policy.clone()).await;
     core.agent.registry = Arc::new(registry);
+    core.mcp_runtime = mcp_runtime;
     core.agent.verify_policy = policy.clone();
     core.agent.approval = approval_for(mode);
     // Account-backed CLIs receive the current sandbox mode as command-line
@@ -1004,6 +1044,7 @@ async fn set_sandbox(core: &mut Core, mode: &str, events: &mpsc::Sender<Event>) 
         &core.models,
     )
     .await;
+    report_mcp_runtime(&core.mcp_runtime, events).await;
     notice(
         events,
         match mode {
@@ -1045,16 +1086,7 @@ async fn set_workspace(
     // fully usable.
     let policy = policy_for(core.policy.mode, &workspace);
     let provider = build_provider(&core.provider_selection, &workspace, policy.mode)?;
-    let mut registry = Registry::default();
-    tools::register_all(
-        &mut registry,
-        &workspace,
-        &core.app_paths.generated_dir,
-        policy.clone(),
-        core.config_state.clone(),
-        core.agent.output_store.clone(),
-        core.privilege_broker.clone(),
-    );
+    let (registry, mcp_runtime) = build_registry(core, &workspace, policy.clone()).await;
     let session = core
         .agent
         .store
@@ -1071,6 +1103,7 @@ async fn set_workspace(
     core.agent.workspace = workspace.clone();
     core.agent.verify_policy = policy.clone();
     core.agent.registry = Arc::new(registry);
+    core.mcp_runtime = mcp_runtime;
     core.agent.provider = provider;
     core.agent.switch_session(session.id).await;
     core.policy = policy;
@@ -1109,6 +1142,40 @@ async fn set_web_search(core: &Core, enabled: bool, events: &mpsc::Sender<Event>
         },
     )
     .await;
+    send_ready(
+        &core.agent,
+        &core.policy,
+        &core.config_state,
+        &core.workspace_history,
+        &core.models,
+    )
+    .await;
+    Ok(())
+}
+
+async fn set_mcp_servers(
+    core: &mut Core,
+    servers: Vec<config::McpServerConfig>,
+    events: &mpsc::Sender<Event>,
+) -> Result<()> {
+    let normalized = {
+        let mut config = core.config_state.write().await;
+        config.mcp_servers = servers;
+        config.normalize();
+        config.save(&core.config_path)?;
+        config.mcp_servers.clone()
+    };
+    let (registry, runtime) =
+        build_registry(core, &core.agent.workspace, core.policy.clone()).await;
+    core.agent.registry = Arc::new(registry);
+    core.agent.mcp_servers = normalized.clone();
+    core.mcp_runtime = runtime;
+    let _ = events
+        .send(Event::McpConfigChanged {
+            servers: normalized,
+        })
+        .await;
+    report_mcp_runtime(&core.mcp_runtime, events).await;
     send_ready(
         &core.agent,
         &core.policy,
@@ -1179,19 +1246,11 @@ async fn resume_session(core: &mut Core, id: &str, events: &mpsc::Sender<Event>)
     if workspace != core.agent.workspace {
         let policy = policy_for(core.policy.mode, &workspace);
         let provider = build_provider(&core.provider_selection, &workspace, policy.mode)?;
-        let mut registry = Registry::default();
-        tools::register_all(
-            &mut registry,
-            &workspace,
-            &core.app_paths.generated_dir,
-            policy.clone(),
-            core.config_state.clone(),
-            core.agent.output_store.clone(),
-            core.privilege_broker.clone(),
-        );
+        let (registry, mcp_runtime) = build_registry(core, &workspace, policy.clone()).await;
         core.agent.workspace = workspace.clone();
         core.agent.verify_policy = policy.clone();
         core.agent.registry = Arc::new(registry);
+        core.mcp_runtime = mcp_runtime;
         core.agent.provider = provider;
         core.policy = policy;
         core.workspace_history.record(&workspace);
@@ -1700,6 +1759,7 @@ async fn send_ready(
 ) {
     let config = config_state.read().await;
     let web_search_enabled = config.web_search_enabled;
+    let mcp_servers = config.mcp_servers.clone();
     let models = if config.provider_id == "openai-account" {
         let metadata = models
             .iter()
@@ -1729,6 +1789,7 @@ async fn send_ready(
                 .map(|path| path.display().to_string())
                 .collect(),
             models,
+            mcp_servers,
         })
         .await;
 }

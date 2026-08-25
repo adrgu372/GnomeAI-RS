@@ -29,8 +29,12 @@ use std::time::Instant;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::McpServerConfig;
 use crate::protocol::{Decision, Event};
-use crate::provider::{Delta, Message, Provider, Request, StopReason, ToolCall};
+use crate::provider::{
+    DelegatedToolExecutor, DelegatedToolResult, Delta, Message, Provider, Request, StopReason,
+    ToolCall,
+};
 use crate::sandbox::SandboxPolicy;
 use crate::store::Store;
 use crate::tooling::{
@@ -110,6 +114,7 @@ pub struct Agent {
     pub workspace: PathBuf,
     pub verify_policy: SandboxPolicy,
     pub output_store: Arc<ToolOutputStore>,
+    pub mcp_servers: Vec<McpServerConfig>,
 
     events: mpsc::Sender<Event>,
     /// Approvals arrive out of band from whichever interface is attached.
@@ -135,6 +140,7 @@ impl Agent {
         workspace: PathBuf,
         verify_policy: SandboxPolicy,
         output_store: Arc<ToolOutputStore>,
+        mcp_servers: Vec<McpServerConfig>,
         events: mpsc::Sender<Event>,
         approvals: mpsc::Receiver<(String, Decision)>,
     ) -> Self {
@@ -148,6 +154,7 @@ impl Agent {
             workspace,
             verify_policy,
             output_store,
+            mcp_servers,
             events,
             approvals: Arc::new(Mutex::new(approvals)),
             always_allow: Arc::new(Mutex::new(Vec::new())),
@@ -190,8 +197,10 @@ impl Agent {
             .send(Event::TurnStarted { turn_id: turn.id })
             .await;
 
+        let delegated_mcp = self.provider.executes_configured_mcp()
+            && self.mcp_servers.iter().any(|server| server.enabled);
         if self.provider.delegates_execution()
-            && self.approval != ApprovalPolicy::Never
+            && (self.approval != ApprovalPolicy::Never || delegated_mcp)
             && !self.approve_delegated_turn().await?
         {
             let text = "Delegated account-provider execution was denied by the user.";
@@ -235,46 +244,107 @@ impl Agent {
                 messages,
                 tools: self.registry.specs(),
                 max_tokens: 8192,
+                delegated_tools: self.registry.external_specs(),
+                delegated_tool_executor: Some(Arc::new(AgentDelegatedToolExecutor {
+                    agent: self.clone_handle(),
+                    cancel: cancel.clone(),
+                })),
+                mcp_servers: self.mcp_servers.clone(),
             };
 
-            // ---- stream ----
-            let mut stream = self.provider.stream(req).await?;
-            let mut text = String::new();
-            let mut calls: Vec<ToolCall> = Vec::new();
-            let mut stop = StopReason::Stop;
-            let mut round_output_tokens = 0i64;
-
-            loop {
-                let next = tokio::select! {
-                    biased;
-                    // Cancellation wins the race deliberately: an interrupt
-                    // that waits for the next token is not an interrupt.
-                    _ = cancel.cancelled() => {
-                        stop = StopReason::Cancelled;
-                        None
+            // ---- stream + safe recall ----
+            // A normal tool-calling provider has not executed anything until
+            // dispatch below, so a completely silent transient failure is
+            // safe to recall. Delegated coding CLIs may already have changed
+            // files internally, therefore they are deliberately never
+            // replayed automatically.
+            let mut recall = 0_u8;
+            let (text, calls, stop, round_usage) = loop {
+                let mut stream = match self.provider.stream(req.clone()).await {
+                    Ok(stream) => stream,
+                    Err(error)
+                        if !self.provider.delegates_execution()
+                            && recall < 2
+                            && crate::provider::retryable_provider_error(&error) =>
+                    {
+                        recall += 1;
+                        self.wait_before_recall(recall, &cancel, &error.to_string())
+                            .await?;
+                        continue;
                     }
-                    d = futures_util::StreamExt::next(&mut stream) => d,
+                    Err(error) => return Err(error),
                 };
+                let mut text = String::new();
+                let mut calls: Vec<ToolCall> = Vec::new();
+                let mut stop = StopReason::Stop;
+                let mut round_usage = crate::provider::Usage::default();
+                let mut stream_error = None;
 
-                let Some(delta) = next else { break };
+                loop {
+                    let next = tokio::select! {
+                        biased;
+                        // Cancellation wins the race deliberately: an interrupt
+                        // that waits for the next token is not an interrupt.
+                        _ = cancel.cancelled() => {
+                            stop = StopReason::Cancelled;
+                            None
+                        }
+                        d = futures_util::StreamExt::next(&mut stream) => d,
+                    };
 
-                match delta? {
-                    Delta::Text(t) => {
-                        text.push_str(&t);
-                        let _ = self.events.send(Event::Token { text: t }).await;
-                    }
-                    Delta::Reasoning(t) => {
-                        let _ = self.events.send(Event::Reasoning { text: t }).await;
-                    }
-                    Delta::ToolCall(c) => calls.push(c),
-                    Delta::Done { reason, usage } => {
-                        stop = reason;
-                        usage_in += usage.input_tokens;
-                        usage_out += usage.output_tokens;
-                        round_output_tokens = usage.output_tokens;
+                    let Some(delta) = next else { break };
+                    match delta {
+                        Ok(Delta::Text(fragment)) => {
+                            text.push_str(&fragment);
+                            let _ = self.events.send(Event::Token { text: fragment }).await;
+                        }
+                        Ok(Delta::Reasoning(fragment)) => {
+                            let _ = self.events.send(Event::Reasoning { text: fragment }).await;
+                        }
+                        Ok(Delta::ToolCall(call)) => calls.push(call),
+                        Ok(Delta::Done { reason, usage }) => {
+                            stop = reason;
+                            round_usage = usage;
+                        }
+                        Err(error) => {
+                            stream_error = Some(error);
+                            break;
+                        }
                     }
                 }
-            }
+
+                if let Some(error) = stream_error {
+                    if !self.provider.delegates_execution()
+                        && text.is_empty()
+                        && calls.is_empty()
+                        && recall < 2
+                        && crate::provider::retryable_provider_error(&error)
+                    {
+                        recall += 1;
+                        self.wait_before_recall(recall, &cancel, &error.to_string())
+                            .await?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if stop != StopReason::Cancelled
+                    && text.trim().is_empty()
+                    && calls.is_empty()
+                    && !self.provider.delegates_execution()
+                {
+                    if recall < 2 {
+                        recall += 1;
+                        self.wait_before_recall(recall, &cancel, "empty provider response")
+                            .await?;
+                        continue;
+                    }
+                    anyhow::bail!("model returned no response after two automatic recalls");
+                }
+                break (text, calls, stop, round_usage);
+            };
+            usage_in += round_usage.input_tokens;
+            usage_out += round_usage.output_tokens;
+            let round_output_tokens = round_usage.output_tokens;
 
             // Persist before anything else can fail.
             let assistant = self.store.append_turn(
@@ -417,6 +487,34 @@ impl Agent {
             }
         };
 
+        let definition = tool.definition();
+        if self.verify_policy.mode == crate::sandbox::SandboxMode::ReadOnly
+            && definition.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    crate::tooling::ToolEffect::ExternalWrite
+                        | crate::tooling::ToolEffect::ExternalDestructive
+                )
+            })
+        {
+            self.record_result(
+                &call,
+                turn_id,
+                "blocked by the read-only sandbox: this MCP tool may change external state",
+                false,
+            )
+            .await?;
+            let _ = self
+                .events
+                .send(Event::ToolCallEnded {
+                    call_id: call.id,
+                    ok: false,
+                    duration_ms: 0,
+                })
+                .await;
+            return Ok(CompletedToolCall::default());
+        }
+
         if !self.approved(&call, &tool, &summary).await? {
             self.record_result(&call, turn_id, "denied by the user", false)
                 .await?;
@@ -501,8 +599,10 @@ impl Agent {
         {
             return Ok(true);
         }
-        if definition.approval == ApprovalRequirement::Standard
-            && self.always_allow.lock().await.iter().any(|s| s == summary)
+        if matches!(
+            definition.approval,
+            ApprovalRequirement::Standard | ApprovalRequirement::External
+        ) && self.always_allow.lock().await.iter().any(|s| s == summary)
         {
             return Ok(true);
         }
@@ -515,13 +615,23 @@ impl Agent {
             ApprovalRequirement::Standard => {
                 format!("`{}` writes or executes with normal OS access", call.name)
             }
+            ApprovalRequirement::External => format!(
+                "`{}` calls an external MCP server and may read or change data outside the workspace",
+                call.name
+            ),
             ApprovalRequirement::None => unreachable!(),
         };
+        let destructive = definition
+            .effects
+            .contains(&crate::tooling::ToolEffect::ExternalDestructive);
         self.request_approval(
             call.id.clone(),
             summary.to_string(),
             reason,
-            definition.approval == ApprovalRequirement::Standard,
+            matches!(
+                definition.approval,
+                ApprovalRequirement::Standard | ApprovalRequirement::External
+            ) && !destructive,
         )
         .await
     }
@@ -539,6 +649,29 @@ impl Agent {
             true,
         )
         .await
+    }
+
+    async fn wait_before_recall(
+        &self,
+        recall: u8,
+        cancel: &CancellationToken,
+        diagnostic: &str,
+    ) -> Result<()> {
+        let delay_ms = if recall == 1 { 500 } else { 1_500 };
+        let short: String = diagnostic.chars().take(240).collect();
+        let _ = self
+            .events
+            .send(Event::Notice {
+                message: format!(
+                    "modelul nu a răspuns; reapelare automată {recall}/2 în {delay_ms} ms ({short})"
+                ),
+            })
+            .await;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => anyhow::bail!("provider recall cancelled"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => Ok(()),
+        }
     }
 
     async fn request_approval(
@@ -706,6 +839,9 @@ impl Agent {
             ],
             tools: Vec::new(),
             max_tokens: 4_096,
+            delegated_tools: Vec::new(),
+            delegated_tool_executor: None,
+            mcp_servers: Vec::new(),
         };
 
         let mut summary = String::new();
@@ -765,11 +901,119 @@ impl Agent {
             workspace: self.workspace.clone(),
             verify_policy: self.verify_policy.clone(),
             output_store: self.output_store.clone(),
+            mcp_servers: self.mcp_servers.clone(),
             events: self.events.clone(),
             approvals: self.approvals.clone(),
             always_allow: self.always_allow.clone(),
         }
     }
+}
+
+struct AgentDelegatedToolExecutor {
+    agent: Agent,
+    cancel: CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl DelegatedToolExecutor for AgentDelegatedToolExecutor {
+    async fn call(
+        &self,
+        call_id: String,
+        name: String,
+        arguments: Value,
+    ) -> Result<DelegatedToolResult> {
+        let Some(tool) = self.agent.registry.find(&name) else {
+            return Ok(DelegatedToolResult {
+                content: format!("unknown delegated tool `{name}`"),
+                success: false,
+            });
+        };
+        let definition = tool.definition();
+        if definition.approval != ApprovalRequirement::External {
+            return Ok(DelegatedToolResult {
+                content: format!("`{name}` is not an external MCP tool"),
+                success: false,
+            });
+        }
+        let call = ToolCall {
+            id: call_id,
+            name,
+            arguments: serde_json::to_string(&arguments)?,
+        };
+        let summary = summarise(&call);
+        let _ = self
+            .agent
+            .events
+            .send(Event::ToolCallStarted {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                summary: summary.clone(),
+            })
+            .await;
+
+        if self.agent.verify_policy.mode == crate::sandbox::SandboxMode::ReadOnly
+            && definition.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    crate::tooling::ToolEffect::ExternalWrite
+                        | crate::tooling::ToolEffect::ExternalDestructive
+                )
+            })
+        {
+            let content =
+                "blocked by the read-only sandbox: this MCP tool may change external state";
+            end_delegated_tool(&self.agent, &call.id, false, 0).await;
+            return Ok(DelegatedToolResult {
+                content: content.into(),
+                success: false,
+            });
+        }
+        if !self.agent.approved(&call, &tool, &summary).await? {
+            end_delegated_tool(&self.agent, &call.id, false, 0).await;
+            return Ok(DelegatedToolResult {
+                content: "denied by the user".into(),
+                success: false,
+            });
+        }
+
+        let started = Instant::now();
+        let outcome = match tool.call(arguments, &self.cancel).await {
+            Ok(outcome) => outcome,
+            Err(error) => ToolOutcome {
+                content: format!("tool failed: {error}"),
+                ok: false,
+                touched: Vec::new(),
+                patches: Vec::new(),
+            },
+        };
+        end_delegated_tool(
+            &self.agent,
+            &call.id,
+            outcome.ok,
+            started.elapsed().as_millis() as u64,
+        )
+        .await;
+        let content = self
+            .agent
+            .output_store
+            .present(&outcome.content)
+            .unwrap_or_else(|_| outcome.content.chars().take(32 * 1024).collect());
+        Ok(DelegatedToolResult {
+            content,
+            success: outcome.ok,
+        })
+    }
+}
+
+async fn end_delegated_tool(agent: &Agent, call_id: &str, ok: bool, duration_ms: u64) {
+    let _ = agent
+        .events
+        .send(Event::ToolCallEnded {
+            call_id: call_id.to_string(),
+            ok,
+            duration_ms,
+        })
+        .await;
 }
 
 pub(crate) fn automatic_session_title(text: &str) -> String {

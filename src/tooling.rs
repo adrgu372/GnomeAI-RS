@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio_util::sync::CancellationToken;
@@ -21,6 +21,13 @@ pub enum ToolEffect {
     WorkspaceRead,
     WorkspaceWrite,
     NetworkRead,
+    /// Reads state owned by another application or remote service.
+    ExternalRead,
+    /// May change state owned by another application or remote service.
+    ExternalWrite,
+    /// May delete, send, purchase, publish, or otherwise cause a difficult to
+    /// reverse external action.
+    ExternalDestructive,
     UserProcess,
     PrivilegeEscalation,
 }
@@ -36,6 +43,9 @@ pub enum ApprovalRequirement {
     None,
     /// Obeys the selected normal/full-access policy.
     Standard,
+    /// External MCP actions always remain visible to the user, including in
+    /// full-access mode.
+    External,
     /// Root or equivalent privilege escalation. Full-access never implies root.
     Privileged,
 }
@@ -138,6 +148,23 @@ impl Registry {
             .values()
             .map(|tool| tool.definition().spec)
             .collect()
+    }
+
+    /// Tools supplied by external MCP servers. Delegated providers must only
+    /// receive these through their bridge; exposing built-ins as well would
+    /// duplicate the provider's own shell and file tools.
+    pub fn external_specs(&self) -> Vec<ToolSpec> {
+        self.tools
+            .values()
+            .filter_map(|tool| {
+                let definition = tool.definition();
+                (definition.approval == ApprovalRequirement::External).then_some(definition.spec)
+            })
+            .collect()
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
     }
 
     pub fn find(&self, name: &str) -> Option<Arc<dyn Tool>> {

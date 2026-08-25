@@ -22,10 +22,15 @@ use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
+use crate::config::McpServerConfig;
+use crate::config::McpTransport;
 use crate::sandbox::SandboxMode;
 
 // ---------------------------------------------------------------------------
@@ -208,11 +213,33 @@ pub enum Delta {
     },
 }
 
+#[derive(Clone)]
 pub struct Request {
     pub model: String,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub max_tokens: u32,
+    /// MCP tools bridged into providers that normally execute their own tools
+    /// instead of returning ordinary tool calls to the outer agent.
+    pub delegated_tools: Vec<ToolSpec>,
+    pub delegated_tool_executor: Option<Arc<dyn DelegatedToolExecutor>>,
+    /// Used by delegated CLIs that accept MCP configuration directly.
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+pub struct DelegatedToolResult {
+    pub content: String,
+    pub success: bool,
+}
+
+#[async_trait]
+pub trait DelegatedToolExecutor: Send + Sync {
+    async fn call(
+        &self,
+        call_id: String,
+        name: String,
+        arguments: Value,
+    ) -> Result<DelegatedToolResult>;
 }
 
 #[async_trait]
@@ -224,7 +251,39 @@ pub trait Provider: Send + Sync {
     fn delegates_execution(&self) -> bool {
         false
     }
+    /// The provider CLI consumes MCP configuration and executes those calls
+    /// internally, so the outer agent can approve the delegated turn but
+    /// cannot interpose on each tools/call.
+    fn executes_configured_mcp(&self) -> bool {
+        false
+    }
     async fn stream(&self, req: Request) -> Result<BoxStream<'static, Result<Delta>>>;
+}
+
+/// Conservative retry classification used only before a provider has emitted
+/// text or executable tool calls. Authentication, validation and unknown-model
+/// errors intentionally fail immediately.
+pub fn retryable_provider_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    [
+        "timeout",
+        "timed out",
+        "connection",
+        "connect error",
+        "connection reset",
+        "unexpected eof",
+        "temporarily",
+        "unavailable",
+        "overloaded",
+        "rate limit",
+        "status 429",
+        "status 500",
+        "status 502",
+        "status 503",
+        "status 504",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 // ---------------------------------------------------------------------------
@@ -855,15 +914,30 @@ impl Provider for CliProvider {
         true
     }
 
+    fn executes_configured_mcp(&self) -> bool {
+        true
+    }
+
     async fn stream(&self, req: Request) -> Result<BoxStream<'static, Result<Delta>>> {
         let flavor = self.flavor;
         let workspace = self.workspace.clone();
         let sandbox = self.sandbox;
         let model = req.model.clone();
         let prompt = cli_prompt(&req.messages);
+        let mcp_servers = req.mcp_servers;
 
         Ok(Box::pin(async_stream::try_stream! {
-            let (program, args) = cli_command(flavor, &workspace, sandbox, &model);
+            // Claude Code receives only this request's enabled MCP servers.
+            // The owner-only temporary file is deleted when the stream ends,
+            // so GnomeAI does not mutate ~/.claude or inherit unrelated MCPs.
+            let mcp_config = TemporaryMcpConfig::create(&mcp_servers)?;
+            let (program, args) = cli_command(
+                flavor,
+                &workspace,
+                sandbox,
+                &model,
+                mcp_config.as_ref().map(|config| config.path.as_path()),
+            );
             let mut child = tokio::process::Command::new(&program)
                 .args(&args)
                 .current_dir(&workspace)
@@ -907,6 +981,7 @@ fn cli_command(
     _workspace: &Path,
     sandbox: SandboxMode,
     model: &str,
+    mcp_config: Option<&Path>,
 ) -> (PathBuf, Vec<String>) {
     match flavor {
         CliFlavor::Claude => {
@@ -930,8 +1005,76 @@ fn cli_command(
             if model != "default" {
                 args.extend(["--model".to_string(), model.to_string()]);
             }
+            if let Some(path) = mcp_config {
+                args.extend([
+                    "--mcp-config".to_string(),
+                    path.display().to_string(),
+                    "--strict-mcp-config".to_string(),
+                ]);
+            }
             (claude_executable(), args)
         }
+    }
+}
+
+struct TemporaryMcpConfig {
+    path: PathBuf,
+}
+
+impl TemporaryMcpConfig {
+    fn create(servers: &[McpServerConfig]) -> Result<Option<Self>> {
+        let mut configured = serde_json::Map::new();
+        for server in servers.iter().filter(|server| server.enabled) {
+            let value = match server.transport {
+                McpTransport::StreamableHttp => json!({
+                    "type": "http",
+                    "url": server.url,
+                    "headers": server.headers,
+                }),
+                McpTransport::Stdio => json!({
+                    "type": "stdio",
+                    "command": server.command,
+                    "args": server.args,
+                    "env": server.env,
+                }),
+            };
+            configured.insert(server.name.clone(), value);
+        }
+        if configured.is_empty() {
+            return Ok(None);
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "gnomeai-claude-mcp-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| {
+                format!(
+                    "cannot create private Claude MCP config `{}`",
+                    path.display()
+                )
+            })?;
+        if let Err(error) = serde_json::to_writer(
+            file,
+            &json!({
+                "mcpServers": configured,
+            }),
+        ) {
+            let _ = fs::remove_file(&path);
+            return Err(error).context("cannot serialize Claude MCP config");
+        }
+        Ok(Some(Self { path }))
+    }
+}
+
+impl Drop for TemporaryMcpConfig {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -1339,6 +1482,9 @@ mod tests {
             }],
             tools: Vec::new(),
             max_tokens: 123,
+            delegated_tools: Vec::new(),
+            delegated_tool_executor: None,
+            mcp_servers: Vec::new(),
         };
         let body = provider.body(&request);
         assert_eq!(body["max_completion_tokens"], 123);
@@ -1464,12 +1610,76 @@ mod tests {
             Path::new("/tmp/project"),
             SandboxMode::ReadOnly,
             "default",
+            None,
         );
         assert!(
             claude
                 .windows(2)
                 .any(|args| args == ["--permission-mode", "plan"])
         );
+    }
+
+    #[test]
+    fn claude_cli_receives_only_the_explicit_temporary_mcp_config() {
+        let path = Path::new("/tmp/gnomeai-test-mcp.json");
+        let (_, claude) = cli_command(
+            CliFlavor::Claude,
+            Path::new("/tmp/project"),
+            SandboxMode::Normal,
+            "default",
+            Some(path),
+        );
+        assert!(
+            claude
+                .windows(2)
+                .any(|args| args == ["--mcp-config", path.to_str().unwrap()])
+        );
+        assert!(claude.iter().any(|arg| arg == "--strict-mcp-config"));
+    }
+
+    #[test]
+    fn claude_mcp_config_is_private_complete_and_ephemeral() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut server = McpServerConfig {
+            name: "browseros".into(),
+            url: "http://127.0.0.1:9239/mcp".into(),
+            ..McpServerConfig::default()
+        };
+        server
+            .headers
+            .insert("Authorization".into(), "Bearer test".into());
+        let config = TemporaryMcpConfig::create(&[server]).unwrap().unwrap();
+        let path = config.path.clone();
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            value["mcpServers"]["browseros"]["url"],
+            "http://127.0.0.1:9239/mcp"
+        );
+        assert_eq!(
+            value["mcpServers"]["browseros"]["headers"]["Authorization"],
+            "Bearer test"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(config);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn recall_classifier_retries_transient_but_not_authentication_errors() {
+        assert!(retryable_provider_error(&anyhow::anyhow!(
+            "upstream status 503 unavailable"
+        )));
+        assert!(retryable_provider_error(&anyhow::anyhow!(
+            "connection reset by peer"
+        )));
+        assert!(!retryable_provider_error(&anyhow::anyhow!(
+            "401 invalid API key"
+        )));
+        assert!(!retryable_provider_error(&anyhow::anyhow!("unknown model")));
     }
 
     #[test]
@@ -1567,6 +1777,9 @@ mod http_tests {
                 parameters: json!({"type": "object"}),
             }],
             max_tokens: 128,
+            delegated_tools: Vec::new(),
+            delegated_tool_executor: None,
+            mcp_servers: Vec::new(),
         }
     }
 

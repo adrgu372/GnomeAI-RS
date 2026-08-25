@@ -17,6 +17,8 @@ use std::fmt;
 use std::path::PathBuf;
 use zeroize::Zeroize;
 
+use crate::config::McpServerConfig;
+
 /// A serialisable secret that is always redacted from diagnostics.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -112,6 +114,12 @@ pub enum Op {
     /// persisted outside the conversation transcript.
     SetWebSearch {
         enabled: bool,
+    },
+
+    /// Replace the generic MCP server list and rebuild the shared tool
+    /// registry. Each enabled server is connected independently.
+    SetMcpServers {
+        servers: Vec<McpServerConfig>,
     },
 
     /// Change the sandbox policy mid-session. Narrowing takes effect on the
@@ -265,6 +273,8 @@ pub enum Event {
         /// Available models for the current provider, for the model picker.
         #[serde(default)]
         models: Vec<String>,
+        #[serde(default)]
+        mcp_servers: Vec<McpServerConfig>,
     },
 
     SessionReset,
@@ -289,6 +299,10 @@ pub enum Event {
 
     WebSearchChanged {
         enabled: bool,
+    },
+
+    McpConfigChanged {
+        servers: Vec<McpServerConfig>,
     },
 
     WhatsAppConfigChanged {
@@ -358,6 +372,11 @@ pub enum Event {
         command: String,
         keyring_available: bool,
         attempt: u8,
+        /// Exact PAM/sudo prompt when authentication uses the dynamic
+        /// askpass conversation. It can be a password, OTP or another
+        /// administrator challenge and is never sent to the model.
+        prompt: Option<String>,
+        dynamic: bool,
         message: Option<String>,
     },
 

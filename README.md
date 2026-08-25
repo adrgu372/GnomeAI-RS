@@ -5,8 +5,23 @@ application keeps the proven agent core and `Op`/`Event` protocol of the former
 terminal interface while replacing the TUI and browser page with one native
 window.
 
-Current package version: **2.0.2**. See [CHANGELOG.md](CHANGELOG.md) for the
+Current package version: **2.2.0**. See [CHANGELOG.md](CHANGELOG.md) for the
 historical release notes.
+
+## What changed in 2.2
+
+Version 2.2 improves long interactive sessions and makes provider output much
+easier to read and operate from the native interface.
+
+| Area | Version 2.2 |
+| --- | --- |
+| Responses | Native Markdown layout for headings, lists, quotes, tables and fenced code, with one-click code copying |
+| Transcript | Reliable mouse-wheel scrolling over selectable text, including while a selection is active |
+| Clipboard | Native keyboard, context-menu and Linux primary-selection copy/paste behavior |
+| MCP | Generic Streamable HTTP and stdio MCP servers shared by API and account-backed providers |
+| Recovery | Automatic recall after transient, empty or interrupted provider responses |
+| Privileges | Dynamic PAM/sudo prompts through a private local askpass channel |
+| WhatsApp | Separate conversation browser with structured assistant responses |
 
 ## What changed in 2.0
 

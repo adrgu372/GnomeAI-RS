@@ -1,3 +1,41 @@
+# GnomeAI-RS 2.2.0 - 2026-08-25
+
+## Structured native responses
+
+- Added native Markdown rendering for assistant responses in the desktop and
+  WhatsApp conversation views: headings, paragraphs, nested ordered and
+  unordered lists, task markers, quotes, separators, tables and fenced code.
+- Added language labels and one-click copying to code blocks while preserving
+  selectable text and the existing copy-selection/context-menu behavior.
+- Fixed transcript mouse-wheel scrolling over read-only selectable text,
+  including while a text selection is active. The main transcript and the
+  separate WhatsApp transcript both use the corrected wheel path.
+- Added native keyboard, context-menu and Linux primary-selection clipboard
+  behavior for transcript and composer text.
+
+## Generic MCP and provider recovery
+
+- Added configurable MCP servers over Streamable HTTP and stdio. Native tools
+  are registered in one shared approval-aware registry and work with API-key
+  providers as well as delegated OpenAI/Codex and Anthropic/Claude sessions.
+- Added MCP resource/content handling and native settings for server command,
+  URL, headers, environment variables and enablement.
+- Added up to two automatic recalls after transient provider failures, empty
+  responses, interrupted streams or silent streams before the interface marks
+  the provider unavailable.
+
+## Privileges and WhatsApp
+
+- Reworked elevated-command authentication around dynamic PAM/sudo prompts and
+  a private local askpass socket, with cancellation, timeouts and diagnostics.
+  Only actual password prompts may be saved to the keyring.
+- Added a separate WhatsApp conversations window with chat selection, message
+  history and structured assistant output.
+- Added regression coverage for structured Markdown parsing, streaming code,
+  links, Unicode selection, WhatsApp filtering and conversation display.
+
+---
+
 # GnomeAI-RS 2.0.2 - 2026-08-23
 
 ## English native interface

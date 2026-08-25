@@ -206,6 +206,8 @@ struct PrivilegeDialog {
     remember: bool,
     keyring_available: bool,
     attempt: u8,
+    prompt: Option<String>,
+    dynamic: bool,
     message: Option<String>,
 }
 
@@ -624,6 +626,8 @@ fn apply_event(app: &mut App, ev: Event) {
             app.web_search_enabled = enabled;
         }
 
+        Event::McpConfigChanged { .. } => {}
+
         Event::TurnStarted { .. } => {
             app.busy = true;
             app.turn_started = Some(Instant::now());
@@ -698,6 +702,8 @@ fn apply_event(app: &mut App, ev: Event) {
             command,
             keyring_available,
             attempt,
+            prompt,
+            dynamic,
             message,
         } => {
             if app.notifications_enabled {
@@ -710,6 +716,8 @@ fn apply_event(app: &mut App, ev: Event) {
                 remember: false,
                 keyring_available,
                 attempt,
+                prompt,
+                dynamic,
                 message,
             });
         }
@@ -3077,10 +3085,20 @@ fn draw_privilege_dialog(f: &mut Frame, dialog: &PrivilegeDialog, screen: Rect) 
         .as_deref()
         .map(|text| format!("\n{text}\n"))
         .unwrap_or_default();
+    let prompt = dialog
+        .prompt
+        .as_deref()
+        .map(|text| format!("\nCerere sistem: {text}\n"))
+        .unwrap_or_default();
     let masked = "•".repeat(dialog.input.chars().count());
+    let step = if dialog.dynamic {
+        format!("pasul {}", dialog.attempt)
+    } else {
+        format!("încercarea {}/3", dialog.attempt)
+    };
     let body = format!(
-        "Comandă root:\n{}\n{}\nParola sudo (încercarea {}/3):\n{}\n\n{}\n\nEnter confirmă · Esc anulează\nParola nu este trimisă modelului.",
-        dialog.command, message, dialog.attempt, masked, remembered
+        "Comandă root:\n{}\n{}{}\nRăspuns de autentificare ({}):\n{}\n\n{}\n\nEnter confirmă · Esc anulează\nSecretul nu este trimis modelului.",
+        dialog.command, message, prompt, step, masked, remembered
     );
 
     f.render_widget(Clear, area);

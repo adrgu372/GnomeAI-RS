@@ -13,7 +13,7 @@ use eframe::egui::{
 };
 use qrcode::{QrCode, types::Color as QrColor};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, McpServerConfig, McpTransport};
 use crate::protocol::{Decision, Event, Op, SecretString, SessionSummary};
 use crate::provider_catalog::{AuthKind, PROVIDERS};
 use crate::uploads::{
@@ -42,7 +42,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/provider", "Choose provider or account login"),
     ("/model", "Choose the active model"),
     ("/websearch", "Toggle web search"),
-    ("/whatsapp", "Open WhatsApp connection and settings"),
+    ("/whatsapp", "Open separate WhatsApp conversations"),
     ("/nodes", "Manage paired lightweight devices"),
     ("/sandbox", "Set read-only, normal or full-access"),
     ("/skills", "List installed skills"),
@@ -128,6 +128,8 @@ struct PrivilegeDialog {
     remember: bool,
     keyring_available: bool,
     attempt: u8,
+    prompt: Option<String>,
+    dynamic: bool,
     message: Option<String>,
 }
 
@@ -275,6 +277,14 @@ enum WhatsAppReply {
     Status(std::result::Result<Value, String>),
     Action(std::result::Result<Value, String>),
     Sent(std::result::Result<Value, String>),
+    Conversations(std::result::Result<WhatsAppConversationSnapshot, String>),
+}
+
+#[derive(Debug)]
+struct WhatsAppConversationSnapshot {
+    chats: Vec<(String, String)>,
+    active_id: Option<String>,
+    active_chat: Option<Value>,
 }
 
 enum NodeReply {
@@ -362,7 +372,9 @@ struct GuiApp {
     show_settings: bool,
     show_activity: bool,
     show_whatsapp: bool,
+    show_whatsapp_conversations: bool,
     show_nodes: bool,
+    mcp_servers: Vec<McpServerConfig>,
     whatsapp_enabled: bool,
     whatsapp_assistant_name: String,
     whatsapp_has_own_number: bool,
@@ -371,6 +383,11 @@ struct GuiApp {
     whatsapp_feedback: Option<String>,
     whatsapp_request_pending: bool,
     whatsapp_last_poll: Instant,
+    whatsapp_conversations: Vec<(String, String)>,
+    whatsapp_selected_chat: Option<String>,
+    whatsapp_active_chat: Option<Value>,
+    whatsapp_conversations_pending: bool,
+    whatsapp_conversations_last_poll: Instant,
     whatsapp_test_jid: String,
     whatsapp_test_message: String,
     whatsapp_log_file: PathBuf,
@@ -460,7 +477,9 @@ impl GuiApp {
             show_settings: false,
             show_activity: false,
             show_whatsapp: false,
+            show_whatsapp_conversations: false,
             show_nodes: false,
+            mcp_servers: Vec::new(),
             whatsapp_enabled: whatsapp.enabled,
             whatsapp_assistant_name: whatsapp.assistant_name,
             whatsapp_has_own_number: whatsapp.has_own_number,
@@ -469,6 +488,11 @@ impl GuiApp {
             whatsapp_feedback: None,
             whatsapp_request_pending: false,
             whatsapp_last_poll: Instant::now() - Duration::from_secs(10),
+            whatsapp_conversations: Vec::new(),
+            whatsapp_selected_chat: None,
+            whatsapp_active_chat: None,
+            whatsapp_conversations_pending: false,
+            whatsapp_conversations_last_poll: Instant::now() - Duration::from_secs(10),
             whatsapp_test_jid: String::new(),
             whatsapp_test_message: String::new(),
             whatsapp_log_file: whatsapp.log_file,
@@ -518,6 +542,53 @@ impl GuiApp {
             )
             .await;
             let _ = sender.send(WhatsAppReply::Status(result));
+        });
+    }
+
+    fn poll_whatsapp_conversations(&mut self, force: bool) {
+        if self.whatsapp_conversations_pending
+            || (!force && self.whatsapp_conversations_last_poll.elapsed() < Duration::from_secs(2))
+        {
+            return;
+        }
+        self.whatsapp_conversations_pending = true;
+        self.whatsapp_conversations_last_poll = Instant::now();
+        let sender = self.whatsapp_tx.clone();
+        let api_base = self.whatsapp_service.api_base.clone();
+        let token = self.whatsapp_service.token.clone();
+        let selected = self.whatsapp_selected_chat.clone();
+        self.runtime.spawn(async move {
+            let result = async {
+                let list = http_json(
+                    reqwest::Client::new()
+                        .get(format!("{api_base}/api/chats"))
+                        .header("X-Gnomef-Token", &token),
+                )
+                .await?;
+                let chats = whatsapp_chat_summaries(&list);
+                let active_id = selected
+                    .filter(|selected| chats.iter().any(|(id, _)| id == selected))
+                    .or_else(|| chats.first().map(|(id, _)| id.clone()));
+                let active_chat = if let Some(id) = active_id.as_deref() {
+                    Some(
+                        http_json(
+                            reqwest::Client::new()
+                                .get(format!("{api_base}/api/chats/{id}"))
+                                .header("X-Gnomef-Token", &token),
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                Ok(WhatsAppConversationSnapshot {
+                    chats,
+                    active_id,
+                    active_chat,
+                })
+            }
+            .await;
+            let _ = sender.send(WhatsAppReply::Conversations(result));
         });
     }
 
@@ -694,6 +765,33 @@ impl GuiApp {
                     self.whatsapp_test_message.clear();
                 }
                 WhatsAppReply::Sent(Err(error)) => self.whatsapp_feedback = Some(error),
+                WhatsAppReply::Conversations(Ok(snapshot)) => {
+                    self.whatsapp_conversations_pending = false;
+                    self.whatsapp_conversations = snapshot.chats;
+                    let selected_is_available =
+                        self.whatsapp_selected_chat
+                            .as_ref()
+                            .is_some_and(|selected| {
+                                self.whatsapp_conversations
+                                    .iter()
+                                    .any(|(id, _)| id == selected)
+                            });
+                    if !selected_is_available {
+                        self.whatsapp_selected_chat = snapshot.active_id.clone();
+                    }
+                    if self.whatsapp_selected_chat == snapshot.active_id {
+                        self.whatsapp_active_chat = snapshot.active_chat;
+                    } else {
+                        // The user selected another row while this request was in flight.
+                        // Keep that selection and immediately fetch its transcript.
+                        self.whatsapp_active_chat = None;
+                        self.poll_whatsapp_conversations(true);
+                    }
+                }
+                WhatsAppReply::Conversations(Err(error)) => {
+                    self.whatsapp_conversations_pending = false;
+                    self.whatsapp_feedback = Some(error);
+                }
             }
         }
         while let Ok(reply) = self.node_rx.try_recv() {
@@ -731,6 +829,7 @@ impl GuiApp {
                 git_branch,
                 recent_workspaces,
                 models,
+                mcp_servers,
             } => {
                 self.session_id = session_id;
                 self.provider = provider;
@@ -740,6 +839,7 @@ impl GuiApp {
                 self.web_search_enabled = web_search_enabled;
                 self.branch = git_branch;
                 self.recent_workspaces = recent_workspaces;
+                self.mcp_servers = mcp_servers;
                 self.set_models(models);
                 self.send(Op::ListSessions);
             }
@@ -783,6 +883,7 @@ impl GuiApp {
                 self.show_provider = false;
             }
             Event::WebSearchChanged { enabled } => self.web_search_enabled = enabled,
+            Event::McpConfigChanged { servers } => self.mcp_servers = servers,
             Event::WhatsAppConfigChanged {
                 enabled,
                 assistant_name,
@@ -886,6 +987,8 @@ impl GuiApp {
                 command,
                 keyring_available,
                 attempt,
+                prompt,
+                dynamic,
                 message,
             } => {
                 self.privilege = Some(PrivilegeDialog {
@@ -895,6 +998,8 @@ impl GuiApp {
                     remember: false,
                     keyring_available,
                     attempt,
+                    prompt,
+                    dynamic,
                     message,
                 });
             }
@@ -1033,8 +1138,9 @@ impl GuiApp {
                 enabled: !self.web_search_enabled,
             }),
             "/whatsapp" => {
-                self.show_whatsapp = true;
+                self.show_whatsapp_conversations = true;
                 self.poll_whatsapp(true);
+                self.poll_whatsapp_conversations(true);
             }
             "/nodes" => {
                 self.show_nodes = true;
@@ -1502,8 +1608,9 @@ impl GuiApp {
                     self.show_models = true;
                 }
                 if nav_button(ui, "WhatsApp", whatsapp_connected, NavIcon::WhatsApp).clicked() {
-                    self.show_whatsapp = true;
+                    self.show_whatsapp_conversations = true;
                     self.poll_whatsapp(true);
+                    self.poll_whatsapp_conversations(true);
                 }
                 if nav_button(ui, "Settings", self.show_settings, NavIcon::Settings).clicked() {
                     self.show_settings = true;
@@ -1821,7 +1928,14 @@ impl GuiApp {
                     .id_salt("transcript")
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
+                    // TextEdit owns the pointer while text is being selected.
+                    // In egui 0.36 that prevents ScrollArea's built-in wheel
+                    // path from running (`dragged_id` is set). Disable that
+                    // path and forward the wheel explicitly from the content
+                    // UI so scrolling keeps working over text and mid-drag.
+                    .wheel_scroll_multiplier(Vec2::ZERO)
                     .show(ui, |ui| {
+                        forward_mouse_wheel_to_parent_scroll(ui);
                         let content_width = ui.available_width().min(900.0);
                         let gutter = ((ui.available_width() - content_width) / 2.0).max(0.0);
                         ui.horizontal(|ui| {
@@ -1985,10 +2099,11 @@ impl GuiApp {
                         let composer_frame = frame.show(ui, |ui| {
                             let width = ui.available_width().max(160.0);
                             let rows = composer_rows(&self.composer, width);
+                            let composer_id = egui::Id::new("main_composer");
                             let response = ui.add_sized(
                                 [width, rows as f32 * 22.0 + 8.0],
                                 TextEdit::multiline(&mut self.composer)
-                                    .id(egui::Id::new("main_composer"))
+                                    .id(composer_id)
                                     .frame(egui::Frame::NONE)
                                     .desired_rows(rows)
                                     .desired_width(f32::INFINITY)
@@ -1998,6 +2113,53 @@ impl GuiApp {
                                         Key::Enter,
                                     )),
                             );
+                            if response.clicked_by(egui::PointerButton::Middle) {
+                                if let Some(text) = primary_selection_text() {
+                                    replace_text_selection(
+                                        &ctx,
+                                        composer_id,
+                                        &mut self.composer,
+                                        &text,
+                                    );
+                                }
+                            }
+                            response.context_menu(|ui| {
+                                if ui.button("Cut").clicked() {
+                                    response.request_focus();
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestCut);
+                                    ui.close();
+                                }
+                                if ui.button("Copy").clicked() {
+                                    response.request_focus();
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestCopy);
+                                    ui.close();
+                                }
+                                if ui.button("Paste").clicked() {
+                                    response.request_focus();
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                                    ui.close();
+                                }
+                                #[cfg(all(
+                                    unix,
+                                    not(any(target_os = "macos", target_os = "android"))
+                                ))]
+                                if ui.button("Paste primary selection").clicked() {
+                                    if let Some(text) = primary_selection_text() {
+                                        replace_text_selection(
+                                            &ctx,
+                                            composer_id,
+                                            &mut self.composer,
+                                            &text,
+                                        );
+                                    }
+                                    ui.close();
+                                }
+                                if ui.button("Select all").clicked() {
+                                    select_all_text(&ctx, composer_id, &self.composer);
+                                    response.request_focus();
+                                    ui.close();
+                                }
+                            });
                             if self.request_focus {
                                 response.request_focus();
                                 self.request_focus = false;
@@ -2099,6 +2261,7 @@ impl GuiApp {
         self.provider_dialog(ctx);
         self.model_dialog(ctx);
         self.session_dialog(ctx);
+        self.whatsapp_conversations_dialog(ctx);
         self.whatsapp_dialog(ctx);
         self.nodes_dialog(ctx);
         self.settings_dialog(ctx);
@@ -2171,6 +2334,8 @@ impl GuiApp {
         let old_sandbox = self.sandbox.clone();
         let old_web_search = self.web_search_enabled;
         let mut save_node_hub = false;
+        let mut save_mcp = false;
+        let mut remove_mcp = None;
 
         let dialog_size = Vec2::new(420.0, 360.0);
         egui::Window::new("Settings")
@@ -2213,6 +2378,128 @@ impl GuiApp {
                             }
                         });
                     });
+
+                ui.add_space(12.0);
+                ui.label(RichText::new("MCP SERVERS").small().strong());
+                ui.label(
+                    RichText::new(
+                        "Generic Streamable HTTP or stdio servers. MCP calls are approval-gated; delegated CLIs approve the turn.",
+                    )
+                    .small()
+                    .color(Color32::GRAY),
+                );
+                for (server_index, server) in self.mcp_servers.iter_mut().enumerate() {
+                    ui.add_space(5.0);
+                    egui::Frame::default()
+                        .fill(Color32::from_rgb(27, 27, 31))
+                        .corner_radius(9.0)
+                        .inner_margin(10.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut server.enabled, "Enabled");
+                                ui.add(
+                                    TextEdit::singleline(&mut server.name)
+                                        .hint_text("server-name")
+                                        .desired_width(150.0),
+                                );
+                                if ui.small_button("Remove").clicked() {
+                                    remove_mcp = Some(server_index);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Transport");
+                                egui::ComboBox::from_id_salt(("mcp_transport", server_index))
+                                    .selected_text(match server.transport {
+                                        McpTransport::StreamableHttp => "Streamable HTTP",
+                                        McpTransport::Stdio => "stdio",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut server.transport,
+                                            McpTransport::StreamableHttp,
+                                            "Streamable HTTP",
+                                        );
+                                        ui.selectable_value(
+                                            &mut server.transport,
+                                            McpTransport::Stdio,
+                                            "stdio",
+                                        );
+                                    });
+                            });
+                            match server.transport {
+                                McpTransport::StreamableHttp => {
+                                    ui.add(
+                                        TextEdit::singleline(&mut server.url)
+                                            .hint_text("http://127.0.0.1:9239/mcp")
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    edit_key_value_map(
+                                        ui,
+                                        &mut server.headers,
+                                        "Header",
+                                        "+ header",
+                                    );
+                                }
+                                McpTransport::Stdio => {
+                                    ui.add(
+                                        TextEdit::singleline(&mut server.command)
+                                            .hint_text("Executable, e.g. npx")
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    let mut remove_argument = None;
+                                    for (argument_index, argument) in
+                                        server.args.iter_mut().enumerate()
+                                    {
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                TextEdit::singleline(argument)
+                                                    .hint_text("Argument")
+                                                    .desired_width(260.0),
+                                            );
+                                            if ui.small_button("−").clicked() {
+                                                remove_argument = Some(argument_index);
+                                            }
+                                        });
+                                    }
+                                    if let Some(index) = remove_argument {
+                                        server.args.remove(index);
+                                    }
+                                    if ui.small_button("+ argument").clicked() {
+                                        server.args.push(String::new());
+                                    }
+                                    edit_key_value_map(
+                                        ui,
+                                        &mut server.env,
+                                        "ENV_VAR",
+                                        "+ environment variable",
+                                    );
+                                }
+                            }
+                            ui.checkbox(
+                                &mut server.allow_whatsapp,
+                                "Allow this server in WhatsApp (off by default)",
+                            );
+                        });
+                }
+                if let Some(index) = remove_mcp {
+                    self.mcp_servers.remove(index);
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.small_button("+ BrowserOS").clicked() {
+                        self.mcp_servers.push(McpServerConfig {
+                            name: "browseros".into(),
+                            url: "http://127.0.0.1:9239/mcp".into(),
+                            ..McpServerConfig::default()
+                        });
+                    }
+                    if ui.small_button("+ MCP server").clicked() {
+                        self.mcp_servers.push(McpServerConfig {
+                            name: format!("mcp-server-{}", self.mcp_servers.len() + 1),
+                            ..McpServerConfig::default()
+                        });
+                    }
+                    save_mcp = ui.button("Save and reconnect").clicked();
+                });
 
                 ui.add_space(12.0);
                 ui.label(RichText::new("EXECUTION").small().strong());
@@ -2338,6 +2625,11 @@ impl GuiApp {
                 port: self.node_port,
             });
         }
+        if save_mcp {
+            self.send(Op::SetMcpServers {
+                servers: self.mcp_servers.clone(),
+            });
+        }
     }
 
     fn approval_dialog(&mut self, ctx: &egui::Context) {
@@ -2388,14 +2680,25 @@ impl GuiApp {
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.label(RichText::new(&dialog.command).monospace());
-                ui.label(format!("Attempt {}", dialog.attempt));
+                ui.label(if dialog.dynamic {
+                    format!("Authentication step {}", dialog.attempt)
+                } else {
+                    format!("Attempt {}", dialog.attempt)
+                });
+                if let Some(prompt) = &dialog.prompt {
+                    ui.label(RichText::new(prompt).strong());
+                }
                 if let Some(message) = &dialog.message {
                     ui.colored_label(Color32::LIGHT_RED, message);
                 }
                 let response = ui.add(
                     TextEdit::singleline(&mut dialog.credential)
                         .password(true)
-                        .hint_text("Password"),
+                        .hint_text(if dialog.dynamic {
+                            "Credential or challenge response"
+                        } else {
+                            "Password"
+                        }),
                 );
                 if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
                     submit = true;
@@ -2654,6 +2957,164 @@ impl GuiApp {
         }
     }
 
+    fn whatsapp_conversations_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_whatsapp_conversations {
+            return;
+        }
+        let mut open = true;
+        let mut open_settings = false;
+        let mut refresh = false;
+        let mut selected_chat = None;
+        let conversations = self.whatsapp_conversations.clone();
+        let selected = self.whatsapp_selected_chat.clone();
+        let active_chat = self.whatsapp_active_chat.clone();
+        let assistant_name = self.whatsapp_assistant_name.clone();
+        let connected = whatsapp_bool(&self.whatsapp_status, "connected");
+        let pending = self.whatsapp_conversations_pending;
+        let feedback = self.whatsapp_feedback.clone();
+
+        egui::Window::new("WhatsApp conversations")
+            .id(egui::Id::new("whatsapp_conversations_v1"))
+            .open(&mut open)
+            .default_size(Vec2::new(860.0, 590.0))
+            .min_size(Vec2::new(620.0, 400.0))
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    status_badge(ui, "Connected", connected);
+                    if pending {
+                        ui.spinner();
+                        ui.label(RichText::new("Updating…").small().color(Color32::GRAY));
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        open_settings = ui.button("Connection settings").clicked();
+                        refresh = ui.button("Refresh").clicked();
+                    });
+                });
+                if let Some(message) = feedback.as_deref().filter(|message| !message.is_empty()) {
+                    ui.label(RichText::new(message).small().color(Color32::LIGHT_BLUE));
+                }
+                ui.separator();
+
+                let content_height = ui.available_height().max(300.0);
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui(Vec2::new(220.0, content_height), |ui| {
+                        ui.label(
+                            RichText::new("CHATS")
+                                .size(10.0)
+                                .strong()
+                                .color(Color32::from_rgb(120, 120, 128)),
+                        );
+                        ui.add_space(4.0);
+                        ScrollArea::vertical()
+                            .id_salt("whatsapp_chat_list")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if conversations.is_empty() {
+                                    ui.label(
+                                        RichText::new(if pending {
+                                            "Loading conversations…"
+                                        } else {
+                                            "No WhatsApp conversations yet. Incoming messages will appear here."
+                                        })
+                                        .small()
+                                        .color(Color32::GRAY),
+                                    );
+                                }
+                                for (id, title) in &conversations {
+                                    let display_title = title
+                                        .strip_prefix("WhatsApp - ")
+                                        .unwrap_or(title)
+                                        .trim();
+                                    if ui
+                                        .selectable_label(
+                                            selected.as_deref() == Some(id.as_str()),
+                                            ellipsize(display_title, 28),
+                                        )
+                                        .on_hover_text(title)
+                                        .clicked()
+                                    {
+                                        selected_chat = Some(id.clone());
+                                    }
+                                }
+                            });
+                    });
+                    ui.separator();
+                    ui.allocate_ui(Vec2::new(ui.available_width(), content_height), |ui| {
+                        let raw_title = active_chat
+                            .as_ref()
+                            .and_then(|chat| chat.get("title"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("WhatsApp conversation");
+                        let title = raw_title
+                            .strip_prefix("WhatsApp - ")
+                            .unwrap_or(raw_title);
+                        ui.heading(title);
+                        ui.add_space(4.0);
+                        ScrollArea::vertical()
+                            .id_salt(("whatsapp_transcript", selected.as_deref().unwrap_or("none")))
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .wheel_scroll_multiplier(Vec2::ZERO)
+                            .show(ui, |ui| {
+                                forward_mouse_wheel_to_parent_scroll(ui);
+                                let Some(messages) = active_chat
+                                    .as_ref()
+                                    .and_then(|chat| chat.get("messages"))
+                                    .and_then(Value::as_array)
+                                else {
+                                    ui.label(
+                                        RichText::new(if pending {
+                                            "Loading messages…"
+                                        } else {
+                                            "Choose a WhatsApp conversation."
+                                        })
+                                        .color(Color32::GRAY),
+                                    );
+                                    return;
+                                };
+                                let chat_id = selected.as_deref().unwrap_or("whatsapp");
+                                let mut visible = 0usize;
+                                for (index, message) in messages.iter().enumerate() {
+                                    if render_whatsapp_message(
+                                        ui,
+                                        chat_id,
+                                        index,
+                                        message,
+                                        &assistant_name,
+                                    ) {
+                                        visible += 1;
+                                        ui.add_space(8.0);
+                                    }
+                                }
+                                if visible == 0 {
+                                    ui.label(
+                                        RichText::new("This WhatsApp conversation is empty.")
+                                            .color(Color32::GRAY),
+                                    );
+                                }
+                            });
+                    });
+                });
+            });
+        self.show_whatsapp_conversations = open;
+
+        if open_settings {
+            self.show_whatsapp = true;
+            self.poll_whatsapp(true);
+        }
+        if refresh {
+            self.poll_whatsapp_conversations(true);
+        }
+        if let Some(id) = selected_chat {
+            if self.whatsapp_selected_chat.as_deref() != Some(id.as_str()) {
+                self.whatsapp_selected_chat = Some(id);
+                self.whatsapp_active_chat = None;
+                self.poll_whatsapp_conversations(true);
+            }
+        }
+    }
+
     fn whatsapp_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_whatsapp {
             return;
@@ -2664,6 +3125,7 @@ impl GuiApp {
         let mut reload = false;
         let mut refresh_qr = false;
         let mut send_test = false;
+        let mut open_conversations = false;
         let connected = whatsapp_bool(&self.whatsapp_status, "connected");
         let running = whatsapp_bool(&self.whatsapp_status, "bridge_running");
         let authenticated = whatsapp_bool(&self.whatsapp_status, "authenticated");
@@ -2688,6 +3150,7 @@ impl GuiApp {
                     if !own_phone.is_empty() {
                         ui.label(RichText::new(format!("Number: +{own_phone}")).small());
                     }
+                    open_conversations = ui.button("View conversations").clicked();
                 });
                 if let Some(error) = &self.whatsapp_service.launch_error {
                     ui.colored_label(Color32::LIGHT_RED, error);
@@ -2823,6 +3286,10 @@ impl GuiApp {
         }
         if send_test {
             self.send_whatsapp_test();
+        }
+        if open_conversations {
+            self.show_whatsapp_conversations = true;
+            self.poll_whatsapp_conversations(true);
         }
     }
 
@@ -3091,8 +3558,11 @@ impl eframe::App for GuiApp {
                 }
             }
         }
-        if self.show_whatsapp || self.whatsapp_enabled {
+        if self.show_whatsapp || self.show_whatsapp_conversations || self.whatsapp_enabled {
             self.poll_whatsapp(false);
+        }
+        if self.show_whatsapp_conversations {
+            self.poll_whatsapp_conversations(false);
         }
         if self.show_nodes {
             self.poll_nodes(false);
@@ -3110,6 +3580,7 @@ impl eframe::App for GuiApp {
             self.show_provider = false;
             self.show_sessions = false;
             self.show_whatsapp = false;
+            self.show_whatsapp_conversations = false;
             self.show_nodes = false;
             self.show_settings = false;
         }
@@ -3849,6 +4320,145 @@ async fn http_json(request: reqwest::RequestBuilder) -> std::result::Result<Valu
     }
 }
 
+fn whatsapp_chat_summaries(value: &Value) -> Vec<(String, String)> {
+    let mut chats = value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|chat| {
+            let id = chat.get("id")?.as_str()?.trim();
+            if !id.starts_with("wa_") {
+                return None;
+            }
+            let title = chat
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .unwrap_or(id);
+            Some((id.to_string(), title.to_string()))
+        })
+        .collect::<Vec<_>>();
+    chats.sort_by(|left, right| {
+        left.1
+            .to_lowercase()
+            .cmp(&right.1.to_lowercase())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    chats
+}
+
+fn whatsapp_message_text(message: &Value) -> Option<String> {
+    let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+    if !matches!(
+        role.trim().to_ascii_lowercase().as_str(),
+        "user" | "assistant" | "gnome"
+    ) {
+        return None;
+    }
+    let content = message.get("content")?;
+    let text = match content {
+        Value::String(text) => {
+            if text.starts_with("[Extracted content from uploaded file:") {
+                return None;
+            }
+            text.trim().to_string()
+        }
+        Value::Object(object) => {
+            let kind = object.get("type").and_then(Value::as_str).unwrap_or("file");
+            let filename = object
+                .get("filename")
+                .and_then(Value::as_str)
+                .unwrap_or("attachment");
+            format!("[{kind}] {filename}")
+        }
+        other => other.to_string(),
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+fn render_whatsapp_message(
+    ui: &mut egui::Ui,
+    chat_id: &str,
+    index: usize,
+    message: &Value,
+    assistant_name: &str,
+) -> bool {
+    let Some(text) = whatsapp_message_text(message) else {
+        return false;
+    };
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let incoming = role == "user";
+    let author = if incoming {
+        message
+            .get("sender_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("WhatsApp")
+    } else if assistant_name.trim().is_empty() {
+        "GnomeAI"
+    } else {
+        assistant_name.trim()
+    };
+    let timestamp = message
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(|value| value.get(..16).unwrap_or(value).replace('T', " "))
+        .unwrap_or_default();
+
+    egui::Frame::default()
+        .fill(if incoming {
+            Color32::from_rgb(28, 48, 39)
+        } else {
+            Color32::from_rgb(28, 29, 33)
+        })
+        .stroke(Stroke::new(
+            1.0,
+            if incoming {
+                Color32::from_rgb(48, 78, 64)
+            } else {
+                Color32::from_rgb(52, 53, 60)
+            },
+        ))
+        .corner_radius(10.0)
+        .inner_margin(Margin::symmetric(11, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(author).small().strong().color(if incoming {
+                    Color32::from_rgb(115, 214, 159)
+                } else {
+                    Color32::from_rgb(151, 152, 161)
+                }));
+                if !timestamp.is_empty() {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(timestamp).small().color(Color32::GRAY));
+                    });
+                }
+            });
+            ui.add_space(2.0);
+            if incoming {
+                selectable_text(
+                    ui,
+                    ("whatsapp-message", chat_id, index),
+                    &text,
+                    true,
+                    false,
+                    None,
+                );
+            } else {
+                let markdown_id = ui.make_persistent_id(("whatsapp-markdown", chat_id, index));
+                render_markdown(ui, markdown_id, &text);
+            }
+        });
+    true
+}
+
 fn read_log_tail(path: &Path, limit: usize) -> String {
     let Ok(bytes) = std::fs::read(path) else {
         return String::new();
@@ -3861,6 +4471,624 @@ fn read_log_tail(path: &Path, limit: usize) -> String {
         }
     }
     String::from_utf8_lossy(tail).trim().to_string()
+}
+
+#[derive(Clone)]
+struct RememberedTextSelection {
+    range: egui::text::CCursorRange,
+    text: String,
+}
+
+fn text_in_cursor_range(text: &str, range: egui::text::CCursorRange) -> Option<String> {
+    if range.is_empty() {
+        return None;
+    }
+    let [start, end] = range.sorted_cursors();
+    let character_count = text.chars().count();
+    let start = start.index.0.min(character_count);
+    let end = end.index.0.min(character_count);
+    let start_byte = text
+        .char_indices()
+        .nth(start)
+        .map(|(offset, _)| offset)
+        .unwrap_or(text.len());
+    let end_byte = text
+        .char_indices()
+        .nth(end)
+        .map(|(offset, _)| offset)
+        .unwrap_or(text.len());
+    (start_byte < end_byte).then(|| text[start_byte..end_byte].to_string())
+}
+
+fn selectable_text(
+    ui: &mut egui::Ui,
+    id_salt: impl egui::AsIdSalt,
+    complete_text: &str,
+    wrap: bool,
+    monospace: bool,
+    color: Option<Color32>,
+) {
+    // Label::selectable treats every pointer press as a new selection. A right
+    // click therefore collapsed the user's range before the context menu could
+    // copy it, and its drag handler also competed with the transcript scroll.
+    // An immutable TextEdit has native selection/keyboard handling, never
+    // edits the source string, and leaves the mouse wheel to the outer scroll.
+    let id = ui.make_persistent_id(id_salt);
+    let remembered_id = id.with("remembered-selection");
+    let remembered = ui
+        .ctx()
+        .data(|data| data.get_temp::<RememberedTextSelection>(remembered_id));
+
+    let mut immutable_text = complete_text;
+    let mut editor = TextEdit::multiline(&mut immutable_text)
+        .id(id)
+        .frame(egui::Frame::NONE)
+        .margin(Margin::same(0))
+        .desired_rows(1)
+        .desired_width(if wrap {
+            ui.available_width().max(1.0)
+        } else {
+            f32::INFINITY
+        });
+    if monospace {
+        editor = editor.font(egui::TextStyle::Monospace);
+    }
+    if let Some(color) = color {
+        editor = editor.text_color(color);
+    }
+
+    let mut output = editor.show(ui);
+    let current = output
+        .cursor_range
+        .and_then(|range| text_in_cursor_range(complete_text, range).map(|text| (range, text)));
+
+    if let Some((range, text)) = current {
+        let selection = RememberedTextSelection { range, text };
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(remembered_id, selection.clone()));
+    } else if output.response.clicked() {
+        // A plain left click intentionally clears the old selection. A right
+        // click does not, so the context menu can still use the selected range.
+        ui.ctx().data_mut(|data| {
+            data.remove::<RememberedTextSelection>(remembered_id);
+        });
+    }
+
+    let selection = ui
+        .ctx()
+        .data(|data| data.get_temp::<RememberedTextSelection>(remembered_id))
+        .or(remembered);
+
+    if output.response.secondary_clicked() {
+        output.response.request_focus();
+        if let Some(selection) = &selection {
+            output.state.cursor.set_char_range(Some(selection.range));
+            output.state.clone().store(ui.ctx(), output.response.id);
+        }
+    }
+
+    output.response.context_menu(|ui| {
+        if ui
+            .add_enabled(selection.is_some(), egui::Button::new("Copy selection"))
+            .clicked()
+        {
+            if let Some(selection) = &selection {
+                ui.ctx().copy_text(selection.text.clone());
+            }
+            ui.close();
+        }
+        if ui.button("Copy all").clicked() {
+            ui.ctx().copy_text(complete_text.to_string());
+            ui.close();
+        }
+    });
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MarkdownBlock {
+    Heading {
+        level: usize,
+        text: String,
+    },
+    Paragraph(String),
+    List(Vec<MarkdownListItem>),
+    Quote(String),
+    Code {
+        language: String,
+        text: String,
+    },
+    Table {
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+    Rule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MarkdownListItem {
+    depth: usize,
+    marker: String,
+    text: String,
+}
+
+fn markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let trimmed = line.trim_start();
+    let hashes = trimmed
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    trimmed
+        .get(hashes..)
+        .and_then(|rest| rest.strip_prefix(' '))
+        .map(|text| (hashes, text.trim()))
+}
+
+fn markdown_list_item(line: &str) -> Option<MarkdownListItem> {
+    let indent = line.len().saturating_sub(line.trim_start().len());
+    let trimmed = line.trim_start();
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(text) = trimmed.strip_prefix(marker) {
+            let (marker, text) = if let Some(text) = text.strip_prefix("[ ] ") {
+                ("☐", text)
+            } else if let Some(text) = text
+                .strip_prefix("[x] ")
+                .or_else(|| text.strip_prefix("[X] "))
+            {
+                ("☑", text)
+            } else {
+                ("•", text)
+            };
+            return Some(MarkdownListItem {
+                depth: indent / 2,
+                marker: marker.into(),
+                text: clean_inline_markdown(text.trim()),
+            });
+        }
+    }
+
+    let digits = trimmed
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .count();
+    if digits > 0 {
+        let suffix = trimmed.get(digits..)?;
+        if let Some(text) = suffix.strip_prefix(". ") {
+            return Some(MarkdownListItem {
+                depth: indent / 2,
+                marker: format!("{}.", &trimmed[..digits]),
+                text: clean_inline_markdown(text.trim()),
+            });
+        }
+    }
+    None
+}
+
+fn markdown_rule(line: &str) -> bool {
+    let compact = line
+        .trim()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    compact.len() >= 3
+        && compact
+            .chars()
+            .next()
+            .is_some_and(|first| matches!(first, '-' | '*' | '_'))
+        && compact
+            .chars()
+            .all(|character| Some(character) == compact.chars().next())
+}
+
+fn markdown_table_cells(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_start_matches('|')
+        .trim_end_matches('|')
+        .split('|')
+        .map(|cell| clean_inline_markdown(cell.trim()))
+        .collect()
+}
+
+fn markdown_table_delimiter(line: &str) -> bool {
+    let cells = markdown_table_cells(line);
+    cells.len() >= 2
+        && cells.iter().all(|cell| {
+            let cell = cell.trim().trim_matches(':');
+            cell.len() >= 3 && cell.chars().all(|character| character == '-')
+        })
+}
+
+fn starts_markdown_block(lines: &[&str], index: usize) -> bool {
+    let line = lines[index];
+    let trimmed = line.trim_start();
+    markdown_heading(line).is_some()
+        || markdown_list_item(line).is_some()
+        || markdown_rule(line)
+        || trimmed.starts_with("> ")
+        || trimmed == ">"
+        || trimmed.starts_with("```")
+        || trimmed.starts_with("~~~")
+        || (index + 1 < lines.len()
+            && line.contains('|')
+            && markdown_table_delimiter(lines[index + 1]))
+}
+
+fn parse_markdown_blocks(text: &str) -> Vec<MarkdownBlock> {
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut blocks = Vec::new();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        if let Some(fence) = ["```", "~~~"]
+            .into_iter()
+            .find(|fence| trimmed.starts_with(fence))
+        {
+            let language = trimmed[fence.len()..].trim().to_string();
+            index += 1;
+            let start = index;
+            while index < lines.len() && !lines[index].trim_start().starts_with(fence) {
+                index += 1;
+            }
+            blocks.push(MarkdownBlock::Code {
+                language,
+                text: lines[start..index].join("\n"),
+            });
+            if index < lines.len() {
+                index += 1;
+            }
+            continue;
+        }
+
+        if let Some((level, heading)) = markdown_heading(line) {
+            blocks.push(MarkdownBlock::Heading {
+                level,
+                text: clean_inline_markdown(heading),
+            });
+            index += 1;
+            continue;
+        }
+
+        if index + 1 < lines.len()
+            && line.contains('|')
+            && markdown_table_delimiter(lines[index + 1])
+        {
+            let headers = markdown_table_cells(line);
+            index += 2;
+            let mut rows = Vec::new();
+            while index < lines.len() && !lines[index].trim().is_empty() {
+                if !lines[index].contains('|') || starts_markdown_block(&lines, index) {
+                    break;
+                }
+                rows.push(markdown_table_cells(lines[index]));
+                index += 1;
+            }
+            blocks.push(MarkdownBlock::Table { headers, rows });
+            continue;
+        }
+
+        if markdown_list_item(line).is_some() {
+            let mut items = Vec::new();
+            while index < lines.len() {
+                let Some(item) = markdown_list_item(lines[index]) else {
+                    break;
+                };
+                items.push(item);
+                index += 1;
+            }
+            blocks.push(MarkdownBlock::List(items));
+            continue;
+        }
+
+        if trimmed.starts_with("> ") || trimmed == ">" {
+            let mut quote = Vec::new();
+            while index < lines.len() {
+                let trimmed = lines[index].trim_start();
+                let Some(content) = trimmed
+                    .strip_prefix("> ")
+                    .or_else(|| (trimmed == ">").then_some(""))
+                else {
+                    break;
+                };
+                quote.push(clean_inline_markdown(content));
+                index += 1;
+            }
+            blocks.push(MarkdownBlock::Quote(quote.join("\n")));
+            continue;
+        }
+
+        if markdown_rule(line) {
+            blocks.push(MarkdownBlock::Rule);
+            index += 1;
+            continue;
+        }
+
+        let mut paragraph = Vec::new();
+        while index < lines.len()
+            && !lines[index].trim().is_empty()
+            && !starts_markdown_block(&lines, index)
+        {
+            paragraph.push(lines[index].trim());
+            index += 1;
+        }
+        if paragraph.is_empty() {
+            // A malformed Markdown construct must never stall streaming.
+            paragraph.push(line.trim());
+            index += 1;
+        }
+        blocks.push(MarkdownBlock::Paragraph(clean_inline_markdown(
+            &paragraph.join(" "),
+        )));
+    }
+
+    blocks
+}
+
+fn clean_inline_markdown(text: &str) -> String {
+    let mut cleaned = text
+        .replace("**", "")
+        .replace("__", "")
+        .replace("~~", "")
+        .replace('`', "");
+
+    // Make Markdown links readable outside a browser without exposing their
+    // punctuation. Keep the destination so copying the answer remains useful.
+    while let Some(open) = cleaned.find('[') {
+        let Some(close_offset) = cleaned[open + 1..].find("](") else {
+            break;
+        };
+        let close = open + 1 + close_offset;
+        let url_start = close + 2;
+        let Some(end_offset) = cleaned[url_start..].find(')') else {
+            break;
+        };
+        let end = url_start + end_offset;
+        let label = &cleaned[open + 1..close];
+        let url = &cleaned[url_start..end];
+        let replacement = if label == url || url.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label} ({url})")
+        };
+        cleaned.replace_range(open..=end, &replacement);
+    }
+    cleaned
+}
+
+fn render_markdown(ui: &mut egui::Ui, id: egui::Id, text: &str) {
+    for (block_index, block) in parse_markdown_blocks(text).into_iter().enumerate() {
+        let block_id = id.with(block_index);
+        match block {
+            MarkdownBlock::Heading { level, text } => {
+                ui.add_space(if level <= 2 { 7.0 } else { 3.0 });
+                let size = match level {
+                    1 => 23.0,
+                    2 => 20.0,
+                    3 => 17.0,
+                    _ => 15.0,
+                };
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(text)
+                            .size(size)
+                            .strong()
+                            .color(Color32::from_rgb(218, 221, 226)),
+                    )
+                    .selectable(true)
+                    .wrap(),
+                );
+            }
+            MarkdownBlock::Paragraph(text) => {
+                selectable_text(ui, block_id, &text, true, false, None);
+            }
+            MarkdownBlock::List(items) => {
+                for (item_index, item) in items.into_iter().enumerate() {
+                    ui.horizontal_top(|ui| {
+                        ui.add_space((item.depth as f32 * 18.0).min(72.0));
+                        ui.label(
+                            RichText::new(item.marker)
+                                .strong()
+                                .color(Color32::from_rgb(126, 207, 164)),
+                        );
+                        ui.vertical(|ui| {
+                            selectable_text(
+                                ui,
+                                block_id.with(item_index),
+                                &item.text,
+                                true,
+                                false,
+                                None,
+                            );
+                        });
+                    });
+                }
+            }
+            MarkdownBlock::Quote(text) => {
+                ui.horizontal(|ui| {
+                    let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 22.0), Sense::hover());
+                    ui.painter()
+                        .rect_filled(bar, 1.5, Color32::from_rgb(105, 205, 153));
+                    ui.add_space(6.0);
+                    ui.vertical(|ui| {
+                        selectable_text(
+                            ui,
+                            block_id,
+                            &text,
+                            true,
+                            false,
+                            Some(Color32::from_rgb(174, 178, 184)),
+                        );
+                    });
+                });
+            }
+            MarkdownBlock::Code { language, text } => {
+                egui::Frame::default()
+                    .fill(Color32::from_rgb(12, 13, 15))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(52, 55, 62)))
+                    .corner_radius(8.0)
+                    .inner_margin(Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(if language.is_empty() {
+                                    "CODE"
+                                } else {
+                                    language.as_str()
+                                })
+                                .small()
+                                .strong()
+                                .color(Color32::from_rgb(126, 207, 164)),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.small_button("Copy code").clicked() {
+                                    ui.ctx().copy_text(text.clone());
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        selectable_text(ui, block_id, &text, true, true, None);
+                    });
+            }
+            MarkdownBlock::Table { headers, rows } => {
+                let columns = headers
+                    .len()
+                    .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+                if columns == 0 {
+                    continue;
+                }
+                egui::Frame::default()
+                    .fill(Color32::from_rgb(20, 21, 24))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(52, 55, 62)))
+                    .corner_radius(8.0)
+                    .inner_margin(Margin::symmetric(8, 7))
+                    .show(ui, |ui| {
+                        ui.columns(columns, |column_uis| {
+                            for (column, column_ui) in column_uis.iter_mut().enumerate() {
+                                selectable_text(
+                                    column_ui,
+                                    block_id.with(("header", column)),
+                                    headers.get(column).map(String::as_str).unwrap_or(""),
+                                    true,
+                                    false,
+                                    Some(Color32::from_rgb(126, 207, 164)),
+                                );
+                            }
+                        });
+                        ui.separator();
+                        for (row_index, row) in rows.iter().enumerate() {
+                            if row_index > 0 {
+                                ui.add_space(2.0);
+                            }
+                            ui.columns(columns, |column_uis| {
+                                for (column, column_ui) in column_uis.iter_mut().enumerate() {
+                                    selectable_text(
+                                        column_ui,
+                                        block_id.with((row_index, column)),
+                                        row.get(column).map(String::as_str).unwrap_or(""),
+                                        true,
+                                        false,
+                                        None,
+                                    );
+                                }
+                            });
+                        }
+                    });
+            }
+            MarkdownBlock::Rule => {
+                ui.add_space(3.0);
+                ui.separator();
+                ui.add_space(3.0);
+            }
+        }
+        ui.add_space(5.0);
+    }
+}
+
+/// Forward the physical mouse wheel to the nearest parent `ScrollArea`.
+///
+/// egui deliberately ignores its normal wheel path while a child widget owns
+/// a pointer drag. Our read-only multiline `TextEdit`s own that drag during
+/// text selection, which made the transcript appear frozen whenever the wheel
+/// was used over a message. `Ui::scroll_with_delta` is an explicit adjustment,
+/// so it remains active both over focused text and while extending a selection.
+fn forward_mouse_wheel_to_parent_scroll(ui: &mut egui::Ui) {
+    let clip_rect = ui.clip_rect();
+    if !ui.rect_contains_pointer(clip_rect) {
+        return;
+    }
+
+    let wheel = ui.ctx().input(|input| input.smooth_scroll_delta());
+    if wheel.y != 0.0 {
+        ui.scroll_with_delta(Vec2::new(0.0, wheel.y));
+    }
+}
+
+fn select_all_text(ctx: &egui::Context, id: egui::Id, text: &str) {
+    let mut state = TextEdit::load_state(ctx, id).unwrap_or_default();
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(text.chars().count()),
+        )));
+    TextEdit::store_state(ctx, id, state);
+}
+
+fn replace_text_selection(ctx: &egui::Context, id: egui::Id, text: &mut String, inserted: &str) {
+    if inserted.is_empty() {
+        return;
+    }
+    let mut state = TextEdit::load_state(ctx, id).unwrap_or_default();
+    let end = text.chars().count();
+    let range = state
+        .cursor
+        .char_range()
+        .unwrap_or_else(|| egui::text::CCursorRange::one(egui::text::CCursor::new(end)));
+    let [start, finish] = range.sorted_cursors();
+    let start = start.index.0.min(end);
+    let finish = finish.index.0.min(end);
+    let start_byte = text
+        .char_indices()
+        .nth(start)
+        .map(|(offset, _)| offset)
+        .unwrap_or(text.len());
+    let finish_byte = text
+        .char_indices()
+        .nth(finish)
+        .map(|(offset, _)| offset)
+        .unwrap_or(text.len());
+    text.replace_range(start_byte..finish_byte, inserted);
+    let cursor = egui::text::CCursor::new(start + inserted.chars().count());
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::one(cursor)));
+    TextEdit::store_state(ctx, id, state);
+    ctx.memory_mut(|memory| memory.request_focus(id));
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+fn primary_selection_text() -> Option<String> {
+    use arboard::{GetExtLinux, LinuxClipboardKind};
+
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard
+        .get()
+        .clipboard(LinuxClipboardKind::Primary)
+        .text()
+        .ok()
+}
+
+#[cfg(not(all(unix, not(any(target_os = "macos", target_os = "android")))))]
+fn primary_selection_text() -> Option<String> {
+    None
 }
 
 fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
@@ -3881,7 +5109,7 @@ fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
                             .color(Color32::from_rgb(126, 207, 164)),
                     );
                     ui.add_space(2.0);
-                    ui.add(egui::Label::new(text).selectable(true).wrap());
+                    selectable_text(ui, ("user-text", index), text, true, false, None);
                 });
         }
         Block::Assistant(text) => {
@@ -3906,7 +5134,8 @@ fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
                             .color(Color32::from_rgb(151, 152, 161)),
                     );
                     ui.add_space(2.0);
-                    ui.add(egui::Label::new(text).selectable(true).wrap());
+                    let markdown_id = ui.make_persistent_id(("assistant-markdown", index));
+                    render_markdown(ui, markdown_id, text);
                 });
             });
         }
@@ -3923,12 +5152,13 @@ fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
                     )
                     .id_salt(("reasoning", index))
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(text).color(Color32::from_rgb(153, 154, 163)),
-                            )
-                            .selectable(true)
-                            .wrap(),
+                        selectable_text(
+                            ui,
+                            ("reasoning-text", index),
+                            text,
+                            true,
+                            false,
+                            Some(Color32::from_rgb(153, 154, 163)),
                         );
                     });
                 });
@@ -3983,12 +5213,17 @@ fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
                                     .corner_radius(7.0)
                                     .inner_margin(8.0)
                                     .show(ui, |ui| {
-                                        ScrollArea::horizontal().max_height(260.0).show(ui, |ui| {
-                                            ui.add(
-                                                egui::Label::new(RichText::new(output).monospace())
-                                                    .selectable(true),
-                                            );
-                                        });
+                                        // Keep output in the transcript's one vertical scroll
+                                        // area. Nested scroll areas stole the wheel while a text
+                                        // selection was active.
+                                        selectable_text(
+                                            ui,
+                                            ("tool-output", call_id),
+                                            output,
+                                            true,
+                                            true,
+                                            None,
+                                        );
                                     });
                             }
                         });
@@ -4287,6 +5522,60 @@ fn looks_like_path(value: &str) -> bool {
         || value.starts_with("../")
 }
 
+fn edit_key_value_map(
+    ui: &mut egui::Ui,
+    values: &mut BTreeMap<String, String>,
+    key_placeholder: &str,
+    add_label: &str,
+) {
+    let entries = std::mem::take(values);
+    let mut rebuilt = BTreeMap::new();
+    for (index, (mut key, mut value)) in entries.into_iter().enumerate() {
+        let mut remove = false;
+        ui.horizontal(|ui| {
+            ui.add(
+                TextEdit::singleline(&mut key)
+                    .hint_text(key_placeholder)
+                    .desired_width(135.0),
+            );
+            let sensitive = {
+                let normalized = key.to_ascii_lowercase();
+                normalized.contains("authorization")
+                    || normalized.contains("token")
+                    || normalized.contains("secret")
+                    || normalized.contains("api-key")
+                    || normalized.contains("api_key")
+            };
+            ui.add(
+                TextEdit::singleline(&mut value)
+                    .password(sensitive)
+                    .hint_text("Value")
+                    .desired_width(190.0),
+            );
+            remove = ui.small_button("−").clicked();
+        });
+        if !remove && !key.trim().is_empty() {
+            let key = key.trim().to_string();
+            let unique = if rebuilt.contains_key(&key) {
+                format!("{key}_{index}")
+            } else {
+                key
+            };
+            rebuilt.insert(unique, value);
+        }
+    }
+    if ui.small_button(add_label).clicked() {
+        let mut key = key_placeholder.to_string();
+        let mut suffix = 2;
+        while rebuilt.contains_key(&key) {
+            key = format!("{key_placeholder}_{suffix}");
+            suffix += 1;
+        }
+        rebuilt.insert(key, String::new());
+    }
+    *values = rebuilt;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4297,6 +5586,124 @@ mod tests {
         assert_eq!(composer_rows("hello\nworld", 320.0), 2);
         assert!(composer_rows(&"x".repeat(300), 240.0) > 1);
         assert_eq!(composer_rows(&"x".repeat(10_000), 240.0), 8);
+    }
+
+    #[test]
+    fn cursor_selection_preserves_partial_unicode_text() {
+        let range =
+            egui::text::CCursorRange::two(egui::text::CCursor::new(1), egui::text::CCursor::new(5));
+        assert_eq!(
+            text_in_cursor_range("așezare", range).as_deref(),
+            Some("șeza")
+        );
+        assert!(
+            text_in_cursor_range(
+                "text",
+                egui::text::CCursorRange::one(egui::text::CCursor::new(2))
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn markdown_parser_structures_headings_lists_tables_and_code() {
+        let blocks = parse_markdown_blocks(
+            "# Rezumat\n\nText cu **accent**.\n\n- primul\n- [x] gata\n\n\
+             | Model | Viteză |\n| --- | --- |\n| K3 | mare |\n\n\
+             ```rust\nfn main() {}\n```",
+        );
+
+        assert_eq!(
+            blocks,
+            vec![
+                MarkdownBlock::Heading {
+                    level: 1,
+                    text: "Rezumat".into(),
+                },
+                MarkdownBlock::Paragraph("Text cu accent.".into()),
+                MarkdownBlock::List(vec![
+                    MarkdownListItem {
+                        depth: 0,
+                        marker: "•".into(),
+                        text: "primul".into(),
+                    },
+                    MarkdownListItem {
+                        depth: 0,
+                        marker: "☑".into(),
+                        text: "gata".into(),
+                    },
+                ]),
+                MarkdownBlock::Table {
+                    headers: vec!["Model".into(), "Viteză".into()],
+                    rows: vec![vec!["K3".into(), "mare".into()]],
+                },
+                MarkdownBlock::Code {
+                    language: "rust".into(),
+                    text: "fn main() {}".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_parser_keeps_streaming_code_before_the_closing_fence() {
+        assert_eq!(
+            parse_markdown_blocks("```bash\necho salut"),
+            vec![MarkdownBlock::Code {
+                language: "bash".into(),
+                text: "echo salut".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn markdown_links_remain_copyable_without_raw_punctuation() {
+        assert_eq!(
+            clean_inline_markdown("Vezi [documentația](https://example.test) și `cod`."),
+            "Vezi documentația (https://example.test) și cod."
+        );
+    }
+
+    #[test]
+    fn whatsapp_conversation_list_excludes_regular_web_chats() {
+        let value = serde_json::json!([
+            {"id": "chat_001", "title": "Browser chat"},
+            {"id": "wa_40700_s_whatsapp_net", "title": "WhatsApp - Ana"},
+            {"id": "wa_group_g_us", "title": "WhatsApp - Echipa"}
+        ]);
+        assert_eq!(
+            whatsapp_chat_summaries(&value),
+            vec![
+                ("wa_40700_s_whatsapp_net".into(), "WhatsApp - Ana".into()),
+                ("wa_group_g_us".into(), "WhatsApp - Echipa".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn whatsapp_transcript_hides_system_and_extracted_context() {
+        assert_eq!(
+            whatsapp_message_text(&serde_json::json!({
+                "role": "user",
+                "content": "Salut"
+            }))
+            .as_deref(),
+            Some("Salut")
+        );
+        assert!(
+            whatsapp_message_text(&serde_json::json!({
+                "role": "system",
+                "content": "private model context"
+            }))
+            .is_none()
+        );
+        assert!(
+            whatsapp_message_text(&serde_json::json!({
+                "role": "user",
+                "content": "[Extracted content from uploaded file: note.txt] secret"
+            }))
+            .is_none()
+        );
     }
 
     #[test]

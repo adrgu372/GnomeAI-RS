@@ -21,7 +21,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::provider::{
-    Delta, Message, Provider, Request, StopReason, Usage, delegated_host_context,
+    DelegatedToolExecutor, Delta, Message, Provider, Request, StopReason, ToolSpec, Usage,
+    delegated_host_context,
 };
 use crate::sandbox::SandboxMode;
 
@@ -74,6 +75,8 @@ impl Provider for CodexAppServer {
         let sandbox = self.sandbox;
         let model = req.model.clone();
         let prompt = codex_prompt(&req.messages);
+        let delegated_tools = req.delegated_tools;
+        let delegated_tool_executor = req.delegated_tool_executor;
 
         Ok(Box::pin(async_stream::try_stream! {
             let mut session = AppServerSession::spawn().await?;
@@ -105,6 +108,9 @@ impl Provider for CodexAppServer {
             });
             if model != "default" {
                 thread_params["model"] = json!(model);
+            }
+            if !delegated_tools.is_empty() {
+                thread_params["dynamicTools"] = json!(codex_dynamic_tools(&delegated_tools));
             }
 
             let thread = session
@@ -142,7 +148,16 @@ impl Provider for CodexAppServer {
                 let message = session.next_message().await?;
 
                 if is_server_request(&message) {
-                    session.reject_server_request(&message).await?;
+                    if message.get("method").and_then(Value::as_str) == Some("item/tool/call") {
+                        session
+                            .answer_dynamic_tool_call(
+                                &message,
+                                delegated_tool_executor.as_ref(),
+                            )
+                            .await?;
+                    } else {
+                        session.reject_server_request(&message).await?;
+                    }
                     continue;
                 }
 
@@ -489,7 +504,9 @@ impl AppServerSession {
                         "title": "GnomeAI-RS",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "capabilities": null,
+                    "capabilities": {
+                        "experimentalApi": true,
+                    },
                 }),
             )
             .await?;
@@ -610,11 +627,80 @@ impl AppServerSession {
         .await
     }
 
+    async fn answer_dynamic_tool_call(
+        &mut self,
+        request: &Value,
+        executor: Option<&Arc<dyn DelegatedToolExecutor>>,
+    ) -> Result<()> {
+        let Some(id) = request.get("id").cloned() else {
+            return Ok(());
+        };
+        let tool = request
+            .pointer("/params/tool")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let call_id = request
+            .pointer("/params/callId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("codex-dynamic-{id}"));
+        let raw_arguments = request
+            .pointer("/params/arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let arguments = raw_arguments
+            .as_str()
+            .and_then(|value| serde_json::from_str(value).ok())
+            .unwrap_or(raw_arguments);
+
+        let (content, success) = if tool.is_empty() {
+            (
+                "Codex requested a dynamic tool without a name".into(),
+                false,
+            )
+        } else if let Some(executor) = executor {
+            match executor.call(call_id, tool, arguments).await {
+                Ok(result) => (result.content, result.success),
+                Err(error) => (format!("dynamic MCP tool failed: {error}"), false),
+            }
+        } else {
+            (
+                "no delegated MCP executor is available for this request".into(),
+                false,
+            )
+        };
+        self.send_value(&json!({
+            "id": id,
+            "result": {
+                "contentItems": [{
+                    "type": "inputText",
+                    "text": content,
+                }],
+                "success": success,
+            },
+        }))
+        .await
+    }
+
     async fn stop(&mut self) {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
         self.stderr_task.abort();
     }
+}
+
+fn codex_dynamic_tools(tools: &[ToolSpec]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": tool.parameters,
+            })
+        })
+        .collect()
 }
 
 fn capture_stderr(stderr: ChildStderr, tail: Arc<Mutex<VecDeque<String>>>) -> JoinHandle<()> {
@@ -892,6 +978,21 @@ mod tests {
             "/opt/gnomeai/codex-app-server"
         )));
         assert!(!is_standalone_app_server(Path::new("/opt/gnomeai/codex")));
+    }
+
+    #[test]
+    fn dynamic_tools_use_the_pinned_app_server_schema() {
+        let tools = codex_dynamic_tools(&[ToolSpec {
+            name: "mcp_browseros_click".into(),
+            description: "Click in BrowserOS".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"selector": {"type": "string"}},
+            }),
+        }]);
+        assert_eq!(tools[0]["name"], "mcp_browseros_click");
+        assert_eq!(tools[0]["inputSchema"]["type"], "object");
+        assert!(tools[0].get("parameters").is_none());
     }
 
     #[test]

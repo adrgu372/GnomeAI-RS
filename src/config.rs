@@ -10,6 +10,51 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpTransport {
+    #[default]
+    StreamableHttp,
+    Stdio,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// Stable local namespace used for model-facing tool names.
+    pub name: String,
+    pub enabled: bool,
+    pub transport: McpTransport,
+    /// MCP Streamable HTTP endpoint, for example BrowserOS' `/mcp` URL.
+    pub url: String,
+    /// Executable and arguments for an MCP stdio server.
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    /// Extra headers for Streamable HTTP servers. The owner-only config file
+    /// may contain Authorization or vendor API-key headers.
+    pub headers: BTreeMap<String, String>,
+    /// Remote chat entry points do not receive MCP tools unless explicitly
+    /// opted in. The native GUI is unaffected by this flag.
+    pub allow_whatsapp: bool,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            name: "mcp-server".into(),
+            enabled: true,
+            transport: McpTransport::StreamableHttp,
+            url: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            allow_whatsapp: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -106,6 +151,9 @@ pub struct AppConfig {
     pub whatsapp_assistant_name: String,
     pub whatsapp_has_own_number: bool,
     pub whatsapp_allowed_jids: Vec<String>,
+    /// Generic MCP clients exposed through the same native tool registry as
+    /// GnomeAI's built-in tools.
+    pub mcp_servers: Vec<McpServerConfig>,
     /// Per-process CSRF/API token for the local WebTool. It is injected at
     /// startup and deliberately never serialized to config.json.
     #[serde(skip)]
@@ -183,6 +231,7 @@ impl Default for AppConfig {
             whatsapp_assistant_name: "Gnome AI".into(),
             whatsapp_has_own_number: false,
             whatsapp_allowed_jids: Vec::new(),
+            mcp_servers: Vec::new(),
             web_api_token: String::new(),
         }
     }
@@ -351,6 +400,39 @@ impl AppConfig {
             .map(|item| compact_ws(item))
             .filter(|item| !item.is_empty())
             .collect();
+        let mut used_names = BTreeMap::<String, usize>::new();
+        for (index, server) in self.mcp_servers.iter_mut().enumerate() {
+            let base = mcp_name(&server.name, index + 1);
+            let count = used_names.entry(base.clone()).or_default();
+            *count += 1;
+            server.name = if *count == 1 {
+                base
+            } else {
+                format!("{base}-{}", *count)
+            };
+            server.url = server.url.trim().to_string();
+            server.command = server.command.trim().to_string();
+            server.args = server
+                .args
+                .iter()
+                .map(|argument| argument.trim().to_string())
+                .filter(|argument| !argument.is_empty())
+                .collect();
+            server.env = std::mem::take(&mut server.env)
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    let key = key.trim().to_string();
+                    (!key.is_empty()).then_some((key, value))
+                })
+                .collect();
+            server.headers = std::mem::take(&mut server.headers)
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    let key = key.trim().to_string();
+                    (!key.is_empty()).then_some((key, value.trim().to_string()))
+                })
+                .collect();
+        }
     }
 
     pub fn provider_api_key(&self, provider_id: &str) -> Option<&str> {
@@ -410,6 +492,28 @@ impl AppConfig {
             merged.web_api_token = web_api_token;
             *self = merged;
         }
+    }
+}
+
+fn mcp_name(name: &str, fallback: usize) -> String {
+    let mut normalized = String::new();
+    let mut separator = false;
+    for character in name.trim().to_ascii_lowercase().chars() {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character);
+            separator = false;
+        } else if !separator && !normalized.is_empty() {
+            normalized.push('-');
+            separator = true;
+        }
+    }
+    while normalized.ends_with('-') {
+        normalized.pop();
+    }
+    if normalized.is_empty() {
+        format!("mcp-server-{fallback}")
+    } else {
+        normalized
     }
 }
 
@@ -493,5 +597,33 @@ mod tests {
         config.web_sandbox_mode = "unknown".into();
         config.normalize();
         assert_eq!(config.web_sandbox_mode, "normal");
+    }
+
+    #[test]
+    fn mcp_servers_normalize_names_arguments_env_and_headers() {
+        let mut config = AppConfig::default();
+        let mut server = McpServerConfig {
+            name: " Browser OS ".into(),
+            args: vec![" --flag ".into(), "  ".into()],
+            ..McpServerConfig::default()
+        };
+        server.env.insert(" TOKEN ".into(), " secret ".into());
+        server
+            .headers
+            .insert(" Authorization ".into(), " Bearer token ".into());
+        config.mcp_servers = vec![server];
+        config.normalize();
+
+        let server = &config.mcp_servers[0];
+        assert_eq!(server.name, "browser-os");
+        assert_eq!(server.args, ["--flag"]);
+        assert_eq!(
+            server.env.get("TOKEN").map(String::as_str),
+            Some(" secret ")
+        );
+        assert_eq!(
+            server.headers.get("Authorization").map(String::as_str),
+            Some("Bearer token")
+        );
     }
 }

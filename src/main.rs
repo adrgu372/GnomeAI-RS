@@ -49,6 +49,7 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Context as _;
@@ -2172,24 +2173,69 @@ async fn generate_account_whatsapp_response(
         messages,
         tools: Vec::new(),
         max_tokens: cfg.llama_max_tokens,
+        delegated_tools: Vec::new(),
+        delegated_tool_executor: None,
+        mcp_servers: cfg
+            .mcp_servers
+            .iter()
+            .filter(|server| server.enabled && server.allow_whatsapp)
+            .cloned()
+            .collect(),
     };
-    let mut stream = match provider.stream(request).await {
-        Ok(stream) => stream,
-        Err(error) => return format!("[Eroare provider cont: {error}]"),
-    };
-    let mut reply = String::new();
-    while let Some(delta) = stream.next().await {
-        match delta {
-            Ok(ProviderDelta::Text(text)) => reply.push_str(&text),
-            Ok(ProviderDelta::Done { .. }) => break,
-            Ok(ProviderDelta::Reasoning(_) | ProviderDelta::ToolCall(_)) => {}
+    let delegated = provider.delegates_execution();
+    let mut recall = 0_u8;
+    'recall: loop {
+        let mut stream = match provider.stream(request.clone()).await {
+            Ok(stream) => stream,
+            Err(error)
+                if !delegated
+                    && recall < 2
+                    && crate::provider::retryable_provider_error(&error) =>
+            {
+                recall += 1;
+                tracing::warn!(recall, %error, "recalling silent WhatsApp provider request");
+                tokio::time::sleep(Duration::from_millis(if recall == 1 { 500 } else { 1_500 }))
+                    .await;
+                continue;
+            }
             Err(error) => return format!("[Eroare provider cont: {error}]"),
+        };
+        let mut reply = String::new();
+        while let Some(delta) = stream.next().await {
+            match delta {
+                Ok(ProviderDelta::Text(text)) => reply.push_str(&text),
+                Ok(ProviderDelta::Done { .. }) => break,
+                Ok(ProviderDelta::Reasoning(_) | ProviderDelta::ToolCall(_)) => {}
+                Err(error)
+                    if !delegated
+                        && reply.is_empty()
+                        && recall < 2
+                        && crate::provider::retryable_provider_error(&error) =>
+                {
+                    recall += 1;
+                    tracing::warn!(recall, %error, "recalling interrupted WhatsApp provider request");
+                    tokio::time::sleep(Duration::from_millis(if recall == 1 {
+                        500
+                    } else {
+                        1_500
+                    }))
+                    .await;
+                    continue 'recall;
+                }
+                Err(error) => return format!("[Eroare provider cont: {error}]"),
+            }
         }
-    }
-    if reply.trim().is_empty() {
-        "[Providerul contului a returnat un răspuns gol.]".to_string()
-    } else {
-        reply
+        if reply.trim().is_empty() && !delegated && recall < 2 {
+            recall += 1;
+            tracing::warn!(recall, "recalling empty WhatsApp provider response");
+            tokio::time::sleep(Duration::from_millis(if recall == 1 { 500 } else { 1_500 })).await;
+            continue;
+        }
+        return if reply.trim().is_empty() {
+            "[Modelul nu a răspuns după două reapelări automate.]".to_string()
+        } else {
+            reply
+        };
     }
 }
 

@@ -1,5 +1,5 @@
 Package: gnomeai-rs
-Version: 2.0.2-1
+Version: 2.2.0-1
 Section: utils
 Priority: optional
 Architecture: amd64
