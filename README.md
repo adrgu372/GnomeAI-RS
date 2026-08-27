@@ -148,7 +148,7 @@ The built-in catalog includes:
 
 - OpenAI API and OpenAI account (Codex);
 - Anthropic API and Anthropic account (Claude Code);
-- DeepSeek, Moonshot/Kimi, Qwen, xAI/Grok, Mistral and Gemini;
+- Z.ai Coding Plan, DeepSeek, Moonshot/Kimi, Qwen, xAI/Grok, Mistral and Gemini;
 - Groq, OpenRouter, Together, Fireworks and Perplexity;
 - Cerebras, NVIDIA NIM, SambaNova and Cohere;
 - custom/local OpenAI-compatible endpoints.
@@ -160,6 +160,12 @@ token refresh to the official vendor runtime.
 The model selector is populated from the provider API and falls back to the
 maintained provider catalog. `/model MODEL` remains available for a direct
 override.
+
+`Z.ai Coding Plan` uses the dedicated OpenAI-compatible subscription endpoint
+`https://api.z.ai/api/coding/paas/v4`. Enter the API key associated with the
+active Coding Plan; `glm-5.3-flash` is selected by default and `glm-5.3` is
+available from the model selector. This entry is separate from Z.ai's general
+pay-as-you-go API endpoint so Coding Plan requests use the intended quota path.
 
 API keys are saved in an owner-only settings file and restored when the same
 provider is selected later. OpenAI Account authentication is owned by the

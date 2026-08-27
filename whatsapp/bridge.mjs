@@ -26,6 +26,9 @@ const ownerPid = process.ppid;
 const maxInboundMediaBytes = Number(
   process.env.GNOME_WA_MAX_MEDIA_BYTES || 15 * 1024 * 1024,
 );
+const inboundRequestTimeoutMs = Number(
+  process.env.GNOME_WA_INBOUND_TIMEOUT_MS || 15 * 60 * 1000,
+);
 
 const logger = pino({
   level: process.env.GNOME_WA_LOG_LEVEL || 'warn',
@@ -42,6 +45,7 @@ const lidToPhoneMap = {};
 const outboundMessageIds = new Set();
 const outboundMessageOrder = [];
 const maxRememberedOutboundMessages = 512;
+const inboundChains = new Map();
 
 const state = {
   bridge_running: true,
@@ -224,6 +228,11 @@ async function sendMessage(jid, text) {
 }
 
 async function forwardInbound(payload) {
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(
+    () => controller.abort(new Error('GnomeAI WhatsApp turn timed out')),
+    inboundRequestTimeoutMs,
+  );
   try {
     const resp = await fetch(`${apiBase}/api/whatsapp/inbound`, {
       method: 'POST',
@@ -232,6 +241,7 @@ async function forwardInbound(payload) {
         'X-Gnomef-Token': webToken,
       },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     });
     if (!resp.ok) {
       const text = await resp.text();
@@ -254,7 +264,23 @@ async function forwardInbound(payload) {
     }
   } catch (err) {
     logger.warn({ err }, 'Failed to forward inbound WhatsApp message');
+  } finally {
+    clearTimeout(timeoutHandle);
   }
+}
+
+// Baileys may dispatch a new upsert before an earlier HTTP turn has finished.
+// Keep ordering per conversation while allowing separate chats to run in
+// parallel. A rejected/aborted turn never poisons the following chain.
+function enqueueInbound(payload) {
+  const key = String(payload.chat_jid || payload.raw_chat_jid || 'unknown');
+  const previous = inboundChains.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(() => forwardInbound(payload));
+  inboundChains.set(key, current);
+  current.finally(() => {
+    if (inboundChains.get(key) === current) inboundChains.delete(key);
+  });
+  return current;
 }
 
 function extensionFromMime(mimetype) {
@@ -544,10 +570,11 @@ async function connectInternal() {
       const senderName = msg.pushName || sender.split('@')[0] || 'WhatsApp';
       const fromMe = Boolean(msg.key.fromMe);
       const isBotMessage =
+        (hasOwnNumber && fromMe) ||
         outboundMessageIds.has(String(msg.key.id || '')) ||
         (!hasOwnNumber && content.startsWith(`${assistantName}:`));
 
-      await forwardInbound({
+      await enqueueInbound({
         id: msg.key.id || '',
         chat_jid: chatJid,
         chat_jid_aliases: chatJidAliases,

@@ -1,3 +1,27 @@
+# Unreleased
+
+## Z.ai Coding Plan
+
+- Added `Z.ai Coding Plan` as a native OpenAI-compatible provider using the
+  dedicated `https://api.z.ai/api/coding/paas/v4` subscription endpoint.
+- Added `glm-5.3-flash` as the multimodal default and `glm-5.3` as a selectable
+  fallback, with provider-scoped API-key persistence shared by the desktop,
+  WebTool, WhatsApp and subagent paths.
+
+## WhatsApp provider recovery
+
+- Fixed GLM WhatsApp turns stalling after the first answer when the model
+  selected the browser-only `AskUserQuestion` tool. WhatsApp now asks such
+  clarifications as an ordinary reply instead of waiting up to one hour for a
+  widget that does not exist on that channel.
+- Serialized inbound turns per WhatsApp conversation and prevented dedicated
+  assistant numbers from feeding their own outbound replies back to the model.
+- Applied the configured `llama_timeout` to streamed and buffered provider
+  requests, so a silent upstream connection can no longer hold the WhatsApp
+  flow indefinitely.
+
+---
+
 # GnomeAI-RS 2.2.0 - 2026-08-25
 
 ## Structured native responses

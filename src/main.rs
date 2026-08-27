@@ -41,7 +41,7 @@ mod whatsapp;
 mod workspaces;
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     fs,
     io::Read,
@@ -122,6 +122,10 @@ struct AppState {
     runtime: RuntimeHandles,
     whatsapp: WhatsAppBridge,
     wa_seen: Arc<Mutex<SeenMessages>>,
+    /// Serializes turns from the same WhatsApp conversation. Baileys may emit
+    /// a second `messages.upsert` while the first provider call is still in
+    /// flight; without this guard both turns race over the same chat file.
+    wa_chat_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     upload_lock: Arc<Mutex<()>>,
     api_token: Arc<str>,
     /// The turn running per conversation, so `/interrupt` can find it.
@@ -272,6 +276,7 @@ async fn web_main() -> anyhow::Result<()> {
         runtime: RuntimeHandles::default(),
         whatsapp: WhatsAppBridge::new(),
         wa_seen: Arc::new(Mutex::new(SeenMessages::default())),
+        wa_chat_locks: Arc::new(Mutex::new(HashMap::new())),
         upload_lock: Arc::new(Mutex::new(())),
         api_token: Arc::from(api_token),
         turns: LiveTurns::default(),
@@ -1868,6 +1873,14 @@ async fn api_whatsapp_inbound(
     }
 
     let cid = whatsapp_chat_id(chat_jid);
+    let chat_lock = {
+        let mut locks = state.wa_chat_locks.lock().await;
+        locks
+            .entry(cid.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _chat_guard = chat_lock.lock().await;
     let chat_name = payload
         .get("chat_name")
         .and_then(Value::as_str)

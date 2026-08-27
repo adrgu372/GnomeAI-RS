@@ -92,6 +92,15 @@ pub const PROVIDERS: &[ProviderPreset] = &[
         description: "DeepSeek platform API",
     },
     ProviderPreset {
+        id: "zai-coding",
+        name: "Z.ai Coding Plan",
+        auth: AuthKind::ApiKey,
+        protocol: WireProtocol::OpenAi,
+        base_url: "https://api.z.ai/api/coding/paas/v4",
+        default_model: "glm-5.3-flash",
+        description: "subscription quota via the OpenAI-compatible coding endpoint",
+    },
+    ProviderPreset {
         id: "moonshot",
         name: "Moonshot / Kimi",
         auth: AuthKind::ApiKey,
@@ -457,10 +466,24 @@ mod tests {
     #[test]
     fn requires_keys_but_allows_keyless_local_endpoint() {
         assert!(ProviderSelection::from_choice("openai", None, None).is_err());
+        assert!(ProviderSelection::from_choice("zai-coding", None, None).is_err());
         assert!(
             ProviderSelection::from_choice("custom", None, Some("http://localhost:8080/v1".into()))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn zai_coding_plan_uses_the_subscription_endpoint_and_flash_default() {
+        let selected =
+            ProviderSelection::from_choice("zai-coding", Some("zai-key".into()), None).unwrap();
+
+        assert_eq!(selected.protocol_name(), "openai");
+        assert_eq!(
+            selected.resolved_base_url(),
+            Some("https://api.z.ai/api/coding/paas/v4")
+        );
+        assert_eq!(selected.model, "glm-5.3-flash");
     }
 
     #[test]

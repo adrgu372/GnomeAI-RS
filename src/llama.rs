@@ -50,6 +50,7 @@ pub fn known_models(provider_id: &str) -> Vec<ModelInfo> {
             model("deepseek-v3"),
             model("deepseek-r1"),
         ],
+        "zai-coding" => vec![model("glm-5.3-flash"), model("glm-5.3")],
         "moonshot" => vec![model("kimi-k3"), model("kimi-k2.5")],
         "qwen" => vec![
             model("qwen-plus"),
@@ -283,6 +284,7 @@ impl LlamaClient {
         );
         self.http
             .post(url)
+            .timeout(request_timeout(cfg))
             .headers(headers(cfg)?)
             .json(payload)
             .send()
@@ -361,6 +363,7 @@ impl LlamaClient {
             let response = self
                 .http
                 .post(&url)
+                .timeout(request_timeout(cfg))
                 .headers(headers(cfg)?)
                 .json(&payload)
                 .send()
@@ -463,6 +466,7 @@ impl LlamaClient {
             let response = self
                 .http
                 .post(&url)
+                .timeout(request_timeout(cfg))
                 .headers(headers(cfg)?)
                 .json(&payload)
                 .send()
@@ -562,6 +566,7 @@ impl LlamaClient {
             let response = self
                 .http
                 .post(&url)
+                .timeout(request_timeout(cfg))
                 .headers(headers(cfg)?)
                 .json(&payload)
                 .send()
@@ -658,6 +663,7 @@ impl LlamaClient {
         let response = self
             .http
             .post(&url)
+            .timeout(request_timeout(cfg))
             .headers(anthropic_headers(cfg)?)
             .json(&payload)
             .send()
@@ -700,6 +706,7 @@ impl LlamaClient {
         let response = self
             .http
             .post(&url)
+            .timeout(request_timeout(cfg))
             .headers(anthropic_headers(cfg)?)
             .json(&payload)
             .send()
@@ -750,6 +757,7 @@ impl LlamaClient {
         let response = self
             .http
             .post(&anthropic_messages_url(cfg))
+            .timeout(request_timeout(cfg))
             .headers(anthropic_headers(cfg)?)
             .json(&payload)
             .send()
@@ -782,6 +790,10 @@ fn set_openai_token_limit(cfg: &AppConfig, payload: &mut Value) {
         "max_tokens"
     };
     payload[key] = json!(cfg.llama_max_tokens);
+}
+
+fn request_timeout(cfg: &AppConfig) -> Duration {
+    Duration::from_secs(cfg.llama_timeout.clamp(5, 3_600))
 }
 
 /// Read an OpenAI-style SSE response into text deltas plus one assembled batch
@@ -1625,6 +1637,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn configured_llama_timeout_is_applied_and_safely_bounded() {
+        let mut cfg = AppConfig::default();
+        cfg.llama_timeout = 120;
+        assert_eq!(request_timeout(&cfg), Duration::from_secs(120));
+
+        cfg.llama_timeout = 0;
+        assert_eq!(request_timeout(&cfg), Duration::from_secs(5));
+
+        cfg.llama_timeout = 10_000;
+        assert_eq!(request_timeout(&cfg), Duration::from_secs(3_600));
+    }
+
+    #[test]
     fn parses_openai_streaming_content_delta() {
         let line = r#"data: {"choices":[{"delta":{"content":"hel"}}]}"#;
         let tokens = stream_tokens_from_line(line).unwrap();
@@ -1907,6 +1932,27 @@ mod tests {
             .map(|model| model.id)
             .collect::<Vec<_>>();
         assert_eq!(anthropic, vec!["default", "sonnet", "opus", "haiku"]);
+    }
+
+    #[test]
+    fn zai_coding_plan_has_current_models_and_exact_endpoint_routes() {
+        let models = known_models("zai-coding")
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+        assert_eq!(models, vec!["glm-5.3-flash", "glm-5.3"]);
+
+        let mut cfg = AppConfig::default();
+        cfg.provider_id = "zai-coding".into();
+        cfg.llama_base_url = "https://api.z.ai/api/coding/paas/v4".into();
+        assert_eq!(
+            candidate_chat_urls(&cfg).first().map(String::as_str),
+            Some("https://api.z.ai/api/coding/paas/v4/chat/completions")
+        );
+        assert_eq!(
+            candidate_model_urls(&cfg).first().map(String::as_str),
+            Some("https://api.z.ai/api/coding/paas/v4/models")
+        );
     }
 
     #[test]

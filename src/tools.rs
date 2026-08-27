@@ -381,11 +381,12 @@ async fn run_tool_loop_internal(
     agent_profile: AgentProfile,
     turn: &TurnStream,
 ) -> String {
+    let whatsapp_origin = session_key.is_some_and(is_whatsapp_scope);
     let runtime_aware_system_prompt = append_memory_block(
         &build_runtime_aware_system_prompt(system_prompt, runtime_profile),
         memory_block,
     );
-    let channel_execution_policy = if session_key.is_some_and(is_whatsapp_scope) {
+    let channel_execution_policy = if whatsapp_origin {
         "WhatsApp authorization: this turn came from an allowed WhatsApp chat. The user's inbound message itself authorizes the standard user-level tool calls needed to fulfill it, so execute them without waiting for a desktop confirmation. Read-only mode still blocks mutations. Sudo may proceed only with an existing sudo ticket or a valid credential already stored in the local keyring; if neither is available, fail clearly instead of opening a desktop prompt."
     } else {
         "Native desktop authorization: obey the selected execution mode and request local confirmation whenever normal mode requires it."
@@ -402,16 +403,7 @@ async fn run_tool_loop_internal(
     ];
     // `0` means unlimited; anything else is a safety valve, not a work limit.
     let step_cap = cfg.tool_loop_max_steps;
-    let schemas = openai_tool_schemas()
-        .into_iter()
-        .filter(|schema| {
-            schema
-                .get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(Value::as_str)
-                .is_some_and(|name| agent_profile.allows(name))
-        })
-        .collect::<Vec<_>>();
+    let schemas = tool_schemas_for(agent_profile, whatsapp_origin);
     let mut final_content = String::new();
     let mut structured_output_only = false;
     let mut tool_observations = Vec::new();
@@ -940,6 +932,16 @@ async fn execute_tool_call(
         );
     }
     match name {
+        // AskUserQuestion is a browser widget: waiting here would leave a
+        // WhatsApp turn apparently frozen for its one-hour default timeout.
+        // It is also removed from the advertised WhatsApp schemas, but keep
+        // this guard for providers that emit textual/unadvertised tool calls.
+        "AskUserQuestion" if is_whatsapp_scope(&tool_ctx.session_key) => Ok(json!({
+            "channel": "whatsapp",
+            "interactive_widget_available": false,
+            "questions": args.get("questions").cloned().unwrap_or_else(|| json!([])),
+            "instruction": "Ask these questions directly in the WhatsApp reply, then stop and wait for the user's next message. Do not call AskUserQuestion again."
+        })),
         "AskUserQuestion" => {
             tool_ask_user_question(pending_questions, &tool_ctx.session_key, args).await
         }
@@ -3586,6 +3588,22 @@ fn tool_schema(name: &str, description: &str, parameters: Value) -> Value {
     })
 }
 
+fn tool_schemas_for(agent_profile: AgentProfile, whatsapp_origin: bool) -> Vec<Value> {
+    openai_tool_schemas()
+        .into_iter()
+        .filter(|schema| {
+            schema
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| {
+                    agent_profile.allows(name)
+                        && !(whatsapp_origin && name == "AskUserQuestion")
+                })
+        })
+        .collect()
+}
+
 fn tool_metadata() -> Vec<ToolMeta> {
     vec![
         ToolMeta {
@@ -4109,6 +4127,21 @@ mod tests {
         Json, Router,
         routing::{get, post},
     };
+
+    #[test]
+    fn whatsapp_never_advertises_the_blocking_question_widget() {
+        let whatsapp = tool_schemas_for(AgentProfile::Root, true);
+        let desktop = tool_schemas_for(AgentProfile::Root, false);
+        let has_question_widget = |schemas: &[Value]| {
+            schemas.iter().any(|schema| {
+                schema.pointer("/function/name").and_then(Value::as_str)
+                    == Some("AskUserQuestion")
+            })
+        };
+
+        assert!(!has_question_widget(&whatsapp));
+        assert!(has_question_widget(&desktop));
+    }
 
     #[test]
     fn parses_markdown_web_search_as_a_real_tool_call() {
