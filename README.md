@@ -5,16 +5,19 @@ application keeps the proven agent core and `Op`/`Event` protocol of the former
 terminal interface while replacing the TUI and browser page with one native
 window.
 
-Current package version: **2.2.0**. See [CHANGELOG.md](CHANGELOG.md) for the
+Current package version: **2.3.0**. See [CHANGELOG.md](CHANGELOG.md) for the
 historical release notes.
 
-## What changed in 2.2
+## What changed in 2.3
 
-Version 2.2 improves long interactive sessions and makes provider output much
-easier to read and operate from the native interface.
+Version 2.3 adds the Z.ai Coding Plan provider and makes WhatsApp turns robust
+against stalled upstream connections.
 
-| Area | Version 2.2 |
+| Area | Version 2.3 |
 | --- | --- |
+| Providers | Z.ai Coding Plan subscription endpoint with `glm-5.3-flash` as multimodal default |
+| WhatsApp | Clarifying questions answered inline; inbound turns serialize per conversation; provider requests honor `llama_timeout` |
+| Responses | Native Markdown layout for headings, lists, quotes, tables and fenced code, with one-click code copying |
 | Responses | Native Markdown layout for headings, lists, quotes, tables and fenced code, with one-click code copying |
 | Transcript | Reliable mouse-wheel scrolling over selectable text, including while a selection is active |
 | Clipboard | Native keyboard, context-menu and Linux primary-selection copy/paste behavior |

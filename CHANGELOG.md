@@ -1,4 +1,4 @@
-# Unreleased
+# GnomeAI-RS 2.3.0 - 2026-08-27
 
 ## Z.ai Coding Plan
 
