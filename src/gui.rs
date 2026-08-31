@@ -61,6 +61,281 @@ const COMMANDS: &[(&str, &str)] = &[
 ];
 
 const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+const WINDOW_RESUME_GAP: Duration = Duration::from_secs(2);
+const WINDOW_GEOMETRY_SETTLE: Duration = Duration::from_millis(750);
+const MONITOR_GEOMETRY_SETTLE: Duration = Duration::from_millis(350);
+const MONITOR_CHANGE_ACCEPT: Duration = Duration::from_secs(4);
+const WINDOW_RESTORE_RETRY: Duration = Duration::from_millis(450);
+const WINDOW_RESTORE_ATTEMPTS: u8 = 3;
+const WINDOW_SIZE_EPSILON: f32 = 4.0;
+const WINDOW_POSITION_EPSILON: f32 = 18.0;
+
+#[derive(Clone, Copy, Debug)]
+struct WindowGeometry {
+    inner_size: Vec2,
+    outer_position: Option<egui::Pos2>,
+    monitor_size: Option<Vec2>,
+    maximized: bool,
+    fullscreen: bool,
+    minimized: bool,
+    occluded: bool,
+}
+
+impl WindowGeometry {
+    fn drawable(self) -> bool {
+        !self.minimized
+            && !self.occluded
+            && self.inner_size.x >= 320.0
+            && self.inner_size.y >= 240.0
+    }
+
+    fn same_monitor(self, other: Self) -> bool {
+        optional_vec2_approx(self.monitor_size, other.monitor_size, WINDOW_SIZE_EPSILON)
+    }
+
+    fn same_window(self, other: Self) -> bool {
+        vec2_approx(self.inner_size, other.inner_size, WINDOW_SIZE_EPSILON)
+            && optional_pos2_approx(
+                self.outer_position,
+                other.outer_position,
+                WINDOW_POSITION_EPSILON,
+            )
+            && self.maximized == other.maximized
+            && self.fullscreen == other.fullscreen
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WindowRecoveryAction {
+    inner_size: Option<Vec2>,
+    outer_position: Option<egui::Pos2>,
+    maximized: Option<bool>,
+    fullscreen: Option<bool>,
+    reset_layout: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingWindowRestore {
+    target: WindowGeometry,
+    attempts: u8,
+    last_attempt: Instant,
+}
+
+#[derive(Debug)]
+struct WindowRecovery {
+    last_frame: Instant,
+    stable: Option<WindowGeometry>,
+    candidate: Option<(WindowGeometry, Instant)>,
+    transition_since: Option<Instant>,
+    last_monitor: Option<Vec2>,
+    monitor_changed_at: Instant,
+    pending: Option<PendingWindowRestore>,
+}
+
+impl Default for WindowRecovery {
+    fn default() -> Self {
+        Self::new_at(Instant::now())
+    }
+}
+
+impl WindowRecovery {
+    fn new_at(now: Instant) -> Self {
+        Self {
+            last_frame: now,
+            stable: None,
+            candidate: None,
+            transition_since: None,
+            last_monitor: None,
+            monitor_changed_at: now,
+            pending: None,
+        }
+    }
+
+    fn observe(&mut self, now: Instant, current: WindowGeometry) -> Option<WindowRecoveryAction> {
+        let frame_gap = now.saturating_duration_since(self.last_frame);
+        self.last_frame = now;
+
+        if !optional_vec2_approx(self.last_monitor, current.monitor_size, WINDOW_SIZE_EPSILON) {
+            self.last_monitor = current.monitor_size;
+            self.monitor_changed_at = now;
+        }
+
+        if !current.drawable() {
+            self.transition_since.get_or_insert(now);
+            self.candidate = None;
+            return None;
+        }
+
+        let Some(stable) = self.stable else {
+            self.stable = Some(current);
+            self.last_monitor = current.monitor_size;
+            return None;
+        };
+
+        // A quick user resize/move can end with no follow-up repaint until the
+        // next click. If the same candidate is still present after the settle
+        // interval, commit it before interpreting the idle frame gap.
+        if self.transition_since.is_none()
+            && self.pending.is_none()
+            && current.same_monitor(stable)
+            && self.candidate.is_some_and(|(candidate, since)| {
+                current.same_window(candidate)
+                    && now.saturating_duration_since(since) >= WINDOW_GEOMETRY_SETTLE
+            })
+        {
+            self.stable = Some(current);
+            self.candidate = None;
+            return None;
+        }
+
+        // eframe is event-driven and may legitimately render no frames while
+        // the UI is idle. A frame gap is a resume signal only when the native
+        // geometry also changed. Monitor/visibility transitions are tracked
+        // independently below.
+        if frame_gap >= WINDOW_RESUME_GAP && !current.same_window(stable) {
+            self.transition_since.get_or_insert(now);
+        }
+
+        if let Some(mut pending) = self.pending {
+            if !current.same_monitor(pending.target) {
+                self.transition_since.get_or_insert(now);
+                if now.saturating_duration_since(self.monitor_changed_at) >= MONITOR_CHANGE_ACCEPT {
+                    // The original monitor did not return. This is a real
+                    // resolution/monitor change, not a short resume fallback.
+                    self.pending = None;
+                    self.transition_since = None;
+                    self.stable = Some(current);
+                    self.candidate = None;
+                    return Some(WindowRecoveryAction {
+                        reset_layout: true,
+                        ..Default::default()
+                    });
+                }
+                return None;
+            }
+            if current.same_window(pending.target) {
+                self.pending = None;
+                self.stable = Some(current);
+                self.candidate = None;
+                return None;
+            }
+            if now.saturating_duration_since(pending.last_attempt) >= WINDOW_RESTORE_RETRY {
+                if pending.attempts < WINDOW_RESTORE_ATTEMPTS {
+                    pending.attempts += 1;
+                    pending.last_attempt = now;
+                    self.pending = Some(pending);
+                    return Some(window_restore_action(pending.target, current));
+                }
+
+                // Do not fight the compositor indefinitely. If it rejected all
+                // requests, accept its geometry and keep the UI usable.
+                self.pending = None;
+                self.stable = Some(current);
+                self.candidate = None;
+                return Some(WindowRecoveryAction {
+                    reset_layout: true,
+                    ..Default::default()
+                });
+            }
+            return None;
+        }
+
+        if !current.same_monitor(stable) {
+            self.transition_since.get_or_insert(now);
+            self.candidate = None;
+            if now.saturating_duration_since(self.monitor_changed_at) >= MONITOR_CHANGE_ACCEPT {
+                // Avoid waiting forever when the user really changed monitor
+                // or display mode. The compositor's current geometry becomes
+                // the new baseline after it remains stable for a few seconds.
+                self.transition_since = None;
+                self.stable = Some(current);
+                return Some(WindowRecoveryAction {
+                    reset_layout: true,
+                    ..Default::default()
+                });
+            }
+            return None;
+        }
+
+        if self.transition_since.is_some() {
+            if now.saturating_duration_since(self.monitor_changed_at) < MONITOR_GEOMETRY_SETTLE {
+                return None;
+            }
+            self.transition_since = None;
+            self.candidate = None;
+            if current.same_window(stable) {
+                return Some(WindowRecoveryAction {
+                    reset_layout: true,
+                    ..Default::default()
+                });
+            }
+
+            self.pending = Some(PendingWindowRestore {
+                target: stable,
+                attempts: 1,
+                last_attempt: now,
+            });
+            return Some(window_restore_action(stable, current));
+        }
+
+        if current.same_window(stable) {
+            self.candidate = None;
+            return None;
+        }
+
+        match self.candidate {
+            Some((candidate, since)) if current.same_window(candidate) => {
+                if now.saturating_duration_since(since) >= WINDOW_GEOMETRY_SETTLE {
+                    self.stable = Some(current);
+                    self.candidate = None;
+                }
+            }
+            _ => self.candidate = Some((current, now)),
+        }
+        None
+    }
+}
+
+fn window_restore_action(target: WindowGeometry, current: WindowGeometry) -> WindowRecoveryAction {
+    let restore_regular_geometry = !target.maximized && !target.fullscreen;
+    WindowRecoveryAction {
+        inner_size: (restore_regular_geometry
+            && !vec2_approx(target.inner_size, current.inner_size, WINDOW_SIZE_EPSILON))
+        .then_some(target.inner_size),
+        outer_position: (restore_regular_geometry
+            && !optional_pos2_approx(
+                target.outer_position,
+                current.outer_position,
+                WINDOW_POSITION_EPSILON,
+            ))
+        .then_some(target.outer_position)
+        .flatten(),
+        maximized: (target.maximized != current.maximized).then_some(target.maximized),
+        fullscreen: (target.fullscreen != current.fullscreen).then_some(target.fullscreen),
+        reset_layout: true,
+    }
+}
+
+fn vec2_approx(left: Vec2, right: Vec2, epsilon: f32) -> bool {
+    (left.x - right.x).abs() <= epsilon && (left.y - right.y).abs() <= epsilon
+}
+
+fn optional_vec2_approx(left: Option<Vec2>, right: Option<Vec2>, epsilon: f32) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => vec2_approx(left, right, epsilon),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn optional_pos2_approx(left: Option<egui::Pos2>, right: Option<egui::Pos2>, epsilon: f32) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.distance(right) <= epsilon,
+        // Wayland deliberately does not expose native window coordinates.
+        (None, None) => true,
+        _ => false,
+    }
+}
 
 #[derive(Debug)]
 enum Block {
@@ -407,6 +682,7 @@ struct GuiApp {
     copy_request: Option<String>,
     quit_requested: bool,
     request_focus: bool,
+    window_recovery: WindowRecovery,
 }
 
 impl GuiApp {
@@ -512,6 +788,7 @@ impl GuiApp {
             copy_request: None,
             quit_requested: false,
             request_focus: true,
+            window_recovery: WindowRecovery::default(),
         }
     }
 
@@ -1936,12 +2213,11 @@ impl GuiApp {
                     .wheel_scroll_multiplier(Vec2::ZERO)
                     .show(ui, |ui| {
                         forward_mouse_wheel_to_parent_scroll(ui);
-                        let content_width = ui.available_width().min(900.0);
-                        let gutter = ((ui.available_width() - content_width) / 2.0).max(0.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(gutter);
-                            ui.vertical(|ui| {
-                                ui.set_width(content_width);
+                        let content_width = ui.available_width().min(900.0).max(1.0);
+                        let content_size = Vec2::new(content_width, 0.0);
+                        let content_layout = Layout::top_down(Align::Min);
+                        ui.vertical_centered(|ui| {
+                            ui.allocate_ui_with_layout(content_size, content_layout, |ui| {
                                 if self.blocks.is_empty() {
                                     ui.vertical_centered(|ui| {
                                         ui.add_space(54.0);
@@ -2032,13 +2308,11 @@ impl GuiApp {
                     .inner_margin(Margin::symmetric(18, 12)),
             )
             .show(root, |ui| {
-                let content_width = ui.available_width().min(900.0);
-                let gutter = ((ui.available_width() - content_width) / 2.0).max(0.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(gutter);
-                    ui.vertical(|ui| {
-                        ui.set_width(content_width);
-
+                let content_width = ui.available_width().min(900.0).max(1.0);
+                let content_size = Vec2::new(content_width, 0.0);
+                let content_layout = Layout::top_down(Align::Min);
+                ui.vertical_centered(|ui| {
+                    ui.allocate_ui_with_layout(content_size, content_layout, |ui| {
                         if let Some(path) = self.pending_attachment.clone() {
                             egui::Frame::default()
                                 .fill(Color32::from_rgb(27, 28, 32))
@@ -3520,6 +3794,10 @@ impl eframe::App for GuiApp {
         self.drain_events();
         self.handle_dropped_files(&ctx);
         apply_contrast(&ctx, self.high_contrast);
+        let geometry = current_window_geometry(&ctx);
+        if let Some(action) = self.window_recovery.observe(Instant::now(), geometry) {
+            apply_window_recovery(&ctx, action);
+        }
         if let Some(text) = self.copy_request.take() {
             ctx.copy_text(text);
         }
@@ -3598,6 +3876,46 @@ impl eframe::App for GuiApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         ctx.request_repaint_after(Duration::from_millis(if self.busy { 40 } else { 120 }));
+    }
+}
+
+fn current_window_geometry(ctx: &egui::Context) -> WindowGeometry {
+    let fallback_inner_size = ctx.content_rect().size();
+    ctx.input(|input| {
+        let viewport = input.viewport();
+        WindowGeometry {
+            inner_size: viewport
+                .inner_rect
+                .map_or(fallback_inner_size, |rect| rect.size()),
+            outer_position: viewport.outer_rect.map(|rect| rect.min),
+            monitor_size: viewport.monitor_size,
+            maximized: viewport.maximized.unwrap_or(false),
+            fullscreen: viewport.fullscreen.unwrap_or(false),
+            minimized: viewport.minimized.unwrap_or(false),
+            occluded: viewport.occluded.unwrap_or(false),
+        }
+    })
+}
+
+fn apply_window_recovery(ctx: &egui::Context, action: WindowRecoveryAction) {
+    if let Some(fullscreen) = action.fullscreen {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+    }
+    if let Some(maximized) = action.maximized {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
+    }
+    if let Some(inner_size) = action.inner_size {
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(inner_size));
+    }
+    if let Some(outer_position) = action.outer_position {
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(outer_position));
+    }
+    if action.reset_layout {
+        // Floating egui windows remember their coordinates independently of
+        // the native window. Forget only those areas so a temporary fallback
+        // resolution cannot leave dialogs off-screen after wake-up.
+        ctx.memory_mut(|memory| memory.reset_areas());
+        ctx.request_repaint();
     }
 }
 
@@ -4174,6 +4492,40 @@ fn ellipsize(text: &str, max_characters: usize) -> String {
         .collect::<String>();
     shortened.push('…');
     shortened
+}
+
+fn tool_header_title(
+    mark: &str,
+    name: &str,
+    summary: &str,
+    done: bool,
+    ms: u64,
+    available_width: f32,
+) -> String {
+    // CollapsingHeader renders its title on one line. A shell command can be
+    // thousands of characters long, so letting the title use its intrinsic
+    // width expands the parent vertical ScrollArea and shifts the whole chat.
+    let title_budget = ((available_width.max(180.0) / 7.0).floor() as usize).clamp(24, 140);
+    // "{mark} {name} — {summary}" joins mark, name and summary with single
+    // spaces, so those two joining characters count against the width budget
+    // alongside the separator itself.
+    let fixed_characters = 2
+        + mark.chars().count()
+        + name.chars().count()
+        + if done {
+            format!(" —  · {ms} ms").chars().count()
+        } else {
+            " — ".chars().count()
+        };
+    let summary = ellipsize(
+        summary,
+        title_budget.saturating_sub(fixed_characters).max(12),
+    );
+    if done {
+        format!("{mark} {name} — {summary} · {ms} ms")
+    } else {
+        format!("{mark} {name} — {summary}")
+    }
 }
 
 fn diff_file_names(diff: &str) -> Vec<String> {
@@ -4954,7 +5306,16 @@ fn render_markdown(ui: &mut egui::Ui, id: egui::Id, text: &str) {
                             });
                         });
                         ui.add_space(4.0);
-                        selectable_text(ui, block_id, &text, true, true, None);
+                        ScrollArea::horizontal()
+                            .id_salt(block_id.with("code-scroll"))
+                            .auto_shrink([false, true])
+                            // The transcript owns the mouse wheel. Code keeps a
+                            // draggable horizontal bar without stealing normal
+                            // vertical scrolling or text selection.
+                            .scroll_source(egui::containers::scroll_area::ScrollSource::SCROLL_BAR)
+                            .show(ui, |ui| {
+                                selectable_text(ui, block_id, &text, false, true, None);
+                            });
                     });
             }
             MarkdownBlock::Table { headers, rows } => {
@@ -5101,7 +5462,7 @@ fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
                 .corner_radius(12.0)
                 .inner_margin(Margin::symmetric(14, 11))
                 .show(ui, |ui| {
-                    ui.set_min_width((width - 30.0).max(120.0));
+                    ui.set_width((width - 30.0).max(120.0));
                     ui.label(
                         RichText::new("YOU")
                             .size(10.0)
@@ -5126,7 +5487,7 @@ fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
                     Color32::from_rgb(18, 31, 24),
                 );
                 ui.vertical(|ui| {
-                    ui.set_min_width((width - 46.0).max(120.0));
+                    ui.set_width((width - 46.0).max(120.0));
                     ui.label(
                         RichText::new("GnomeAI")
                             .size(11.0)
@@ -5177,12 +5538,9 @@ fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
                 (true, true) => ("✓", Color32::from_rgb(80, 200, 130)),
                 (true, false) => ("✕", Color32::LIGHT_RED),
             };
-            let title = if *done {
-                format!("{mark} {name} — {summary} · {ms} ms")
-            } else {
-                format!("{mark} {name} — {summary}")
-            };
             let width = ui.available_width();
+            let inner_width = (width - 24.0).max(120.0);
+            let title = tool_header_title(mark, name, summary, *done, *ms, inner_width);
             egui::Frame::default()
                 .fill(Color32::from_rgb(24, 25, 29))
                 .stroke(Stroke::new(
@@ -5198,8 +5556,8 @@ fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
                 .corner_radius(10.0)
                 .inner_margin(Margin::symmetric(11, 8))
                 .show(ui, |ui| {
-                    ui.set_min_width((width - 24.0).max(120.0));
-                    egui::CollapsingHeader::new(RichText::new(title).color(color))
+                    ui.set_width(inner_width);
+                    let response = egui::CollapsingHeader::new(RichText::new(title).color(color))
                         .id_salt(("tool", call_id))
                         .default_open(!*done || !*ok)
                         .show(ui, |ui| {
@@ -5227,6 +5585,7 @@ fn render_block(ui: &mut egui::Ui, index: usize, block: &Block) {
                                     });
                             }
                         });
+                    response.header_response.on_hover_text(summary);
                 });
         }
         Block::Diff(diff) => {
@@ -5580,12 +5939,195 @@ fn edit_key_value_map(
 mod tests {
     use super::*;
 
+    fn geometry(inner: [f32; 2], monitor: [f32; 2]) -> WindowGeometry {
+        WindowGeometry {
+            inner_size: Vec2::new(inner[0], inner[1]),
+            outer_position: Some(egui::pos2(200.0, 120.0)),
+            monitor_size: Some(Vec2::new(monitor[0], monitor[1])),
+            maximized: false,
+            fullscreen: false,
+            minimized: false,
+            occluded: false,
+        }
+    }
+
+    #[test]
+    fn window_geometry_is_restored_after_a_resume_gap() {
+        let start = Instant::now();
+        let mut recovery = WindowRecovery::new_at(start);
+        let stable = geometry([1220.0, 780.0], [1920.0, 1080.0]);
+        assert!(recovery.observe(start, stable).is_none());
+
+        let shifted = WindowGeometry {
+            inner_size: Vec2::new(940.0, 700.0),
+            outer_position: Some(egui::pos2(480.0, 120.0)),
+            ..stable
+        };
+        let action = recovery
+            .observe(start + Duration::from_secs(5), shifted)
+            .expect("resume must request recovery");
+
+        assert_eq!(action.inner_size, Some(stable.inner_size));
+        assert_eq!(action.outer_position, stable.outer_position);
+        assert!(action.reset_layout);
+    }
+
+    #[test]
+    fn ordinary_idle_does_not_trigger_window_recovery() {
+        let start = Instant::now();
+        let mut recovery = WindowRecovery::new_at(start);
+        let stable = geometry([1220.0, 780.0], [1920.0, 1080.0]);
+        assert!(recovery.observe(start, stable).is_none());
+        assert!(
+            recovery
+                .observe(start + Duration::from_secs(30), stable)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn completed_resize_is_kept_after_an_idle_frame_gap() {
+        let start = Instant::now();
+        let mut recovery = WindowRecovery::new_at(start);
+        let original = geometry([1220.0, 780.0], [1920.0, 1080.0]);
+        assert!(recovery.observe(start, original).is_none());
+
+        let resized = WindowGeometry {
+            inner_size: Vec2::new(1080.0, 720.0),
+            ..original
+        };
+        assert!(
+            recovery
+                .observe(start + Duration::from_millis(100), resized)
+                .is_none()
+        );
+        assert!(
+            recovery
+                .observe(start + Duration::from_secs(5), resized)
+                .is_none(),
+            "an event-driven idle gap must not undo a completed user resize"
+        );
+        assert!(
+            recovery
+                .stable
+                .is_some_and(|stable| stable.same_window(resized))
+        );
+    }
+
+    #[test]
+    fn transient_monitor_resolution_does_not_replace_stable_geometry() {
+        let start = Instant::now();
+        let mut recovery = WindowRecovery::new_at(start);
+        let stable = geometry([1220.0, 780.0], [1920.0, 1080.0]);
+        assert!(recovery.observe(start, stable).is_none());
+
+        let fallback = geometry([880.0, 620.0], [1024.0, 768.0]);
+        assert!(
+            recovery
+                .observe(start + Duration::from_millis(100), fallback)
+                .is_none()
+        );
+
+        let returned = WindowGeometry {
+            inner_size: fallback.inner_size,
+            outer_position: Some(egui::pos2(410.0, 120.0)),
+            monitor_size: stable.monitor_size,
+            ..fallback
+        };
+        assert!(
+            recovery
+                .observe(start + Duration::from_millis(300), returned)
+                .is_none(),
+            "monitor geometry must settle before moving the window"
+        );
+        let action = recovery
+            .observe(start + Duration::from_millis(700), returned)
+            .expect("the original monitor must restore the saved geometry");
+        assert_eq!(action.inner_size, Some(stable.inner_size));
+        assert_eq!(action.outer_position, stable.outer_position);
+    }
+
+    #[test]
+    fn deliberate_resize_becomes_the_next_stable_geometry() {
+        let start = Instant::now();
+        let mut recovery = WindowRecovery::new_at(start);
+        let original = geometry([1220.0, 780.0], [1920.0, 1080.0]);
+        assert!(recovery.observe(start, original).is_none());
+
+        let resized = WindowGeometry {
+            inner_size: Vec2::new(1080.0, 720.0),
+            ..original
+        };
+        assert!(
+            recovery
+                .observe(start + Duration::from_millis(100), resized)
+                .is_none()
+        );
+        assert!(
+            recovery
+                .observe(start + Duration::from_millis(900), resized)
+                .is_none()
+        );
+
+        let wake_geometry = WindowGeometry {
+            inner_size: Vec2::new(900.0, 650.0),
+            ..resized
+        };
+        let action = recovery
+            .observe(start + Duration::from_secs(5), wake_geometry)
+            .expect("resume must use the last deliberate resize");
+        assert_eq!(action.inner_size, Some(resized.inner_size));
+    }
+
+    #[test]
+    fn permanent_monitor_change_becomes_the_new_baseline() {
+        let start = Instant::now();
+        let mut recovery = WindowRecovery::new_at(start);
+        let original = geometry([1220.0, 780.0], [1920.0, 1080.0]);
+        assert!(recovery.observe(start, original).is_none());
+
+        let changed = geometry([1080.0, 700.0], [1600.0, 900.0]);
+        assert!(
+            recovery
+                .observe(start + Duration::from_millis(100), changed)
+                .is_none()
+        );
+        assert!(
+            recovery
+                .observe(start + Duration::from_secs(3), changed)
+                .is_none(),
+            "a temporary fallback resolution must not replace the baseline"
+        );
+        let action = recovery
+            .observe(start + Duration::from_secs(5), changed)
+            .expect("a persistent monitor change must eventually be accepted");
+        assert!(action.reset_layout);
+        assert!(
+            recovery
+                .stable
+                .is_some_and(|stable| stable.same_window(changed))
+        );
+    }
+
     #[test]
     fn composer_grows_for_wrapped_and_hard_lines() {
         assert_eq!(composer_rows("hello", 320.0), 1);
         assert_eq!(composer_rows("hello\nworld", 320.0), 2);
         assert!(composer_rows(&"x".repeat(300), 240.0) > 1);
         assert_eq!(composer_rows(&"x".repeat(10_000), 240.0), 8);
+    }
+
+    #[test]
+    fn long_tool_command_is_bounded_by_the_transcript_width() {
+        let command = format!(
+            "cd /home/gulas/Downloads && {}",
+            "very_long_command ".repeat(80)
+        );
+        let title = tool_header_title("●", "shell", &command, false, 0, 620.0);
+
+        assert!(title.chars().count() <= (620.0_f32 / 7.0).floor() as usize);
+        assert!(title.ends_with('…'));
+        assert!(!title.contains(&command));
     }
 
     #[test]

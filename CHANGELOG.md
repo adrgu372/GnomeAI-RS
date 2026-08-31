@@ -1,3 +1,25 @@
+# Unreleased
+
+## Display resume and responsive layout
+
+- Preserve the last stable native-window size, position and display state, then
+  restore them after suspend, screen lock, monitor power-off or a transient
+  fallback resolution.
+- Wait for monitor geometry to settle before restoring the window, retry
+  compositor requests without looping forever, and accept a real monitor or
+  resolution change after it remains stable.
+- Recenter the transcript and composer using bounded egui layouts, reset
+  off-screen floating dialogs after resume, and keep long fenced code in its
+  own horizontal scroller so it cannot widen or shift the conversation.
+- Bound every conversation block to the transcript width and shorten long
+  single-line tool headers dynamically, while exposing the complete command on
+  hover, so shell invocations cannot expand the chat beyond the window.
+- Added regression coverage for resume gaps, ordinary event-loop idle periods,
+  transient fallback resolutions, deliberate window resizing and permanent
+  monitor changes.
+
+---
+
 # GnomeAI-RS 2.3.0 - 2026-08-27
 
 ## Z.ai Coding Plan
