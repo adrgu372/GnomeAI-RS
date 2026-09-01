@@ -20,6 +20,13 @@ License: Apache-2.0
  On Debian systems, the Apache License version 2.0 is also available at
  /usr/share/common-licenses/Apache-2.0.
 
+Files: usr/lib/gnomeai-rs/dotnet/*
+Copyright: Microsoft Corporation and respective .NET contributors
+License: MIT and bundled third-party licenses
+ The complete Microsoft license and third-party notices remain installed as
+ /usr/lib/gnomeai-rs/dotnet/LICENSE.txt and
+ /usr/lib/gnomeai-rs/dotnet/ThirdPartyNotices.txt.
+
 Files: usr/share/gnomeai-rs/whatsapp/node_modules/*
 Copyright: respective Node package authors
 License: MIT and BSD-3-Clause and ISC and Apache-2.0 and GPL-3.0 and 0BSD and BlueOak-1.0.0

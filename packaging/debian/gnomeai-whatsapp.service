@@ -1,0 +1,19 @@
+[Unit]
+Description=GnomeAI-RS background service for WhatsApp
+Documentation=file:///usr/share/doc/gnomeai-rs/README.Debian
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/gnomeai-rs/gnomef-whatsapp
+Environment=GNOMEF_NATIVE_HELPER=1
+Environment=GNOMEF_RS_ASSETS=/usr/share/gnomeai-rs
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+UMask=0077
+
+[Install]
+WantedBy=default.target

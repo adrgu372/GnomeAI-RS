@@ -11,6 +11,27 @@ if [ -z "${GNOMEF_RS_HOME:-}" ]; then
 fi
 export GNOMEF_RS_ASSETS=${GNOMEF_RS_ASSETS:-/usr/share/gnomeai-rs}
 
+bundled_dotnet=/usr/lib/gnomeai-rs/dotnet
+if [ -x "$bundled_dotnet/dotnet" ]; then
+    DOTNET_ROOT=$bundled_dotnet
+    DOTNET_ROOT_X64=$bundled_dotnet
+    DOTNET_MULTILEVEL_LOOKUP=0
+    PATH=$bundled_dotnet:$PATH
+    export DOTNET_ROOT DOTNET_ROOT_X64 DOTNET_MULTILEVEL_LOOKUP PATH
+fi
+
 mkdir -p "$GNOMEF_RS_HOME"
+
+# The packaged WhatsApp backend is a user service, not a child of the desktop
+# window. Starting it here also activates it immediately after a package
+# upgrade; the globally enabled unit handles subsequent logins and reboots.
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    if systemctl --user start gnomeai-whatsapp.service >/dev/null 2>&1 \
+       && systemctl --user is-active --quiet gnomeai-whatsapp.service; then
+        GNOMEF_PERSISTENT_SERVICE=1
+        export GNOMEF_PERSISTENT_SERVICE
+    fi
+fi
 
 exec /usr/lib/gnomeai-rs/gnomef-rs "$@"

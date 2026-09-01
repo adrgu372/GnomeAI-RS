@@ -1,22 +1,88 @@
 # Unreleased
 
+## Avalonia desktop frontend
+
+- Make command-approval feedback explicit: choosing Allow once, Always allow
+  or Deny immediately removes all decision buttons, records the selected state
+  on the card and prevents duplicate/conflicting submissions.
+- Install the WhatsApp backend as an auto-enabled systemd user service. It now
+  keeps receiving and answering messages after the Avalonia window closes,
+  while the UI and service share a private stable per-user loopback token.
+- Reuse the application path retained by `AppPaths` when creating that token,
+  avoiding a moved-`PathBuf` compilation failure in `gnomef-whatsapp`.
+- Download the pinned Microsoft .NET SDK 8.0.424 Linux x64 archive directly
+  during Debian packaging, verify its official SHA-512 and bundle the complete
+  SDK privately in the `.deb`. The installed package no longer depends on a
+  Microsoft APT repository or a separately installed `dotnet-sdk-8.0` package.
+- Route transcript wheel input through the outer ScrollViewer and render chat
+  text with SelectableTextBlock instead of nested read-only TextBox scrollers,
+  preventing mouse-wheel input from terminating the Avalonia process.
+- Close the current assistant/reasoning segment before tool, approval, patch or
+  verification cards, so the final answer starts in a new chronological bubble.
+- Keep new/resumed session navigation silent in the transcript while background
+  chats continue independently.
+- Convert buffered multi-chat token builders back to strings during replay and
+  update the Avalonia drag-data API, eliminating the reported C# build errors
+  and obsolete-member warning. Rename the Markdown border brush and implement
+  the always-enabled command event explicitly to keep the UI build warning-free.
+- Restored every Rust binary entry point under `src/bin` in the complete source
+  archive so `scripts/build-deb.sh` can resolve all targets from `Cargo.toml`.
+- Replaced the `eframe`/`egui` window with a native Avalonia UI 11 frontend
+  (`ui/GnomeAI.UI`) spawned and supervised by the Rust core as a private child
+  process.
+- Conversations, providers, attachments, approvals, sudo prompts, WhatsApp,
+  memory, skills, sandbox modes and the node hub now flow through the extended
+  newline-delimited JSON `Op`/`Event` bridge in `src/avalonia_bridge.rs`.
+- Run multiple saved conversations concurrently. Turn events are tagged by
+  session, background streaming is buffered independently, each chat has its
+  own queue and Stop state, and the sidebar shows working/attention status.
+- Keep path-bound providers, registries and MCP transports alive for background
+  turns when the foreground conversation changes workspace. Sensitive approval
+  and sudo interactions remain serialized so replies cannot cross sessions.
+- Removed the `eframe` and `egui` dependencies; the Rust executable stays the
+  sole core and packaging builds the Avalonia .NET 8 UI with its private SDK.
+- Restored feature parity with the previous native window: every slash command,
+  session rename/delete/fork flow, provider and model selection, MCP editor,
+  memory and skill tools, transcript search/export, activity/diff pane,
+  WhatsApp conversations/QR/test messaging and per-node root policy is exposed
+  in Avalonia.
+- Reworked the complete desktop shell in an English Windows Apps style with
+  persistent System, Light and Dark Fluent themes, a navigation pane, command
+  bar, content cards and native resizable dialogs.
+- Replaced oversized conversation close controls and the stock reasoning
+  expander with compact Fluent controls, fixed sidebar icon spacing and
+  composer alignment, and kept the last transcript line clear of the composer.
+- Stabilized chat-card width from the first message, centered the Send label,
+  and made Enter send while Shift+Enter inserts a new line.
+- Anchored transcript auto-scroll after Markdown layout settles so the final
+  lines remain fully visible above the composer.
+- Batch streamed tokens and throttle Markdown reconstruction with reusable UI
+  timers, then follow the transcript's real content-size changes. This avoids
+  dispatcher backlogs, UI freezes and stale bottom-scroll positions.
+- Increase the live transcript follow space to roughly three text lines so new
+  output moves clearly above the composer instead of touching its top edge.
+- Stop polling monitor enumeration from the UI thread during idle/standby
+  recovery; window geometry alone now drives bounded restoration.
+- Refined the delete-conversation confirmation into a compact, symmetrical
+  Fluent dialog.
+- Added native Markdown presentation for streamed headings, lists, quotes,
+  tables and fenced code, including one-click code copying.
+- Added a source-level UI contract check to CI so XAML handlers, legacy slash
+  commands, core operations and English-only UI labels cannot silently regress.
+
 ## Display resume and responsive layout
 
-- Preserve the last stable native-window size, position and display state, then
-  restore them after suspend, screen lock, monitor power-off or a transient
-  fallback resolution.
-- Wait for monitor geometry to settle before restoring the window, retry
-  compositor requests without looping forever, and accept a real monitor or
-  resolution change after it remains stable.
-- Recenter the transcript and composer using bounded egui layouts, reset
-  off-screen floating dialogs after resume, and keep long fenced code in its
-  own horizontal scroller so it cannot widen or shift the conversation.
-- Bound every conversation block to the transcript width and shorten long
-  single-line tool headers dynamically, while exposing the complete command on
-  hover, so shell invocations cannot expand the chat beyond the window.
-- Added regression coverage for resume gaps, ordinary event-loop idle periods,
-  transient fallback resolutions, deliberate window resizing and permanent
-  monitor changes.
+- Preserve the last stable Avalonia window size, position, display size and
+  window state, then restore them after suspend, screen lock, monitor power-off
+  or a transient fallback resolution.
+- Wait for geometry to settle, retry compositor recovery a bounded number of
+  times, and accept a deliberate resize or permanent display change as the new
+  baseline.
+- Keep the transcript and composer inside bounded Grid/ScrollViewer layouts;
+  fenced code and tables receive their own horizontal scrollers so long output
+  cannot widen or shift the conversation.
+- Bound every conversation card to the transcript width and collapse detailed
+  reasoning/tool output without hiding approvals or administrator prompts.
 
 ---
 

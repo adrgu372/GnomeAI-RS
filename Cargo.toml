@@ -39,13 +39,11 @@ bench = false
 
 [dependencies]
 anyhow = "1"
-arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
-eframe = { version = "0.36.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 futures-util = "0.3"
 ignore = "0.4"
 libc = "0.2"
@@ -54,7 +52,6 @@ qrcode = "0.14"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
-rfd = "0.17.2"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

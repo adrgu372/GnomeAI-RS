@@ -1,12 +1,12 @@
 Package: gnomeai-rs
-Version: 2.3.0-1
+Version: 2.3.0-8
 Section: utils
 Priority: optional
 Architecture: amd64
 Maintainer: GnomeAI-RS Project <noreply@example.invalid>
 Homepage: https://github.com/adrgu372/GnomeAI-RS
 Installed-Size: 408924
-Depends: libc6 (>= 2.39), libgcc-s1, libx11-6, libxkbcommon0, libwayland-client0, libgl1, libdbus-1-3, at-spi2-core, ca-certificates, curl, util-linux, nodejs (>= 20), poppler-utils, xdotool, scrot | gnome-screenshot
+Depends: libc6 (>= 2.39), libgcc-s1, libgssapi-krb5-2, libicu76, libssl3t64, libstdc++6, tzdata, zlib1g, libx11-6, libxkbcommon0, libwayland-client0, libdbus-1-3, at-spi2-core, ca-certificates, curl, util-linux, nodejs (>= 20), poppler-utils, xdotool, scrot | gnome-screenshot
 Recommends: podman (>= 4.3), xdg-utils, git, libsecret-tools, wl-clipboard | xclip | xsel, grim
 Suggests: npm, claude-code
 Description: native graphical multi-provider AI agent written in Rust
@@ -15,5 +15,6 @@ Description: native graphical multi-provider AI agent written in Rust
  SKILL.md packages.
  .
  The package bundles the official OpenAI Codex app-server runtime, the pinned
- WhatsApp bridge dependencies and a rootless, lazy Firecrawl deployment with
- complete corresponding AGPL source.
+ WhatsApp bridge dependencies, Microsoft .NET SDK 8.0.424 for the Avalonia UI
+ and a rootless, lazy Firecrawl deployment with complete corresponding AGPL
+ source.

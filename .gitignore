@@ -6,4 +6,8 @@
 /generated/
 /whatsapp/node_modules/
 /dist/
+/ui/**/bin/
+/ui/**/obj/
+__pycache__/
+*.pyc
 descriere

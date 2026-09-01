@@ -4,6 +4,8 @@ mod agent;
 mod app_dirs;
 #[path = "../apply_patch.rs"]
 mod apply_patch;
+#[path = "../avalonia_bridge.rs"]
+mod avalonia_bridge;
 #[path = "../codex_app_server.rs"]
 mod codex_app_server;
 #[path = "../config.rs"]
@@ -17,8 +19,6 @@ mod desktop_a11y;
 mod embeddings;
 #[path = "../firecrawl.rs"]
 mod firecrawl;
-#[path = "../gui.rs"]
-mod gui;
 #[path = "../llama.rs"]
 mod llama;
 #[path = "../mcp_client.rs"]
@@ -27,6 +27,8 @@ mod mcp_client;
 mod memory;
 #[path = "../memory_engine.rs"]
 mod memory_engine;
+#[path = "../native_service.rs"]
+mod native_service;
 #[path = "../node_protocol.rs"]
 mod node_protocol;
 #[path = "../nodes.rs"]
@@ -68,21 +70,27 @@ mod workspaces;
 
 use agent::{Agent, ApprovalPolicy};
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
 use config::AppConfig;
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use memory_engine::{DreamHandle, MemoryEngine, spawn_dream_worker};
 use privilege::{PrivilegeBroker, PrivilegeCredential};
 use protocol::{Decision, Event, HistoryTurn, Op, SessionSummary};
 use provider_catalog::{ProviderSelection, ProviderSettingsStore, build_provider, preset};
 use sandbox::{SandboxMode, SandboxPolicy};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::{RwLock, mpsc};
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tooling::{Registry, ToolOutputStore};
 use workspaces::{WorkspaceHistory, resolve_startup_workspace};
+
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
 struct Cli {
     workspace: Option<PathBuf>,
@@ -94,8 +102,11 @@ struct Cli {
 
 struct ActiveTurn {
     cancel: CancellationToken,
-    handle: JoinHandle<Result<()>>,
+    agent: Agent,
+    queued: VecDeque<String>,
 }
+
+type TurnFuture = Pin<Box<dyn Future<Output = (String, Result<()>)> + Send>>;
 
 fn main() -> Result<()> {
     // sudo invokes this executable as its askpass helper for interactive PAM
@@ -208,7 +219,8 @@ async fn async_main() -> Result<()> {
     let provider = build_provider(&provider_selection, &workspace, policy.mode)?;
     let mut runtime_config = config;
     apply_selection_to_config(&provider_selection, &mut runtime_config);
-    let whatsapp_launch = gui::WhatsAppLaunchConfig::from_config(&runtime_config, &app_home);
+    let whatsapp_launch =
+        avalonia_bridge::WhatsAppLaunchConfig::from_config(&runtime_config, &app_home);
     let config_state = Arc::new(RwLock::new(runtime_config));
     let models = fetch_model_ids(&config_state, &model).await;
     if provider_selection.provider_id == "openai-account"
@@ -293,10 +305,10 @@ async fn async_main() -> Result<()> {
         privilege_tx,
         privilege_broker,
     ));
-    // The native event loop must stay on the process main thread. Tokio's
-    // worker threads continue to drive the agent core while eframe blocks
-    // here, and the GUI polls the same Op/Event channels the TUI used.
-    let ui_result = gui::run(op_tx.clone(), event_rx, whatsapp_launch);
+    // Avalonia owns the native event loop in a private child process. The
+    // bridge forwards the same serialisable Op/Event protocol used by the
+    // core, keeping all agent state and credentials in this Rust process.
+    let ui_result = avalonia_bridge::run(op_tx.clone(), event_rx, whatsapp_launch).await;
     let _ = op_tx.send(Op::Shutdown).await;
     let core_result = core.await.context("agent core task panicked")?;
 
@@ -316,6 +328,9 @@ enum IdleOutcome {
 struct Core {
     agent: Agent,
     mcp_runtime: mcp_client::McpRuntime,
+    /// Old MCP transports stay alive while a turn that captured their registry
+    /// is still running in another conversation/workspace.
+    retired_mcp_runtimes: Vec<mcp_client::McpRuntime>,
     policy: SandboxPolicy,
     provider_selection: ProviderSelection,
     provider_settings: ProviderSettingsStore,
@@ -354,6 +369,7 @@ async fn core_loop(
     let mut core = Core {
         agent,
         mcp_runtime,
+        retired_mcp_runtimes: Vec::new(),
         policy,
         provider_selection,
         provider_settings,
@@ -368,99 +384,125 @@ async fn core_loop(
         dream,
         models,
     };
-    let mut active: Option<ActiveTurn> = None;
-    let mut queued: VecDeque<String> = VecDeque::new();
-    // State-changing ops that arrived mid-turn. Applied in arrival order the
-    // moment the turn ends — queued, never dropped.
+    let mut active: HashMap<String, ActiveTurn> = HashMap::new();
+    let mut turns: FuturesUnordered<TurnFuture> = FuturesUnordered::new();
+    // Global state-changing ops still wait until every turn is idle. Session
+    // navigation and submissions are handled immediately, so users can open a
+    // second conversation while the first one keeps working.
     let mut deferred: VecDeque<Op> = VecDeque::new();
 
     loop {
-        if let Some(mut turn) = active.take() {
-            tokio::select! {
-                result = &mut turn.handle => {
-                    report_turn_result(&events, result).await;
-                    spawn_agent_memory_refresh(&core);
-                    // The first user turn assigns the automatic conversation
-                    // title; refresh the sidebar as soon as that turn lands.
-                    send_session_list(&core, &events).await;
-                    let mut shutdown = false;
+        tokio::select! {
+            completed = turns.next(), if !turns.is_empty() => {
+                let Some((session_id, result)) = completed else { continue };
+                let Some(mut finished) = active.remove(&session_id) else { continue };
+                report_turn_result(&events, &session_id, result).await;
+                spawn_agent_memory_refresh(&finished.agent, &core);
+                // The first user turn assigns the automatic conversation title.
+                send_session_list(&core, &events).await;
+
+                if let Some(text) = finished.queued.pop_front() {
+                    let agent = finished.agent.clone();
+                    let (cancel, future) = start_turn(&agent, text);
+                    finished.cancel = cancel;
+                    active.insert(session_id, finished);
+                    turns.push(future);
+                }
+
+                if active.is_empty() {
+                    core.retired_mcp_runtimes.clear();
                     while let Some(op) = deferred.pop_front() {
                         match handle_idle_op(&mut core, op, &events).await? {
                             IdleOutcome::Continue => {}
-                            IdleOutcome::StartTurn(text) => queued.push_back(text),
-                            IdleOutcome::Shutdown => { shutdown = true; break; }
+                            IdleOutcome::StartTurn(text) => {
+                                launch_turn(&core.agent, text, &mut active, &mut turns);
+                                break;
+                            }
+                            IdleOutcome::Shutdown => {
+                                core.dream.shutdown();
+                                return Ok(());
+                            }
                         }
-                    }
-                    if shutdown {
-                        break;
-                    }
-                    if let Some(text) = queued.pop_front() {
-                        active = Some(start_turn(&core.agent, text));
                     }
                 }
-                op = ops.recv() => {
-                    let Some(op) = op else {
-                        turn.cancel.cancel();
-                        let _ = turn.handle.await;
-                        break;
-                    };
-                    match op {
-                        Op::Submit { text } => {
-                            queued.push_back(text);
-                            notice(&events, "message queued").await;
+            }
+            op = ops.recv() => {
+                let Some(op) = op else {
+                    cancel_all_turns(&active);
+                    break;
+                };
+
+                match op {
+                    Op::Submit { text } => {
+                        submit_or_queue(&core.agent, text, &mut active, &mut turns, &events).await;
+                    }
+                    Op::SubmitAttachment { text, path } => {
+                        let session_id = core.agent.session_id.clone();
+                        let prepared = tokio::task::spawn_blocking(move || prepare_attachment(&path, &text))
+                            .await
+                            .context("attachment preparation task failed")?;
+                        match prepared {
+                            Ok(text) => submit_or_queue(&core.agent, text, &mut active, &mut turns, &events).await,
+                            Err(error) => session_recoverable_error(&events, &session_id, error).await,
                         }
-                        Op::Interrupt => {
+                    }
+                    Op::Interrupt => {
+                        if let Some(turn) = active.get(&core.agent.session_id) {
                             turn.cancel.cancel();
+                        } else {
+                            session_notice(&events, &core.agent.session_id, "nothing is running").await;
                         }
-                        Op::Approve { call_id, decision } => {
-                            let _ = core.approvals.send((call_id, decision)).await;
-                        }
-                        Op::ProvidePrivilegeCredential {
+                    }
+                    Op::Approve { call_id, decision } => {
+                        let _ = core.approvals.send((call_id, decision)).await;
+                    }
+                    Op::ProvidePrivilegeCredential { request_id, credential, remember } => {
+                        let _ = core.privilege_replies.send(PrivilegeCredential {
                             request_id,
                             credential,
                             remember,
-                        } => {
-                            let _ = core
-                                .privilege_replies
-                                .send(PrivilegeCredential {
-                                    request_id,
-                                    credential,
-                                    remember,
-                                })
-                                .await;
+                        }).await;
+                    }
+                    Op::Shutdown => {
+                        cancel_all_turns(&active);
+                        break;
+                    }
+                    Op::DeleteSession { ref id } if active.contains_key(id) => {
+                        session_notice(&events, id, "stop this conversation before deleting it").await;
+                    }
+                    Op::Compact | Op::Rollback | Op::ShowDiff
+                        if active.contains_key(&core.agent.session_id) =>
+                    {
+                        session_notice(
+                            &events,
+                            &core.agent.session_id,
+                            "command is available after this conversation finishes",
+                        ).await;
+                    }
+                    other if !active.is_empty() && !can_run_during_turns(&other) => {
+                        deferred.push_back(other);
+                        notice(
+                            &events,
+                            "setting queued — it will be applied when all conversations are idle",
+                        ).await;
+                    }
+                    other => {
+                        match handle_idle_op(&mut core, other, &events).await? {
+                            IdleOutcome::Continue => {}
+                            IdleOutcome::StartTurn(text) => {
+                                submit_or_queue(&core.agent, text, &mut active, &mut turns, &events).await;
+                            }
+                            IdleOutcome::Shutdown => {
+                                cancel_all_turns(&active);
+                                break;
+                            }
                         }
-                        Op::Shutdown => {
-                            turn.cancel.cancel();
-                            let _ = turn.handle.await;
-                            break;
-                        }
-                        // Read-only/history commands make no sense mid-turn.
-                        Op::Compact | Op::Rollback | Op::ShowDiff => {
-                            notice(&events, "command is available after the current turn").await;
-                        }
-                        // Everything that changes state is deferred, not lost.
-                        other => {
-                            deferred.push_back(other);
-                            notice(
-                                &events,
-                                "queued — it will be applied as soon as the current turn ends",
-                            )
-                            .await;
+                        if active.is_empty() {
+                            core.retired_mcp_runtimes.clear();
                         }
                     }
-                    active = Some(turn);
                 }
             }
-            continue;
-        }
-
-        let Some(op) = ops.recv().await else {
-            break;
-        };
-        match handle_idle_op(&mut core, op, &events).await? {
-            IdleOutcome::Continue => {}
-            IdleOutcome::StartTurn(text) => active = Some(start_turn(&core.agent, text)),
-            IdleOutcome::Shutdown => break,
         }
     }
 
@@ -475,6 +517,15 @@ async fn handle_idle_op(
 ) -> Result<IdleOutcome> {
     match op {
         Op::Submit { text } => return Ok(IdleOutcome::StartTurn(text)),
+        Op::SubmitAttachment { text, path } => {
+            let prepared = tokio::task::spawn_blocking(move || prepare_attachment(&path, &text))
+                .await
+                .context("attachment preparation task failed")?;
+            match prepared {
+                Ok(text) => return Ok(IdleOutcome::StartTurn(text)),
+                Err(error) => recoverable_error(events, error).await,
+            }
+        }
         Op::Interrupt => notice(events, "nothing is running").await,
         Op::Approve { call_id, decision } => {
             let _ = core.approvals.send((call_id, decision)).await;
@@ -558,7 +609,6 @@ async fn handle_idle_op(
                 &core.models,
             )
             .await;
-            notice(events, "started a new session").await;
         }
         Op::SetWorkspace { path } => match set_workspace(core, path, events).await {
             Ok(()) => {}
@@ -592,6 +642,41 @@ async fn handle_idle_op(
             {
                 recoverable_error(events, error).await;
             }
+        }
+        Op::LoginProvider { provider_id } => {
+            let login_result = match provider_id.as_str() {
+                "openai-account" => {
+                    let progress_events = events.clone();
+                    crate::codex_app_server::login_with_chatgpt_notifying(
+                        move |verification_url, user_code| {
+                            let _ = progress_events.try_send(Event::ProviderLoginDeviceCode {
+                                provider_id: "openai-account".into(),
+                                verification_url,
+                                user_code,
+                            });
+                        },
+                    )
+                    .await
+                }
+                "anthropic-account" => crate::provider::login_with_claude().await,
+                _ => Err(anyhow::anyhow!(
+                    "account login is not configured for `{provider_id}`"
+                )),
+            };
+            let (success, message) = match login_result {
+                Ok(()) => match set_provider(core, provider_id.clone(), None, None, events).await {
+                    Ok(()) => (true, "Authentication completed.".to_string()),
+                    Err(error) => (false, error.to_string()),
+                },
+                Err(error) => (false, error.to_string()),
+            };
+            let _ = events
+                .send(Event::ProviderLoginFinished {
+                    provider_id,
+                    success,
+                    message,
+                })
+                .await;
         }
         Op::SetWebSearch { enabled } => {
             set_web_search(core, enabled, events).await?;
@@ -639,12 +724,12 @@ async fn handle_idle_op(
             Err(_) => {
                 recoverable_error(
                     events,
-                    anyhow::anyhow!("adresa Hub trebuie să fie un IP valid, de exemplu 0.0.0.0"),
+                    anyhow::anyhow!("the Hub address must be a valid IP, for example 0.0.0.0"),
                 )
                 .await;
             }
             Ok(_) if port == 0 => {
-                recoverable_error(events, anyhow::anyhow!("portul Hub nu poate fi 0")).await;
+                recoverable_error(events, anyhow::anyhow!("the Hub port cannot be 0")).await;
             }
             Ok(_) => {
                 let (bind, port) = {
@@ -863,29 +948,165 @@ fn append_skill_catalog_update(core: &Core) -> Result<()> {
     Ok(())
 }
 
-fn start_turn(agent: &Agent, text: String) -> ActiveTurn {
+fn prepare_attachment(path: &Path, prompt: &str) -> Result<String> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("cannot inspect {}", path.display()))?;
+    if metadata.len() as usize > MAX_ATTACHMENT_BYTES {
+        bail!(
+            "attachment is too large (limit {} MiB)",
+            MAX_ATTACHMENT_BYTES / (1024 * 1024)
+        );
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment");
+    if uploads::file_type_from_name(name) == "image" {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let media_type = mime_guess::from_path(path)
+            .first_raw()
+            .unwrap_or("application/octet-stream");
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let prompt = if prompt.trim().is_empty() {
+            format!("Analyze the attached image “{name}”.")
+        } else {
+            prompt.trim().to_string()
+        };
+        return Ok(serde_json::to_string(&serde_json::json!([
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": format!("data:{media_type};base64,{data}")}}
+        ]))?);
+    }
+
+    let extracted = uploads::extract_text_attachment(path)
+        .with_context(|| format!("cannot read {name}"))?;
+    if extracted.trim().is_empty() {
+        bail!("no readable text was found in {name}");
+    }
+    let prompt = if prompt.trim().is_empty() {
+        format!("Analyze the attached file “{name}”.")
+    } else {
+        prompt.trim().to_string()
+    };
+    Ok(format!(
+        "{prompt}\n\n<attached_file name=\"{name}\">\n{extracted}\n</attached_file>"
+    ))
+}
+
+fn start_turn(agent: &Agent, text: String) -> (CancellationToken, TurnFuture) {
     let agent = agent.clone();
+    let session_id = agent.session_id.clone();
     let cancel = CancellationToken::new();
     let turn_cancel = cancel.clone();
-    let handle = tokio::spawn(async move { agent.run_turn(text, turn_cancel).await });
-    ActiveTurn { cancel, handle }
+    let future: TurnFuture = Box::pin(async move {
+        let result = AssertUnwindSafe(agent.run_turn(text, turn_cancel))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("agent turn task panicked")));
+        (session_id, result)
+    });
+    (cancel, future)
+}
+
+fn launch_turn(
+    agent: &Agent,
+    text: String,
+    active: &mut HashMap<String, ActiveTurn>,
+    turns: &mut FuturesUnordered<TurnFuture>,
+) {
+    let session_id = agent.session_id.clone();
+    let (cancel, future) = start_turn(agent, text);
+    active.insert(
+        session_id,
+        ActiveTurn {
+            cancel,
+            agent: agent.clone(),
+            queued: VecDeque::new(),
+        },
+    );
+    turns.push(future);
+}
+
+async fn submit_or_queue(
+    agent: &Agent,
+    text: String,
+    active: &mut HashMap<String, ActiveTurn>,
+    turns: &mut FuturesUnordered<TurnFuture>,
+    events: &mpsc::Sender<Event>,
+) {
+    if let Some(turn) = active.get_mut(&agent.session_id) {
+        turn.queued.push_back(text);
+        session_notice(events, &agent.session_id, "message queued in this conversation").await;
+    } else {
+        launch_turn(agent, text, active, turns);
+    }
+}
+
+fn cancel_all_turns(active: &HashMap<String, ActiveTurn>) {
+    for turn in active.values() {
+        turn.cancel.cancel();
+    }
+}
+
+/// Navigation is session-local and safe while another Agent clone owns an
+/// active turn. Provider/sandbox/MCP and other global mutations stay deferred.
+fn can_run_during_turns(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::NewSession
+            | Op::SetWorkspace { .. }
+            | Op::ListSessions
+            | Op::ResumeSession { .. }
+            | Op::RenameSession { .. }
+            | Op::DeleteSession { .. }
+    )
+}
+
+async fn session_event(events: &mpsc::Sender<Event>, session_id: &str, payload: Event) {
+    let _ = events
+        .send(Event::SessionEvent {
+            session_id: session_id.to_string(),
+            payload: Box::new(payload),
+        })
+        .await;
+}
+
+async fn session_notice(events: &mpsc::Sender<Event>, session_id: &str, message: &str) {
+    session_event(
+        events,
+        session_id,
+        Event::Notice {
+            message: message.to_string(),
+        },
+    )
+    .await;
+}
+
+async fn session_recoverable_error(
+    events: &mpsc::Sender<Event>,
+    session_id: &str,
+    error: anyhow::Error,
+) {
+    session_event(
+        events,
+        session_id,
+        Event::Error {
+            message: format!("{error:#}"),
+            fatal: false,
+        },
+    )
+    .await;
 }
 
 async fn report_turn_result(
     events: &mpsc::Sender<Event>,
-    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+    session_id: &str,
+    result: Result<()>,
 ) {
     match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => recoverable_error(events, error).await,
-        Err(error) => {
-            let _ = events
-                .send(Event::Error {
-                    message: format!("agent turn task failed: {error}"),
-                    fatal: false,
-                })
-                .await;
-        }
+        Ok(()) => {}
+        Err(error) => session_recoverable_error(events, session_id, error).await,
     }
 }
 
@@ -900,7 +1121,7 @@ async fn set_model(core: &mut Core, model: String, events: &mpsc::Sender<Event>)
     {
         notice(
             events,
-            "modelul nu este disponibil pentru contul OpenAI conectat; reîncarcă providerul și alege un model din listă",
+            "the model is not available for the connected OpenAI account; reload the provider and choose a model from the list",
         )
         .await;
         return Ok(());
@@ -1006,6 +1227,11 @@ async fn build_registry(
     (registry, mcp_runtime)
 }
 
+fn replace_mcp_runtime(core: &mut Core, runtime: mcp_client::McpRuntime) {
+    let previous = std::mem::replace(&mut core.mcp_runtime, runtime);
+    core.retired_mcp_runtimes.push(previous);
+}
+
 async fn report_mcp_runtime(runtime: &mcp_client::McpRuntime, events: &mpsc::Sender<Event>) {
     for message in runtime.notices() {
         notice(events, message).await;
@@ -1023,7 +1249,7 @@ async fn set_sandbox(core: &mut Core, mode: &str, events: &mpsc::Sender<Event>) 
     let policy = policy_for(mode, &core.agent.workspace);
     let (registry, mcp_runtime) = build_registry(core, &core.agent.workspace, policy.clone()).await;
     core.agent.registry = Arc::new(registry);
-    core.mcp_runtime = mcp_runtime;
+    replace_mcp_runtime(core, mcp_runtime);
     core.agent.verify_policy = policy.clone();
     core.agent.approval = approval_for(mode);
     // Account-backed CLIs receive the current sandbox mode as command-line
@@ -1103,7 +1329,7 @@ async fn set_workspace(
     core.agent.workspace = workspace.clone();
     core.agent.verify_policy = policy.clone();
     core.agent.registry = Arc::new(registry);
-    core.mcp_runtime = mcp_runtime;
+    replace_mcp_runtime(core, mcp_runtime);
     core.agent.provider = provider;
     core.agent.switch_session(session.id).await;
     core.policy = policy;
@@ -1169,7 +1395,7 @@ async fn set_mcp_servers(
         build_registry(core, &core.agent.workspace, core.policy.clone()).await;
     core.agent.registry = Arc::new(registry);
     core.agent.mcp_servers = normalized.clone();
-    core.mcp_runtime = runtime;
+    replace_mcp_runtime(core, runtime);
     let _ = events
         .send(Event::McpConfigChanged {
             servers: normalized,
@@ -1250,7 +1476,7 @@ async fn resume_session(core: &mut Core, id: &str, events: &mpsc::Sender<Event>)
         core.agent.workspace = workspace.clone();
         core.agent.verify_policy = policy.clone();
         core.agent.registry = Arc::new(registry);
-        core.mcp_runtime = mcp_runtime;
+        replace_mcp_runtime(core, mcp_runtime);
         core.agent.provider = provider;
         core.policy = policy;
         core.workspace_history.record(&workspace);
@@ -1270,15 +1496,6 @@ async fn resume_session(core: &mut Core, id: &str, events: &mpsc::Sender<Event>)
         &core.config_state,
         &core.workspace_history,
         &core.models,
-    )
-    .await;
-    notice(
-        events,
-        &format!(
-            "resumed session {} in {}",
-            &session.id[..8.min(session.id.len())],
-            workspace.display()
-        ),
     )
     .await;
     Ok(())
@@ -1438,8 +1655,8 @@ async fn show_memory(core: &Core, events: &mpsc::Sender<Event>) {
 
 /// After every finished turn, extract durable facts into the shared SQLite
 /// store — the same `store/memory.db` WebTool and WhatsApp use.
-fn spawn_agent_memory_refresh(core: &Core) {
-    let agent = core.agent.clone();
+fn spawn_agent_memory_refresh(completed_agent: &Agent, core: &Core) {
+    let agent = completed_agent.clone();
     let config_state = core.config_state.clone();
     let engine = core.memory.clone();
     tokio::spawn(async move {

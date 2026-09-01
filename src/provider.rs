@@ -424,7 +424,7 @@ fn text_only_user_content(content: &str) -> Option<String> {
         text.push_str("\n\n");
     }
     text.push_str(
-        "[Imaginea atașată nu poate fi transmisă acestui provider text-only. Răspunde numai pe baza textului sau OCR-ului disponibil și nu inventa detalii vizuale.]",
+        "[The attached image cannot be sent to this text-only provider. Answer only from the available text or OCR and do not invent visual details.]",
     );
     Some(text)
 }
@@ -531,7 +531,7 @@ impl Provider for OpenAiCompatible {
         let mut notices = Vec::new();
         if image_text_fallback {
             notices.push(Delta::Reasoning(
-                "Providerul activ acceptă doar text; imaginea a fost eliminată din cerere. Pentru analiză vizuală completă, selectează un model multimodal."
+                "The active provider accepts text only, so the image was removed from the request. Select a multimodal model for complete visual analysis."
                     .into(),
             ));
         }

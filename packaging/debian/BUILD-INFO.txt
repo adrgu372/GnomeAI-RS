@@ -2,11 +2,13 @@ GnomeAI-RS 2.3.0
 Source: https://github.com/adrgu372/GnomeAI-RS
 License: GPL-3.0
 Primary executable: /usr/lib/gnomeai-rs/gnomef-rs
+Persistent WhatsApp service: /usr/lib/systemd/user/gnomeai-whatsapp.service
 Private WhatsApp helper: /usr/lib/gnomeai-rs/gnomef-whatsapp
 Launchers: /usr/bin/gnomeai-rs, /usr/bin/gnomef-rs, /usr/bin/gnomef-agent
-Interface: native eframe/egui desktop GUI
+Interface: native Avalonia UI 11 desktop frontend (bundled .NET SDK 8.0.424)
 Web interface: removed
 State: ${XDG_STATE_HOME:-$HOME/.local/state}/gnomeai-rs
 Skills: ${XDG_DATA_HOME:-$HOME/.local/share}/gnomeai-rs/skills
-Optional services: official Codex sidecar, Claude Code, rootless Firecrawl,
-and the WhatsApp bridge controlled from the native GUI.
+Optional services: official Codex sidecar, Claude Code and rootless Firecrawl.
+The WhatsApp backend is an auto-enabled per-user service controlled from the
+native GUI and remains active after its desktop window is closed.

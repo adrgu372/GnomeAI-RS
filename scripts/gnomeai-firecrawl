@@ -35,7 +35,7 @@ healthcheck() {
 
 require_runtime() {
     if ! command -v podman >/dev/null 2>&1; then
-        echo "Firecrawl local necesită Podman rootless. Instalează pachetul recomandat «podman»." >&2
+        echo "Local Firecrawl requires rootless Podman. Install the recommended 'podman' package." >&2
         exit 69
     fi
 }
@@ -150,14 +150,14 @@ ensure_running() {
     attempt=0
     while [ "$attempt" -lt 120 ]; do
         if healthcheck; then
-            echo "Firecrawl este disponibil la http://127.0.0.1:3002"
+            echo "Firecrawl is available at http://127.0.0.1:3002"
             exit 0
         fi
         attempt=$((attempt + 1))
         sleep 1
     done
 
-    echo "Firecrawl nu a devenit disponibil. Verifică: podman logs $API_CONTAINER" >&2
+    echo "Firecrawl did not become available. Check: podman logs $API_CONTAINER" >&2
     exit 70
 }
 
@@ -191,4 +191,3 @@ case "$action" in
         exit 64
         ;;
 esac
-

@@ -7,4 +7,11 @@ if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
 fi
 
+# Enable the per-user background service for every desktop account. Existing
+# sessions start it the next time GnomeAI-RS is opened; new sessions start it
+# automatically with the user's systemd manager.
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --global enable gnomeai-whatsapp.service >/dev/null 2>&1 || true
+fi
+
 exit 0

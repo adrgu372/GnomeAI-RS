@@ -13,6 +13,29 @@ codex_version="0.145.0"
 codex_target="x86_64-unknown-linux-musl"
 codex_tar_sha256="11239480f8e3efd1430f23bbe91c1a397856b8bbe6185ccbaee2382d25e03df2"
 codex_bin_sha256="a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14"
+dotnet_sdk_version="8.0.424"
+dotnet_sdk_filename="dotnet-sdk-${dotnet_sdk_version}-linux-x64.tar.gz"
+dotnet_sdk_url="https://builds.dotnet.microsoft.com/dotnet/Sdk/${dotnet_sdk_version}/${dotnet_sdk_filename}"
+dotnet_sdk_sha512="6503fd9f464d5e3a4f43a881d2b74afc6a2c46ceda74d027f1565b7239f4b3ec884857c03c0dcd49eb52f384d5ae1fa5aaf135f0a6aabc5518103aceed643c74"
+
+download_file() {
+    local url="$1"
+    local destination="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl --fail --location --retry 3 --output "$destination" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --tries=3 --output-document="$destination" "$url"
+    else
+        echo "curl or wget is required to download the Microsoft .NET SDK." >&2
+        return 1
+    fi
+}
+
+verify_dotnet_archive() {
+    local archive="$1"
+    [[ -f "$archive" ]] || return 1
+    printf '%s  %s\n' "$dotnet_sdk_sha512" "$archive" | sha512sum --check --status
+}
 
 if [[ "${GNOMEAI_SKIP_BUILD:-0}" != "1" ]]; then
     cargo build --release --bins --locked
@@ -32,11 +55,93 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [[ "$architecture" != "amd64" ]]; then
+    echo "The pinned Microsoft .NET SDK archive is linux-x64 and requires Architecture: amd64." >&2
+    exit 1
+fi
+
+# Always stage the pinned Microsoft SDK. It is used to publish Avalonia and is
+# copied into the .deb, so installation never depends on a Microsoft APT feed.
+dotnet_sdk_root="${GNOMEAI_DOTNET_SDK_DIR:-}"
+if [[ -z "$dotnet_sdk_root" ]]; then
+    dotnet_sdk_archive="${GNOMEAI_DOTNET_SDK_ARCHIVE:-}"
+    if [[ -z "$dotnet_sdk_archive" ]]; then
+        if [[ -n "${GNOMEAI_DOWNLOAD_CACHE:-}" ]]; then
+            download_cache="$GNOMEAI_DOWNLOAD_CACHE"
+        elif [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+            download_cache="$XDG_CACHE_HOME/gnomeai-rs/downloads"
+        elif [[ -n "${HOME:-}" ]]; then
+            download_cache="$HOME/.cache/gnomeai-rs/downloads"
+        else
+            download_cache="$project_root/.cache/gnomeai-rs/downloads"
+        fi
+        mkdir -p "$download_cache"
+        dotnet_sdk_archive="$download_cache/$dotnet_sdk_filename"
+        if ! verify_dotnet_archive "$dotnet_sdk_archive"; then
+            downloaded_sdk="$build_root/$dotnet_sdk_filename"
+            echo "Downloading Microsoft .NET SDK $dotnet_sdk_version (linux-x64)..." >&2
+            download_file "${GNOMEAI_DOTNET_SDK_URL:-$dotnet_sdk_url}" "$downloaded_sdk"
+            if ! verify_dotnet_archive "$downloaded_sdk"; then
+                echo "Microsoft .NET SDK SHA-512 verification failed." >&2
+                exit 1
+            fi
+            install -m 0644 "$downloaded_sdk" "$dotnet_sdk_archive"
+        fi
+    elif ! verify_dotnet_archive "$dotnet_sdk_archive"; then
+        echo "GNOMEAI_DOTNET_SDK_ARCHIVE failed the pinned SHA-512 verification." >&2
+        exit 1
+    fi
+
+    dotnet_sdk_root="$build_root/dotnet-sdk"
+    mkdir -p "$dotnet_sdk_root"
+    tar --no-same-owner -xzf "$dotnet_sdk_archive" -C "$dotnet_sdk_root"
+fi
+
+dotnet_sdk_root="$(CDPATH= cd -- "$dotnet_sdk_root" && pwd)"
+dotnet_cmd="$dotnet_sdk_root/dotnet"
+dotnet_cli_home="$build_root/dotnet-home"
+mkdir -p "$dotnet_cli_home"
+if [[ ! -x "$dotnet_cmd" \
+      || ! -f "$dotnet_sdk_root/LICENSE.txt" \
+      || ! -f "$dotnet_sdk_root/ThirdPartyNotices.txt" ]]; then
+    echo "Invalid Microsoft .NET SDK directory: $dotnet_sdk_root" >&2
+    exit 1
+fi
+if ! DOTNET_ROOT="$dotnet_sdk_root" DOTNET_MULTILEVEL_LOOKUP=0 \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
+    DOTNET_NOLOGO=1 DOTNET_CLI_HOME="$dotnet_cli_home" \
+    "$dotnet_cmd" --list-sdks | grep -Fq "$dotnet_sdk_version ["; then
+    echo "The staged SDK does not contain Microsoft .NET SDK $dotnet_sdk_version." >&2
+    exit 1
+fi
+
+avalonia_publish_dir="${GNOMEAI_AVALONIA_PUBLISH_DIR:-}"
+if [[ -z "$avalonia_publish_dir" ]]; then
+    avalonia_publish_dir="$build_root/avalonia-publish"
+    DOTNET_ROOT="$dotnet_sdk_root" \
+    DOTNET_MULTILEVEL_LOOKUP=0 \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1 \
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
+    DOTNET_CLI_HOME="$dotnet_cli_home" \
+    "$dotnet_cmd" publish ui/GnomeAI.UI/GnomeAI.UI.csproj \
+        -c Release -r linux-x64 --self-contained false \
+        -p:SelfContained=false -p:UseAppHost=true \
+        -p:PublishTrimmed=false -p:DebugType=None \
+        -o "$avalonia_publish_dir"
+fi
+if [[ ! -x "$avalonia_publish_dir/GnomeAI.UI" ]]; then
+    echo "Invalid Avalonia publish directory: missing GnomeAI.UI executable in $avalonia_publish_dir" >&2
+    exit 1
+fi
+
 package_root="$build_root/package"
 mkdir -p \
     "$package_root/DEBIAN" \
     "$package_root/usr/bin" \
     "$package_root/usr/lib/gnomeai-rs" \
+    "$package_root/usr/lib/gnomeai-rs/dotnet" \
+    "$package_root/usr/lib/systemd/user" \
     "$package_root/usr/share/applications" \
     "$package_root/usr/share/doc/gnomeai-rs/firecrawl" \
     "$package_root/usr/share/icons/hicolor/scalable/apps" \
@@ -54,6 +159,14 @@ install -m 0755 "$binary_dir/gnomeai-desktop-a11y" \
     "$package_root/usr/lib/gnomeai-rs/gnomeai-desktop-a11y"
 install -m 0755 "$binary_dir/gnomeai-node" "$package_root/usr/bin/gnomeai-node"
 install -m 0755 "$binary_dir/gnomeai-hubctl" "$package_root/usr/bin/gnomeai-hubctl"
+cp -a "$dotnet_sdk_root/." "$package_root/usr/lib/gnomeai-rs/dotnet/"
+find "$package_root/usr/lib/gnomeai-rs/dotnet" -type d -exec chmod 0755 {} +
+chmod 0755 "$package_root/usr/lib/gnomeai-rs/dotnet/dotnet"
+install -d "$package_root/usr/lib/gnomeai-rs/ui"
+cp -a "$avalonia_publish_dir/." "$package_root/usr/lib/gnomeai-rs/ui/"
+find "$package_root/usr/lib/gnomeai-rs/ui" -type d -exec chmod 0755 {} +
+find "$package_root/usr/lib/gnomeai-rs/ui" -type f -exec chmod 0644 {} +
+chmod 0755 "$package_root/usr/lib/gnomeai-rs/ui/GnomeAI.UI"
 if command -v strip >/dev/null 2>&1; then
     strip --strip-unneeded "$package_root/usr/lib/gnomeai-rs/gnomef-rs"
     strip --strip-unneeded "$package_root/usr/lib/gnomeai-rs/gnomef-whatsapp"
@@ -68,6 +181,8 @@ ln -s gnomeai-rs "$package_root/usr/bin/gnomef-rs"
 ln -s gnomeai-rs "$package_root/usr/bin/gnomef-agent"
 install -m 0755 scripts/gnomeai-firecrawl "$package_root/usr/bin/gnomeai-firecrawl"
 install -m 0755 scripts/gnomeai-desktop "$package_root/usr/bin/gnomeai-desktop"
+install -m 0644 packaging/debian/gnomeai-whatsapp.service \
+    "$package_root/usr/lib/systemd/user/gnomeai-whatsapp.service"
 
 install -m 0644 config.example.json "$package_root/usr/share/gnomeai-rs/config.example.json"
 install -m 0644 whatsapp/bridge.mjs "$package_root/usr/share/gnomeai-rs/whatsapp/bridge.mjs"
@@ -152,6 +267,8 @@ install -m 0644 packaging/debian/README-BINARY.txt \
     "$package_root/usr/share/doc/gnomeai-rs/README-BINARY.txt"
 install -m 0644 packaging/debian/BUILD-INFO.txt \
     "$package_root/usr/share/doc/gnomeai-rs/BUILD-INFO.txt"
+install -m 0644 third_party/dotnet/README.md \
+    "$package_root/usr/share/doc/gnomeai-rs/DOTNET-SDK.txt"
 install -m 0644 packaging/debian/copyright \
     "$package_root/usr/share/doc/gnomeai-rs/copyright"
 
@@ -221,6 +338,7 @@ done
 
 cp "$control_file" "$package_root/DEBIAN/control"
 install -m 0755 packaging/debian/postinst "$package_root/DEBIAN/postinst"
+install -m 0755 packaging/debian/postrm "$package_root/DEBIAN/postrm"
 installed_size="$(du -sk "$package_root/usr" | awk '{print $1}')"
 sed -i "s/^Installed-Size:.*/Installed-Size: $installed_size/" \
     "$package_root/DEBIAN/control"

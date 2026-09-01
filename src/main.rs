@@ -12,6 +12,7 @@ mod generation;
 mod llama;
 mod memory;
 mod memory_engine;
+mod native_service;
 mod node_protocol;
 mod nodes;
 mod openrouter;
@@ -238,13 +239,17 @@ async fn web_main() -> anyhow::Result<()> {
         .ok()
         .filter(|token| token.len() >= 16);
     let has_configured_api_token = configured_api_token.is_some();
-    let api_token = configured_api_token.unwrap_or_else(|| {
+    let api_token = if let Some(token) = configured_api_token {
+        token
+    } else if std::env::var_os("GNOMEF_NATIVE_HELPER").is_some() {
+        native_service::load_or_create_token(paths.app_dir.as_path())?
+    } else {
         format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         )
-    });
+    };
     config.web_api_token = api_token.clone();
     let provider_settings = ProviderSettingsStore::new(paths.store_dir.join("providers.json"));
     if let Some(selection) = provider_settings.load()? {
@@ -419,13 +424,28 @@ async fn web_main() -> anyhow::Result<()> {
     trace_startup("listener bound");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            wait_for_shutdown_signal().await;
             shutdown_state.dream.shutdown();
             let cfg = shutdown_state.config.read().await.clone();
             shutdown_state.whatsapp.stop(&cfg).await;
         })
         .await?;
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() {
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    match terminate {
+        Ok(mut terminate) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
 }
 
 async fn protect_local_api(
@@ -1998,16 +2018,16 @@ async fn api_whatsapp_inbound(
 
             if content.is_empty() {
                 content = match read.file_type.as_str() {
-                    "image" => format!("Analizeaza imaginea atasata: {final_name}"),
-                    "audio" => format!("Asculta mesajul vocal atasat: {final_name}"),
-                    "video" => format!("Analizeaza videoclipul atasat: {final_name}"),
-                    _ => format!("Analizeaza fisierul atasat: {final_name}"),
+                    "image" => format!("Analyze the attached image: {final_name}"),
+                    "audio" => format!("Listen to the attached voice message: {final_name}"),
+                    "video" => format!("Analyze the attached video: {final_name}"),
+                    _ => format!("Analyze the attached file: {final_name}"),
                 };
             }
         }
     }
     if content.is_empty() {
-        content = "Am primit un atasament WhatsApp pe care nu il pot procesa inca.".into();
+        content = "A WhatsApp attachment was received but cannot be processed yet.".into();
     }
 
     if content.eq_ignore_ascii_case("/skills") {
@@ -2041,21 +2061,19 @@ async fn api_whatsapp_inbound(
                         skill_extra,
                     )?;
                     format!(
-                        "Skillul `{}` este activ în acest chat. Permisiunile nu au fost \
-                             modificate.",
+                        "Skill `{}` is active in this chat. Permissions were not changed.",
                         skill.summary.name
                     )
                 }
-                Err(error) => format!("Nu pot activa skillul: {error}"),
+                Err(error) => format!("Cannot activate the skill: {error}"),
             },
             "inspect" | "show" if !value.is_empty() => skills::inspect(&workspace, value)
-                .unwrap_or_else(|error| format!("Nu pot inspecta skillul: {error}")),
+                .unwrap_or_else(|error| format!("Cannot inspect the skill: {error}")),
             "install" | "update" | "remove" | "uninstall" => {
-                "Din motive de securitate, instalarea și ștergerea skillurilor se confirmă \
-                 local în aplicația GnomeAI-RS."
+                "For security, installing and removing skills must be confirmed locally in the GnomeAI-RS application."
                     .into()
             }
-            _ => "Folosește `/skills`, `/skill use NUME` sau `/skill inspect NUME`.".into(),
+            _ => "Use `/skills`, `/skill use NAME`, or `/skill inspect NAME`.".into(),
         };
         send_whatsapp_message(&cfg, reply_jid, &reply).await;
         return Ok(Json(
@@ -2161,12 +2179,12 @@ async fn generate_account_whatsapp_response(
     let workspace = state.workspace.read().await.current.clone();
     let mut selection = match ProviderSelection::from_choice(&cfg.provider_id, None, None) {
         Ok(selection) => selection,
-        Err(error) => return format!("[Eroare provider cont: {error}]"),
+        Err(error) => return format!("[Account provider error: {error}]"),
     };
     selection.model = model.to_string();
     let provider = match build_provider(&selection, &workspace, whatsapp_account_sandbox(cfg)) {
         Ok(provider) => provider,
-        Err(error) => return format!("[Eroare provider cont: {error}]"),
+        Err(error) => return format!("[Account provider error: {error}]"),
     };
 
     let mut messages = Vec::new();
@@ -2211,7 +2229,7 @@ async fn generate_account_whatsapp_response(
                     .await;
                 continue;
             }
-            Err(error) => return format!("[Eroare provider cont: {error}]"),
+            Err(error) => return format!("[Account provider error: {error}]"),
         };
         let mut reply = String::new();
         while let Some(delta) = stream.next().await {
@@ -2235,7 +2253,7 @@ async fn generate_account_whatsapp_response(
                     .await;
                     continue 'recall;
                 }
-                Err(error) => return format!("[Eroare provider cont: {error}]"),
+                Err(error) => return format!("[Account provider error: {error}]"),
             }
         }
         if reply.trim().is_empty() && !delegated && recall < 2 {
@@ -2245,7 +2263,7 @@ async fn generate_account_whatsapp_response(
             continue;
         }
         return if reply.trim().is_empty() {
-            "[Modelul nu a răspuns după două reapelări automate.]".to_string()
+            "[The model did not respond after two automatic retries.]".to_string()
         } else {
             reply
         };
@@ -2544,7 +2562,7 @@ async fn handle_whatsapp_command(state: &AppState, chat_id: &str, command: &str)
         "/workspace" => {
             let workspace = current_workspace(state).await;
             Some(format!(
-                "📁 Folderul comun GnomeAI-RS + WhatsApp este:\n{}\n\nSchimbă-l din selectorul de workspace al aplicației.",
+                "📁 The shared GnomeAI-RS + WhatsApp folder is:\n{}\n\nChange it from the application's workspace selector.",
                 workspace.display()
             ))
         }
@@ -2552,7 +2570,7 @@ async fn handle_whatsapp_command(state: &AppState, chat_id: &str, command: &str)
         "/sandbox" => {
             let cfg = state.config.read().await;
             Some(format!(
-                "🛡️ Mod comun: {}\nCererile acceptate din WhatsApp autorizează direct scrierile și comenzile standard. Read-only rămâne blocant; sudo folosește numai un ticket activ sau keyring-ul local.",
+                "🛡️ Shared mode: {}\nRequests accepted from WhatsApp directly authorize standard writes and commands. Read-only remains restrictive; sudo uses only an active ticket or the local keyring.",
                 cfg.web_sandbox_mode
             ))
         }
@@ -2565,10 +2583,10 @@ async fn handle_whatsapp_command(state: &AppState, chat_id: &str, command: &str)
                     .cloned()
                     .unwrap_or_default();
                 if agents.is_empty() {
-                    return Some("Nu există încă subagenți.".into());
+                    return Some("There are no subagents yet.".into());
                 }
                 let mut reply = format!(
-                    "🤖 Subagenți comuni — {} activi / {} total\n\n",
+                    "🤖 Shared subagents — {} active / {} total\n\n",
                     value.get("running").and_then(Value::as_u64).unwrap_or(0),
                     agents.len()
                 );
@@ -2607,26 +2625,26 @@ async fn handle_whatsapp_command(state: &AppState, chat_id: &str, command: &str)
                             .unwrap_or("Subagent")
                     ));
                 }
-                reply.push_str("\nDetalii: /agent ID · Oprire: /stopagent ID");
+                reply.push_str("\nDetails: /agent ID · Stop: /stopagent ID");
                 Some(reply)
             }
-            Err(error) => Some(format!("Nu pot citi subagenții: {error}")),
+            Err(error) => Some(format!("Cannot read subagents: {error}")),
         },
 
         "/agent" => {
             let Some(agent_id) = parts.get(1) else {
-                return Some("Folosește /agent ID".into());
+                return Some("Use /agent ID".into());
             };
             match workflow_tasks::agent_get(&state.paths, agent_id) {
                 Ok(value) => {
                     let Some(agent) = value.get("agent").filter(|value| !value.is_null()) else {
-                        return Some(format!("Subagentul {agent_id} nu există."));
+                        return Some(format!("Subagent {agent_id} does not exist."));
                     };
                     let output = agent.get("output").and_then(Value::as_str).unwrap_or("");
                     let mut preview = output.chars().rev().take(3_500).collect::<String>();
                     preview = preview.chars().rev().collect();
                     Some(format!(
-                        "🤖 {}\nStare: {}\nTip: {}\nProvider/model: {}/{}\nTask: {}\n\n{}",
+                        "🤖 {}\nStatus: {}\nType: {}\nProvider/model: {}/{}\nTask: {}\n\n{}",
                         agent.get("id").and_then(Value::as_str).unwrap_or(agent_id),
                         agent.get("status").and_then(Value::as_str).unwrap_or("?"),
                         agent
@@ -2647,19 +2665,19 @@ async fn handle_whatsapp_command(state: &AppState, chat_id: &str, command: &str)
                             .and_then(Value::as_str)
                             .unwrap_or("Subagent"),
                         if preview.trim().is_empty() {
-                            "Fără output încă."
+                            "No output yet."
                         } else {
                             preview.trim()
                         }
                     ))
                 }
-                Err(error) => Some(format!("Nu pot citi subagentul: {error}")),
+                Err(error) => Some(format!("Cannot read the subagent: {error}")),
             }
         }
 
         "/stopagent" => {
             let Some(agent_id) = parts.get(1) else {
-                return Some("Folosește /stopagent ID".into());
+                return Some("Use /stopagent ID".into());
             };
             let status = workflow_tasks::agent_get(&state.paths, agent_id)
                 .ok()
@@ -2671,13 +2689,13 @@ async fn handle_whatsapp_command(state: &AppState, chat_id: &str, command: &str)
                         .map(str::to_string)
                 });
             if status.is_none() {
-                return Some(format!("Subagentul {agent_id} nu există."));
+                return Some(format!("Subagent {agent_id} does not exist."));
             }
             if status.as_deref().is_some_and(|status| {
                 matches!(status, "completed" | "failed" | "killed" | "cancelled")
             }) {
                 return Some(format!(
-                    "Subagentul {agent_id} este deja {}.",
+                    "Subagent {agent_id} is already {}.",
                     status.unwrap()
                 ));
             }
@@ -2685,11 +2703,11 @@ async fn handle_whatsapp_command(state: &AppState, chat_id: &str, command: &str)
                 Ok(_) => {
                     let stopped = state.runtime.stop(agent_id).await;
                     Some(format!(
-                        "{} Subagentul {agent_id} a fost oprit.",
+                        "{} Subagent {agent_id} was stopped.",
                         if stopped { "✓" } else { "⚠" }
                     ))
                 }
-                Err(error) => Some(format!("Nu pot opri subagentul: {error}")),
+                Err(error) => Some(format!("Cannot stop the subagent: {error}")),
             }
         }
 

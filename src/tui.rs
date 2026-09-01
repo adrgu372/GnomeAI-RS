@@ -552,6 +552,8 @@ async fn run_account_login(flow: AccountLogin) -> Result<()> {
 
 fn apply_event(app: &mut App, ev: Event) {
     match ev {
+        Event::SessionEvent { payload, .. } => apply_event(app, *payload),
+
         Event::Ready {
             provider,
             model,
@@ -3073,12 +3075,12 @@ fn draw_privilege_dialog(f: &mut Frame, dialog: &PrivilegeDialog, screen: Rect) 
         height,
     };
     let remembered = if !dialog.keyring_available {
-        "Keyring indisponibil: parola rămâne numai în memorie pentru această autentificare."
+        "The keyring is unavailable; the credential remains in memory only for this authentication."
             .to_string()
     } else if dialog.remember {
-        "[x] Salvează în keyring-ul desktop (Tab schimbă)".to_string()
+        "[x] Save in the desktop keyring (Tab toggles)".to_string()
     } else {
-        "[ ] Salvează în keyring-ul desktop (Tab schimbă)".to_string()
+        "[ ] Save in the desktop keyring (Tab toggles)".to_string()
     };
     let message = dialog
         .message
@@ -3088,16 +3090,16 @@ fn draw_privilege_dialog(f: &mut Frame, dialog: &PrivilegeDialog, screen: Rect) 
     let prompt = dialog
         .prompt
         .as_deref()
-        .map(|text| format!("\nCerere sistem: {text}\n"))
+        .map(|text| format!("\nSystem prompt: {text}\n"))
         .unwrap_or_default();
     let masked = "•".repeat(dialog.input.chars().count());
     let step = if dialog.dynamic {
-        format!("pasul {}", dialog.attempt)
+        format!("step {}", dialog.attempt)
     } else {
-        format!("încercarea {}/3", dialog.attempt)
+        format!("attempt {}/3", dialog.attempt)
     };
     let body = format!(
-        "Comandă root:\n{}\n{}{}\nRăspuns de autentificare ({}):\n{}\n\n{}\n\nEnter confirmă · Esc anulează\nSecretul nu este trimis modelului.",
+        "Root command:\n{}\n{}{}\nAuthentication response ({}):\n{}\n\n{}\n\nEnter confirms · Esc cancels\nThe secret is not sent to the model.",
         dialog.command, message, prompt, step, masked, remembered
     );
 
@@ -3106,7 +3108,7 @@ fn draw_privilege_dialog(f: &mut Frame, dialog: &PrivilegeDialog, screen: Rect) 
         Paragraph::new(body).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" autentificare sudo ")
+                .title(" sudo authentication ")
                 .border_style(Style::new().fg(Color::Yellow)),
         ),
         area,

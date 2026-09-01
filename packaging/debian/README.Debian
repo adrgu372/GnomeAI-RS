@@ -10,6 +10,11 @@ The desktop menu entry and these compatible commands open the same native GUI:
   gnomef-rs /path/to/workspace
   gnomef-agent /path/to/workspace
 
+Microsoft .NET SDK 8.0.424, including the .NET 8 runtime used by Avalonia, is
+bundled privately under `/usr/lib/gnomeai-rs/dotnet`. No Microsoft APT source
+or separate `dotnet-sdk-8.0` package is required. The bundled SDK is added to
+`DOTNET_ROOT` and `PATH` only for GnomeAI-RS and its child processes.
+
 Runtime state and API keys use owner-only permissions under:
 
   ${XDG_STATE_HOME:-$HOME/.local/state}/gnomeai-rs
@@ -22,7 +27,14 @@ dialog.
 
 WhatsApp is configured from the native sidebar. Pairing state and the QR code
 are shown inside the GUI; the packaged private loopback helper has no browser
-page or public launcher.
+page or public launcher. Its per-user service starts automatically at login
+and remains active when the Avalonia window is closed:
+
+  systemctl --user status gnomeai-whatsapp.service
+  systemctl --user restart gnomeai-whatsapp.service
+
+The service and UI share a protected token stored under the user's GnomeAI
+state directory. It is never installed as a system-wide credential.
 
 Managed SKILL.md packages live under:
 

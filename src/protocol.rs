@@ -58,6 +58,14 @@ pub enum Op {
         text: String,
     },
 
+    /// Submit text together with one local attachment. The core performs all
+    /// file validation and extraction so every desktop frontend gets the same
+    /// PDF, Office, source-code and image behavior.
+    SubmitAttachment {
+        text: String,
+        path: PathBuf,
+    },
+
     /// Start a fresh session in the current workspace.
     NewSession,
 
@@ -108,6 +116,12 @@ pub enum Op {
         provider_id: String,
         api_key: Option<SecretString>,
         base_url: Option<String>,
+    },
+
+    /// Start the official account authentication flow for a provider. API-key
+    /// providers continue to use `SetProvider` directly.
+    LoginProvider {
+        provider_id: String,
     },
 
     /// Enable or disable all web-search and web-fetch tools. The setting is
@@ -257,6 +271,15 @@ pub enum Decision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    /// A turn-scoped event tagged with the conversation that produced it.
+    /// Global lifecycle/configuration events stay at the top level. This lets
+    /// desktop interfaces keep several turns streaming concurrently without
+    /// ever appending a token or approval card to the wrong transcript.
+    SessionEvent {
+        session_id: String,
+        payload: Box<Event>,
+    },
+
     /// Sent once on connect so a late-joining client can draw a full screen
     /// without replaying history.
     Ready {
@@ -295,6 +318,21 @@ pub enum Event {
         /// Available models for the new provider.
         #[serde(default)]
         models: Vec<String>,
+    },
+
+    /// Device-code details emitted by the OpenAI account login flow.
+    ProviderLoginDeviceCode {
+        provider_id: String,
+        verification_url: String,
+        user_code: String,
+    },
+
+    /// Completion of an account login. A successful login also selects the
+    /// provider before this event is emitted.
+    ProviderLoginFinished {
+        provider_id: String,
+        success: bool,
+        message: String,
     },
 
     WebSearchChanged {
@@ -455,5 +493,20 @@ mod tests {
         let debug = format!("{op:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("root-secret"));
+    }
+
+    #[test]
+    fn turn_events_keep_their_session_route() {
+        let event = Event::SessionEvent {
+            session_id: "session-b".into(),
+            payload: Box::new(Event::Token {
+                text: "background text".into(),
+            }),
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["event"], "session_event");
+        assert_eq!(value["session_id"], "session-b");
+        assert_eq!(value["payload"]["event"], "token");
+        assert_eq!(value["payload"]["text"], "background text");
     }
 }

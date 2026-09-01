@@ -116,10 +116,30 @@ pub struct Agent {
     pub output_store: Arc<ToolOutputStore>,
     pub mcp_servers: Vec<McpServerConfig>,
 
-    events: mpsc::Sender<Event>,
+    events: SessionEventSender,
     /// Approvals arrive out of band from whichever interface is attached.
     approvals: Arc<Mutex<mpsc::Receiver<(String, Decision)>>>,
     always_allow: Arc<Mutex<Vec<String>>>,
+}
+
+/// Each running Agent clone retains the session it was created for. Switching
+/// the foreground Agent replaces this value without retagging an already
+/// running background turn.
+#[derive(Clone)]
+struct SessionEventSender {
+    raw: mpsc::Sender<Event>,
+    session_id: String,
+}
+
+impl SessionEventSender {
+    async fn send(&self, payload: Event) -> std::result::Result<(), mpsc::error::SendError<Event>> {
+        self.raw
+            .send(Event::SessionEvent {
+                session_id: self.session_id.clone(),
+                payload: Box::new(payload),
+            })
+            .await
+    }
 }
 
 #[derive(Default)]
@@ -144,6 +164,7 @@ impl Agent {
         events: mpsc::Sender<Event>,
         approvals: mpsc::Receiver<(String, Decision)>,
     ) -> Self {
+        let event_session_id = session_id.clone();
         Self {
             provider,
             registry,
@@ -155,19 +176,25 @@ impl Agent {
             verify_policy,
             output_store,
             mcp_servers,
-            events,
+            events: SessionEventSender {
+                raw: events,
+                session_id: event_session_id,
+            },
             approvals: Arc::new(Mutex::new(approvals)),
             always_allow: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub fn event_sender(&self) -> mpsc::Sender<Event> {
-        self.events.clone()
+        self.events.raw.clone()
     }
 
     pub async fn switch_session(&mut self, session_id: String) {
-        self.session_id = session_id;
-        self.always_allow.lock().await.clear();
+        self.session_id = session_id.clone();
+        self.events.session_id = session_id;
+        // Do not clear the Arc shared by a turn that is still running in the
+        // previous conversation. The new session gets an independent policy.
+        self.always_allow = Arc::new(Mutex::new(Vec::new()));
     }
 
     pub async fn run_turn(&self, user_text: String, cancel: CancellationToken) -> Result<()> {
@@ -663,7 +690,7 @@ impl Agent {
             .events
             .send(Event::Notice {
                 message: format!(
-                    "modelul nu a răspuns; reapelare automată {recall}/2 în {delay_ms} ms ({short})"
+                    "the model did not respond; automatic retry {recall}/2 in {delay_ms} ms ({short})"
                 ),
             })
             .await;
@@ -681,6 +708,10 @@ impl Agent {
         reason: String,
         allow_always: bool,
     ) -> Result<bool> {
+        // Only one approval card is exposed at a time. Turns still stream and
+        // execute concurrently, but an answer can no longer be consumed by a
+        // different pending call.
+        let mut rx = self.approvals.lock().await;
         let _ = self
             .events
             .send(Event::ApprovalRequest {
@@ -692,8 +723,7 @@ impl Agent {
             })
             .await;
 
-        // Blocks the loop, which is the point — nothing else should proceed.
-        let mut rx = self.approvals.lock().await;
+        // Blocks this turn only; other sessions continue independently.
         while let Some((id, decision)) = rx.recv().await {
             if id != call_id {
                 continue;
@@ -1020,7 +1050,7 @@ pub(crate) fn automatic_session_title(text: &str) -> String {
     let compact = text
         .lines()
         .find(|line| !line.trim().is_empty())
-        .unwrap_or("Conversație nouă")
+        .unwrap_or("New conversation")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");

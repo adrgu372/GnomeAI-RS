@@ -39,6 +39,7 @@ pub struct PrivilegeCredential {
 pub struct PrivilegeBroker {
     events: mpsc::Sender<Event>,
     replies: Arc<Mutex<mpsc::Receiver<PrivilegeCredential>>>,
+    gate: Arc<Mutex<()>>,
 }
 
 impl PrivilegeBroker {
@@ -46,6 +47,7 @@ impl PrivilegeBroker {
         Self {
             events,
             replies: Arc::new(Mutex::new(replies)),
+            gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -54,6 +56,9 @@ impl PrivilegeBroker {
         command: &str,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        // sudo/PAM is a desktop-global interaction. Expose one credential
+        // conversation at a time so replies cannot cross between chat turns.
+        let _gate = self.gate.lock().await;
         if validate_sudo(None, cancel).await? {
             return Ok(());
         }

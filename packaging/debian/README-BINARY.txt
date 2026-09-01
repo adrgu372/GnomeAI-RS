@@ -8,10 +8,15 @@ The compatibility names `gnomef-rs` and `gnomef-agent` open the same GUI.
 The application provides streaming chat, tool/patch output, command approvals,
 sessions, providers, models, workspaces, sandbox policies, Web Search, skills,
 memory, diagnostics, Markdown export and native WhatsApp pairing. WhatsApp
-uses a private authenticated loopback helper with no HTML page.
+uses a private authenticated loopback helper with no HTML page. The Debian
+package runs it as an auto-enabled user service, so it stays connected after
+the desktop window is closed.
 
 Never start GnomeAI-RS with sudo. Install-time elevation does not change the
 per-user runtime at `${XDG_STATE_HOME:-$HOME/.local/state}/gnomeai-rs`.
+
+The package already contains Microsoft .NET SDK 8.0.424 in
+`/usr/lib/gnomeai-rs/dotnet`; no external .NET package repository is needed.
 
 Optional provider integrations:
 

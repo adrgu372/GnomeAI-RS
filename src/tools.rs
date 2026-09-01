@@ -719,7 +719,7 @@ fn empty_response_fallback(tool_observations: &[ToolObservation]) -> Option<Stri
             .collect::<Vec<_>>()
             .join("\n");
         return Some(format!(
-            "Nu am primit un răspuns final de la model după execuția tool-urilor. Observațiile utile sunt:\n{details}"
+            "The model did not return a final answer after the tools ran. Useful observations:\n{details}"
         ));
     }
 
@@ -734,7 +734,7 @@ fn empty_response_fallback(tool_observations: &[ToolObservation]) -> Option<Stri
         None
     } else {
         Some(format!(
-            "Modelul nu a produs un răspuns final. Ultimele erori observate au fost:\n{}",
+            "The model did not produce a final answer. The latest observed errors were:\n{}",
             failed.join("\n")
         ))
     }
@@ -2139,7 +2139,7 @@ async fn ensure_web_sudo_authenticated(
             }
             return Ok(());
         }
-        message = Some("Parola nu a fost acceptată de sudo. Încearcă din nou.".into());
+        message = Some("The credential was not accepted by sudo. Try again.".into());
     }
     bail!("sudo authentication failed after three attempts")
 }
@@ -4640,7 +4640,7 @@ mod tests {
         });
         let observation = ToolObservation::from_success(&profile, "Bash", &args, &result);
         let fallback = empty_response_fallback(&[observation]).unwrap();
-        assert!(fallback.contains("Nu am primit un răspuns final"));
+        assert!(fallback.contains("The model did not return a final answer"));
         assert!(fallback.contains("nvidia-smi"));
         let _ = std::fs::remove_dir_all(root);
     }

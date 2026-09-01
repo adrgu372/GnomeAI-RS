@@ -35,9 +35,9 @@ nodes in one interface.
 
 | Area | Version 2.0 |
 | --- | --- |
-| Interface | Native Rust `eframe`/`egui` window; no browser page or terminal launcher |
+| Interface | Native Avalonia UI 11 window driven by the Rust core over the `Op`/`Event` bridge; no browser page |
 | Conversations | Streaming, automatic titles, resume, rename, fork and sidebar deletion |
-| Input | Full-width multiline composer, diacritics, automatic growth and drag-and-drop |
+| Input | Full-width multiline composer, diacritics, automatic growth, drag-and-drop, Enter to send and Shift+Enter for a new line |
 | Providers | API keys plus OpenAI Account/Codex and Anthropic Account/Claude Code |
 | Files | Images, PDF, Office/ODF, text/data and source code |
 | Agent | Tools, subagents, memory, skills, Web Search, desktop navigation and guarded sudo |
@@ -54,9 +54,12 @@ The GUI includes:
 - live token streaming without blocking input;
 - a full-width, multiline composer that grows to eight rows, wraps long text,
   supports Romanian diacritics and focuses when any empty point in it is
-  clicked;
+  clicked; Enter sends and Shift+Enter inserts a new line;
 - a local message queue while the agent is busy;
-- expandable reasoning, tool output, patches and verification results;
+- concurrent saved conversations: start or resume another chat while the first
+  keeps running in the background, with independent Stop/queue state and live
+  sidebar status;
+- structured reasoning, tool output, patches and verification results;
 - Stop/interrupt during model calls and long-running tools;
 - command approvals and a separate masked sudo credential dialog;
 - persisted sessions with automatic titles, resume, rename, delete and fork;
@@ -70,7 +73,10 @@ The GUI includes:
 - native WhatsApp setup, live status, QR pairing and test messaging;
 - a Hub for weak Linux devices, with root policy controlled per device;
 - slash-command suggestions in the composer;
-- dark desktop styling, consistent title bars and selectable transcript text.
+- English Windows Apps styling with persistent System, Light and Dark Fluent
+  themes, consistent title surfaces, navigation pane, command bar and
+  selectable transcript text. Use the title-bar theme button, Settings, or
+  `/theme light|dark|system`.
 
 There is no `index.html`, WebTool page or browser launcher in version 2.0. The
 Debian desktop entry uses `Terminal=false`. WhatsApp keeps a
@@ -141,6 +147,14 @@ Package builders:
 ./scripts/build-node-packages.sh
 ./scripts/build-macos-arm64.sh
 ```
+
+The Debian builder pins Microsoft .NET SDK 8.0.424 for Linux x64. It downloads
+the official tar.gz directly from Microsoft, verifies the published SHA-512,
+uses that SDK to publish Avalonia and includes the complete SDK privately under
+`/usr/lib/gnomeai-rs/dotnet` in the generated package. The installed app does
+not need `dotnet-sdk-8.0` from a Debian or Microsoft APT repository. Repeated
+builds reuse the verified archive from the user cache. For offline builds, set
+`GNOMEAI_DOTNET_SDK_ARCHIVE=/path/to/dotnet-sdk-8.0.424-linux-x64.tar.gz`.
 
 The Debian launcher uses `Terminal=false`; the macOS application launches the
 native Rust window directly rather than opening Terminal or a browser.

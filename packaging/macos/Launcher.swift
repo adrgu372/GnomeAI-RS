@@ -25,7 +25,7 @@ private func showFailure(_ message: String) {
 
     let alert = NSAlert()
     alert.alertStyle = .critical
-    alert.messageText = "GnomeAI-RS nu a pornit"
+    alert.messageText = "GnomeAI-RS could not start"
     alert.informativeText = message
     alert.runModal()
 }
@@ -48,7 +48,7 @@ private func launchAgent(executable: String) throws {
             code: Int(process.terminationStatus),
             userInfo: [
                 NSLocalizedDescriptionKey:
-                    "Aplicația s-a închis cu codul \(process.terminationStatus)."
+                    "The application exited with code \(process.terminationStatus)."
             ]
         )
     }

@@ -276,12 +276,12 @@ pub async fn generate_image_response(
                             .await;
                         }
                         return format!(
-                            "Am primit imaginea, dar providerul sau modelul selectat a respins cererea vizuală. Pentru un model local, verifică și dacă projectorul/mmproj este încărcat. Eroare: {err}"
+                            "The image was received, but the selected provider or model rejected the visual request. For a local model, also check that the projector/mmproj is loaded. Error: {err}"
                         );
                     }
                 },
                 Err(err) => {
-                    return format!("Nu am putut encoda imaginea pentru model: {err}");
+                    return format!("The image could not be encoded for the model: {err}");
                 }
             }
         }
@@ -305,10 +305,10 @@ pub async fn generate_image_response(
 
     if image_path.is_some() {
         format!(
-            "Am primit imaginea „{image_name}”, dar modelul selectat „{model}” este marcat explicit ca text-only și OCR nu a găsit text. Alege un model multimodal pentru analiză vizuală."
+            "The image '{image_name}' was received, but the selected model '{model}' is explicitly marked as text-only and OCR found no text. Select a multimodal model for visual analysis."
         )
     } else {
-        "Nu am gasit imaginea atasata in istoricul chatului.".into()
+        "The attached image was not found in the chat history.".into()
     }
 }
 
@@ -331,14 +331,14 @@ async fn answer_from_ocr(
     vision_error: Option<&str>,
 ) -> String {
     let note = if let Some(err) = vision_error {
-        format!("Cererea vision a esuat, deci pot raspunde doar din OCR. Eroare: {err}\n\n")
+        format!("The vision request failed, so I can answer only from OCR. Error: {err}\n\n")
     } else {
         format!(
-            "Modelul „{model}” este marcat explicit ca text-only, deci pot răspunde doar din OCR.\n\n"
+            "Model '{model}' is explicitly marked as text-only, so I can answer only from OCR.\n\n"
         )
     };
     let prompt = format!(
-        "{note}Imagine: {image_name}\nIntrebarea utilizatorului: {query}\n\nText OCR:\n{ocr}"
+        "{note}Image: {image_name}\nUser question: {query}\n\nOCR text:\n{ocr}"
     );
     let system_prompt = append_memory_block(
         &build_runtime_aware_system_prompt(SYSTEM_PROMPT, runtime_profile),

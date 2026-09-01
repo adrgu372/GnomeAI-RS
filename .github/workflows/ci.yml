@@ -10,6 +10,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  avalonia:
+    name: Avalonia UI build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Cache NuGet
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('ui/GnomeAI.UI/*.csproj') }}
+
+      - name: Check Avalonia UI contracts
+        run: python3 scripts/check-avalonia-ui.py
+
+      - name: Build (Release)
+        run: dotnet build ui/GnomeAI.UI/GnomeAI.UI.csproj -c Release
+
+      - name: Publish self-contained smoke check
+        run: dotnet publish ui/GnomeAI.UI/GnomeAI.UI.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -o dist/ui-smoke
+
   # Ubuntu: the GitHub runner already executes as an unprivileged user.
   ubuntu:
     name: Ubuntu build · test · smoke run
