@@ -949,8 +949,8 @@ fn append_skill_catalog_update(core: &Core) -> Result<()> {
 }
 
 fn prepare_attachment(path: &Path, prompt: &str) -> Result<String> {
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("cannot inspect {}", path.display()))?;
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("cannot inspect {}", path.display()))?;
     if metadata.len() as usize > MAX_ATTACHMENT_BYTES {
         bail!(
             "attachment is too large (limit {} MiB)",
@@ -962,8 +962,8 @@ fn prepare_attachment(path: &Path, prompt: &str) -> Result<String> {
         .and_then(|name| name.to_str())
         .unwrap_or("attachment");
     if uploads::file_type_from_name(name) == "image" {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("cannot read {}", path.display()))?;
+        let bytes =
+            std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
         let media_type = mime_guess::from_path(path)
             .first_raw()
             .unwrap_or("application/octet-stream");
@@ -979,8 +979,8 @@ fn prepare_attachment(path: &Path, prompt: &str) -> Result<String> {
         ]))?);
     }
 
-    let extracted = uploads::extract_text_attachment(path)
-        .with_context(|| format!("cannot read {name}"))?;
+    let extracted =
+        uploads::extract_text_attachment(path).with_context(|| format!("cannot read {name}"))?;
     if extracted.trim().is_empty() {
         bail!("no readable text was found in {name}");
     }
@@ -1037,7 +1037,12 @@ async fn submit_or_queue(
 ) {
     if let Some(turn) = active.get_mut(&agent.session_id) {
         turn.queued.push_back(text);
-        session_notice(events, &agent.session_id, "message queued in this conversation").await;
+        session_notice(
+            events,
+            &agent.session_id,
+            "message queued in this conversation",
+        )
+        .await;
     } else {
         launch_turn(agent, text, active, turns);
     }
@@ -1099,11 +1104,7 @@ async fn session_recoverable_error(
     .await;
 }
 
-async fn report_turn_result(
-    events: &mpsc::Sender<Event>,
-    session_id: &str,
-    result: Result<()>,
-) {
+async fn report_turn_result(events: &mpsc::Sender<Event>, session_id: &str, result: Result<()>) {
     match result {
         Ok(()) => {}
         Err(error) => session_recoverable_error(events, session_id, error).await,

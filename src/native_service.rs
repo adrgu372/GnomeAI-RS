@@ -43,8 +43,7 @@ pub fn load_or_create_token(app_home: &Path) -> anyhow::Result<String> {
         // The UI and the user service may start together at login. Whichever
         // loses the create-new race must reuse the winner's credential.
         Err(error) if error.kind() == ErrorKind::AlreadyExists => read_token(&path),
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to create {}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("failed to create {}", path.display())),
     }
 }
 
@@ -91,7 +90,11 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
         assert_eq!(
-            fs::metadata(token_path(&directory)).unwrap().permissions().mode() & 0o777,
+            fs::metadata(token_path(&directory))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600
         );
         fs::remove_dir_all(directory).unwrap();

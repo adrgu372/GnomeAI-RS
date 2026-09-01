@@ -175,7 +175,10 @@ pub async fn run(
             launch.program.display()
         )
     })?;
-    let mut input = child.stdin.take().context("Avalonia stdin is unavailable")?;
+    let mut input = child
+        .stdin
+        .take()
+        .context("Avalonia stdin is unavailable")?;
     let output = child
         .stdout
         .take()
@@ -243,7 +246,10 @@ pub async fn run(
     }
 
     drop(input);
-    let status = child.wait().await.context("cannot wait for Avalonia frontend")?;
+    let status = child
+        .wait()
+        .await
+        .context("cannot wait for Avalonia frontend")?;
     if status.success() {
         Ok(())
     } else {
@@ -251,7 +257,10 @@ pub async fn run(
     }
 }
 
-async fn write_json_line<T: Serialize>(writer: &mut tokio::process::ChildStdin, value: &T) -> Result<()> {
+async fn write_json_line<T: Serialize>(
+    writer: &mut tokio::process::ChildStdin,
+    value: &T,
+) -> Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
     writer.write_all(&bytes).await?;

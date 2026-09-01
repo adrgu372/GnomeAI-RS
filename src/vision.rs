@@ -337,9 +337,7 @@ async fn answer_from_ocr(
             "Model '{model}' is explicitly marked as text-only, so I can answer only from OCR.\n\n"
         )
     };
-    let prompt = format!(
-        "{note}Image: {image_name}\nUser question: {query}\n\nOCR text:\n{ocr}"
-    );
+    let prompt = format!("{note}Image: {image_name}\nUser question: {query}\n\nOCR text:\n{ocr}");
     let system_prompt = append_memory_block(
         &build_runtime_aware_system_prompt(SYSTEM_PROMPT, runtime_profile),
         memory_block,

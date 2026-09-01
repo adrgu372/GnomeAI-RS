@@ -3597,8 +3597,7 @@ fn tool_schemas_for(agent_profile: AgentProfile, whatsapp_origin: bool) -> Vec<V
                 .and_then(|function| function.get("name"))
                 .and_then(Value::as_str)
                 .is_some_and(|name| {
-                    agent_profile.allows(name)
-                        && !(whatsapp_origin && name == "AskUserQuestion")
+                    agent_profile.allows(name) && !(whatsapp_origin && name == "AskUserQuestion")
                 })
         })
         .collect()
@@ -4134,8 +4133,7 @@ mod tests {
         let desktop = tool_schemas_for(AgentProfile::Root, false);
         let has_question_widget = |schemas: &[Value]| {
             schemas.iter().any(|schema| {
-                schema.pointer("/function/name").and_then(Value::as_str)
-                    == Some("AskUserQuestion")
+                schema.pointer("/function/name").and_then(Value::as_str) == Some("AskUserQuestion")
             })
         };
 
