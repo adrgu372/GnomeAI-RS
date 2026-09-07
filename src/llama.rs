@@ -32,6 +32,7 @@ pub struct ModelInfo {
 pub fn known_models(provider_id: &str) -> Vec<ModelInfo> {
     match provider_id {
         "openai" => vec![
+            model("gpt-6-astra"),
             model("gpt-5.6-terra"),
             model("gpt-5.4"),
             model("gpt-5.3"),
@@ -39,6 +40,7 @@ pub fn known_models(provider_id: &str) -> Vec<ModelInfo> {
             model("gpt-4o-mini"),
         ],
         "anthropic" => vec![
+            model("claude-fable-5-1"),
             model("claude-sonnet-5"),
             model("claude-opus-4-8"),
             model("claude-opus-4-7"),
@@ -85,13 +87,14 @@ pub fn known_models(provider_id: &str) -> Vec<ModelInfo> {
         "sambanova" => vec![model("DeepSeek-V3.1"), model("DeepSeek-R1")],
         "cohere" => vec![model("command-a-03-2025"), model("command-r-plus")],
         // A ChatGPT account can expose a different Codex catalog depending on
-        // its plan and rollout. Never guess those ids: model/list replaces
+        // its plan and rollout. Keep only official ids here; model/list replaces
         // this safe fallback whenever the account runtime is available.
-        "openai-account" => vec![model("default")],
+        "openai-account" => vec![model("default"), model("gpt-6-astra")],
         // Claude Code accepts these stable aliases and resolves them to the
         // newest model included in the connected Anthropic subscription.
         "anthropic-account" => vec![
             model("default"),
+            model("claude-fable-5-1"),
             model("sonnet"),
             model("opus"),
             model("haiku"),
@@ -199,11 +202,11 @@ impl LlamaClient {
                     None
                 }
                 Ok(Err(error)) => {
-                    tracing::warn!(%error, "Codex model discovery failed; using default");
+                    tracing::warn!(%error, "Codex model discovery failed; using official fallback");
                     None
                 }
                 Err(_) => {
-                    tracing::warn!("Codex model discovery timed out; using default");
+                    tracing::warn!("Codex model discovery timed out; using official fallback");
                     None
                 }
             };
@@ -357,6 +360,7 @@ impl LlamaClient {
                         "stream": true,
                     });
                     set_openai_token_limit(cfg, &mut payload);
+                    apply_openai_reasoning_options(cfg, model, &mut payload);
                     payload
                 };
 
@@ -456,6 +460,7 @@ impl LlamaClient {
                 "stream": true,
             });
             set_openai_token_limit(cfg, &mut payload);
+            apply_openai_reasoning_options(cfg, model, &mut payload);
             if needs_tools {
                 payload["tools"] = json!(tools);
                 if let Some(choice) = tool_choice.clone() {
@@ -554,6 +559,7 @@ impl LlamaClient {
                     "stream": false,
                 });
                 set_openai_token_limit(cfg, &mut payload);
+                apply_openai_reasoning_options(cfg, model, &mut payload);
                 if let Some(tools) = tools.clone() {
                     payload["tools"] = Value::Array(tools);
                     if let Some(tool_choice) = tool_choice.clone() {
@@ -649,6 +655,7 @@ impl LlamaClient {
         if !system.is_empty() {
             payload["system"] = json!(system);
         }
+        apply_anthropic_reasoning_options(cfg, model, &mut payload);
         if let Some(tools) = tools {
             let tools = tools
                 .iter()
@@ -702,6 +709,7 @@ impl LlamaClient {
         if !system.is_empty() {
             payload["system"] = json!(system);
         }
+        apply_anthropic_reasoning_options(cfg, model, &mut payload);
         let url = anthropic_messages_url(cfg);
         let response = self
             .http
@@ -746,6 +754,7 @@ impl LlamaClient {
         if !system.is_empty() {
             payload["system"] = json!(system);
         }
+        apply_anthropic_reasoning_options(cfg, model, &mut payload);
         let tools = tools
             .iter()
             .filter_map(anthropic_tool_schema)
@@ -780,6 +789,46 @@ fn ensure_web_provider_supported(cfg: &AppConfig) -> anyhow::Result<()> {
         "codex" => bail!("OpenAI account requests must use the Codex app-server adapter"),
         "claude-cli" => bail!("Anthropic account requests must use the Claude Code adapter"),
         _ => Ok(()),
+    }
+}
+
+fn configured_reasoning_effort(cfg: &AppConfig) -> Option<&str> {
+    let effort = cfg.reasoning_effort.trim();
+    (!effort.is_empty() && effort != "default").then_some(effort)
+}
+
+fn apply_openai_reasoning_options(cfg: &AppConfig, model: &str, payload: &mut Value) {
+    if cfg.provider_id != "openai" {
+        return;
+    }
+    // Astra's reasoning models do not accept sampling temperature.
+    if model.starts_with("gpt-6-astra") {
+        payload.as_object_mut().map(|object| object.remove("temperature"));
+    }
+    if let Some(effort) = configured_reasoning_effort(cfg) {
+        payload["reasoning_effort"] = json!(effort);
+    }
+}
+
+fn apply_anthropic_reasoning_options(cfg: &AppConfig, model: &str, payload: &mut Value) {
+    if cfg.provider_id != "anthropic" {
+        return;
+    }
+    // Current frontier Claude models reject custom sampling controls. Keep the
+    // existing temperature path for older models, but strip it for the new
+    // families before applying effort.
+    if model.starts_with("claude-fable-5")
+        || model.starts_with("claude-sonnet-5")
+        || model.starts_with("claude-opus-5")
+        || model.starts_with("claude-opus-4-7")
+        || model.starts_with("claude-opus-4-8")
+    {
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("temperature");
+        }
+    }
+    if let Some(effort) = configured_reasoning_effort(cfg) {
+        payload["output_config"] = json!({ "effort": effort });
     }
 }
 
@@ -1920,18 +1969,21 @@ mod tests {
     }
 
     #[test]
-    fn account_provider_fallbacks_never_invent_codex_model_ids() {
+    fn account_provider_fallbacks_use_only_official_model_ids() {
         let openai = known_models("openai-account")
             .into_iter()
             .map(|model| model.id)
             .collect::<Vec<_>>();
-        assert_eq!(openai, vec!["default"]);
+        assert_eq!(openai, vec!["default", "gpt-6-astra"]);
 
         let anthropic = known_models("anthropic-account")
             .into_iter()
             .map(|model| model.id)
             .collect::<Vec<_>>();
-        assert_eq!(anthropic, vec!["default", "sonnet", "opus", "haiku"]);
+        assert_eq!(
+            anthropic,
+            vec!["default", "claude-fable-5-1", "sonnet", "opus", "haiku"]
+        );
     }
 
     #[test]

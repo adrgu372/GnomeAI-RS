@@ -1,5 +1,5 @@
 Package: gnomeai-rs
-Version: 2.3.0-8
+Version: 2.4.0-1
 Section: utils
 Priority: optional
 Architecture: amd64
@@ -15,6 +15,6 @@ Description: native graphical multi-provider AI agent written in Rust
  SKILL.md packages.
  .
  The package bundles the official OpenAI Codex app-server runtime, the pinned
- WhatsApp bridge dependencies, Microsoft .NET SDK 8.0.424 for the Avalonia UI
- and a rootless, lazy Firecrawl deployment with complete corresponding AGPL
- source.
+ WhatsApp bridge dependencies, Microsoft .NET SDK 10.0.400 for the Avalonia UI
+ and a rootless, lazy Firecrawl deployment pinned to its exact upstream AGPL
+ source revision.

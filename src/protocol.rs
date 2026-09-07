@@ -109,6 +109,12 @@ pub enum Op {
         model: String,
     },
 
+    /// Persist a provider/model reasoning-effort preference. `default` lets
+    /// the selected provider keep its own default.
+    SetReasoningEffort {
+        effort: String,
+    },
+
     /// Select a hosted provider or one of the official account-backed CLIs.
     /// The core persists API credentials in its owner-only settings file;
     /// they are never echoed back in an event.
@@ -116,6 +122,16 @@ pub enum Op {
         provider_id: String,
         api_key: Option<SecretString>,
         base_url: Option<String>,
+    },
+
+    /// Persist the default provider/model used when an Agent delegation does
+    /// not explicitly override either field.
+    SetSubagentDefaults {
+        enabled: bool,
+        provider_id: String,
+        model: String,
+        #[serde(default = "default_reasoning_effort")]
+        reasoning_effort: String,
     },
 
     /// Start the official account authentication flow for a provider. API-key
@@ -286,6 +302,8 @@ pub enum Event {
         session_id: String,
         provider: String,
         model: String,
+        #[serde(default = "default_reasoning_effort")]
+        reasoning_effort: String,
         workspace: PathBuf,
         sandbox: String,
         web_search_enabled: bool,
@@ -298,6 +316,14 @@ pub enum Event {
         models: Vec<String>,
         #[serde(default)]
         mcp_servers: Vec<McpServerConfig>,
+        #[serde(default)]
+        subagent_use_separate_model: bool,
+        #[serde(default = "default_inherit")]
+        subagent_provider_id: String,
+        #[serde(default = "default_inherit")]
+        subagent_model: String,
+        #[serde(default = "default_reasoning_effort")]
+        subagent_reasoning_effort: String,
     },
 
     SessionReset,
@@ -318,6 +344,14 @@ pub enum Event {
         /// Available models for the new provider.
         #[serde(default)]
         models: Vec<String>,
+    },
+
+    SubagentDefaultsChanged {
+        enabled: bool,
+        provider_id: String,
+        model: String,
+        #[serde(default = "default_reasoning_effort")]
+        reasoning_effort: String,
     },
 
     /// Device-code details emitted by the OpenAI account login flow.
@@ -453,6 +487,14 @@ pub enum Event {
         /// rejected command. True means the session is finished.
         fatal: bool,
     },
+}
+
+fn default_reasoning_effort() -> String {
+    "default".into()
+}
+
+fn default_inherit() -> String {
+    "inherit".into()
 }
 
 #[cfg(test)]

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="0.145.0"
+version="0.153.4"
 destination="${1:-target/release/codex}"
 case "$(uname -m)" in
     x86_64 | amd64)
         target="x86_64-unknown-linux-musl"
-        sha256="63c3568f800723421ec4a4dec591158dbb1a7e8f353d1f333b080203d96ffa85"
+        sha256="a5d37ff1fa6953ee6d317b7e69bfafd39f5f53350b631d790fa7531159f22420"
         ;;
     aarch64 | arm64)
         target="aarch64-unknown-linux-musl"
-        sha256="803e718bfc108a97f443a23d5203b42771c5afbeb5ff9bd534a755515ccfe3b3"
+        sha256="5673c5a8935ff2f85ca67b489e560fdd5e08fb0f0e2f7426f048ec7449aa4fdc"
         ;;
     *)
         printf 'Unsupported Linux architecture: %s\n' "$(uname -m)" >&2

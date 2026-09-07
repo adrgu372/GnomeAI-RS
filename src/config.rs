@@ -71,6 +71,9 @@ pub struct AppConfig {
     pub search_cache_max: usize,
     pub max_chunk_size: usize,
     pub default_model: String,
+    /// Optional provider reasoning-effort override. `default` leaves the provider
+    /// or model default untouched.
+    pub reasoning_effort: String,
     pub llama_api_key: String,
     /// Provider-scoped API keys. `llama_api_key` remains the active key for
     /// backwards compatibility, while this map lets switching providers keep
@@ -85,6 +88,20 @@ pub struct AppConfig {
     /// context budget and by the user's interrupt, not by a round count.
     pub tool_loop_max_steps: u32,
     pub agent_max_depth: u32,
+    /// When enabled, Agent calls that omit both `provider_id` and `model`
+    /// use the dedicated worker selection below instead of inheriting the
+    /// root agent. Explicit Agent arguments always keep their old behavior.
+    pub subagent_use_separate_model: bool,
+    /// Provider preset used by implicit delegated workers. `inherit` keeps
+    /// the root provider.
+    pub subagent_provider_id: String,
+    /// Model used by implicit delegated workers. `inherit` keeps the legacy
+    /// resolution behavior (root model for the same provider, provider
+    /// default for a different provider).
+    pub subagent_model: String,
+    /// Reasoning effort used by implicit delegated workers. `default` leaves
+    /// the delegated provider/model default untouched.
+    pub subagent_reasoning_effort: String,
     /// Maximum number of local/remote subagents that may execute at once.
     /// This keeps proactive delegation useful without exhausting a local
     /// model server or creating an unbounded number of background workers.
@@ -176,6 +193,7 @@ impl Default for AppConfig {
             search_cache_max: 500,
             max_chunk_size: 3_500,
             default_model: "gemma-3n-E4B-it-Q4_K_M".into(),
+            reasoning_effort: "default".into(),
             llama_api_key: String::new(),
             provider_api_keys: BTreeMap::new(),
             llama_base_url: "http://127.0.0.1:8090/v1".into(),
@@ -184,6 +202,10 @@ impl Default for AppConfig {
             llama_max_tokens: 4_096,
             tool_loop_max_steps: 0,
             agent_max_depth: 3,
+            subagent_use_separate_model: false,
+            subagent_provider_id: "inherit".into(),
+            subagent_model: "inherit".into(),
+            subagent_reasoning_effort: "default".into(),
             agent_max_concurrent: 4,
             remote_agent_api_url: String::new(),
             remote_agent_api_key: String::new(),
@@ -322,6 +344,17 @@ impl AppConfig {
             self.tool_loop_max_steps = self.tool_loop_max_steps.min(64);
         }
         self.agent_max_depth = self.agent_max_depth.clamp(1, 8);
+        self.subagent_provider_id = compact_ws(&self.subagent_provider_id).to_lowercase();
+        if self.subagent_provider_id.is_empty() {
+            self.subagent_provider_id = "inherit".into();
+        }
+        self.reasoning_effort = normalize_reasoning_effort(&self.reasoning_effort);
+        self.subagent_model = compact_ws(&self.subagent_model);
+        if self.subagent_model.is_empty() {
+            self.subagent_model = "inherit".into();
+        }
+        self.subagent_reasoning_effort =
+            normalize_reasoning_effort(&self.subagent_reasoning_effort);
         self.agent_max_concurrent = self.agent_max_concurrent.clamp(1, 16);
         self.memory_max_facts_in_prompt = self.memory_max_facts_in_prompt.clamp(1, 20);
         if self.memory_max_age_days > 0 {
@@ -514,6 +547,15 @@ fn mcp_name(name: &str, fallback: usize) -> String {
         format!("mcp-server-{fallback}")
     } else {
         normalized
+    }
+}
+
+pub fn normalize_reasoning_effort(value: &str) -> String {
+    let value = compact_ws(value).to_ascii_lowercase();
+    if matches!(value.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
+        value
+    } else {
+        "default".into()
     }
 }
 

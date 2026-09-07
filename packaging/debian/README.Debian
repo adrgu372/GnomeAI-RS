@@ -10,9 +10,9 @@ The desktop menu entry and these compatible commands open the same native GUI:
   gnomef-rs /path/to/workspace
   gnomef-agent /path/to/workspace
 
-Microsoft .NET SDK 8.0.424, including the .NET 8 runtime used by Avalonia, is
+Microsoft .NET SDK 10.0.400, including the .NET 10 runtime used by Avalonia, is
 bundled privately under `/usr/lib/gnomeai-rs/dotnet`. No Microsoft APT source
-or separate `dotnet-sdk-8.0` package is required. The bundled SDK is added to
+or separate `dotnet-sdk-10.0` package is required. The bundled SDK is added to
 `DOTNET_ROOT` and `PATH` only for GnomeAI-RS and its child processes.
 
 Runtime state and API keys use owner-only permissions under:

@@ -382,12 +382,15 @@ async fn run_tool_loop_internal(
     turn: &TurnStream,
 ) -> String {
     let whatsapp_origin = session_key.is_some_and(is_whatsapp_scope);
+    let native_delegate_origin = session_key.is_some_and(is_native_delegate_scope);
     let runtime_aware_system_prompt = append_memory_block(
         &build_runtime_aware_system_prompt(system_prompt, runtime_profile),
         memory_block,
     );
     let channel_execution_policy = if whatsapp_origin {
         "WhatsApp authorization: this turn came from an allowed WhatsApp chat. The user's inbound message itself authorizes the standard user-level tool calls needed to fulfill it, so execute them without waiting for a desktop confirmation. Read-only mode still blocks mutations. Sudo may proceed only with an existing sudo ticket or a valid credential already stored in the local keyring; if neither is available, fail clearly instead of opening a desktop prompt."
+    } else if native_delegate_origin {
+        "Native delegated-worker authorization: the parent native Agent tool call already passed the desktop execution policy, so standard user-level tool calls may proceed without another confirmation. Read-only still blocks mutations. Root privilege is not delegated: Sudo must fail and be returned to the parent agent instead."
     } else {
         "Native desktop authorization: obey the selected execution mode and request local confirmation whenever normal mode requires it."
     };
@@ -403,7 +406,7 @@ async fn run_tool_loop_internal(
     ];
     // `0` means unlimited; anything else is a safety valve, not a work limit.
     let step_cap = cfg.tool_loop_max_steps;
-    let schemas = tool_schemas_for(agent_profile, whatsapp_origin);
+    let schemas = tool_schemas_for(agent_profile, whatsapp_origin || native_delegate_origin);
     let mut final_content = String::new();
     let mut structured_output_only = false;
     let mut tool_observations = Vec::new();
@@ -808,7 +811,7 @@ impl AgentProfile {
     fn guidance(self) -> &'static str {
         match self {
             Self::Root => {
-                "For complex work, use the Agent tool proactively to delegate independent, well-scoped tasks. Give every subagent all context it needs because it receives a separate conversation. Launch multiple independent Agent calls in the same response so they can run concurrently. Use Explore for read-only codebase/web investigation, Plan for solution design without file changes, and general-purpose for implementation. Each Agent call may independently choose provider_id and model; use inherit unless the user requested a particular provider/model or a saved provider is clearly better suited. Do not delegate trivial work or duplicate work already in progress. Synchronous subagent results return directly; background agents are checked with TaskOutput."
+                "For complex work, use the Agent tool proactively to delegate independent, well-scoped tasks. Give every subagent all context it needs because it receives a separate conversation. Launch multiple independent Agent calls in the same response so they can run concurrently. Use Explore for read-only codebase/web investigation, Plan for solution design without file changes, and general-purpose for implementation. Omit provider_id and model for normal delegation so the user's configured delegated-worker defaults can be applied. Include provider_id and/or model only when intentionally overriding those defaults for this specific Agent call; explicit inherit keeps the legacy parent/provider-default behavior. Do not delegate trivial work or duplicate work already in progress. Synchronous subagent results return directly; background agents are checked with TaskOutput."
             }
             Self::GeneralPurpose => {
                 "You are a general-purpose subagent with an isolated context. You may inspect and modify the shared workspace using the available tools. Do not ask the human questions; report blockers to the parent."
@@ -932,10 +935,16 @@ async fn execute_tool_call(
         );
     }
     match name {
-        // AskUserQuestion is a browser widget: waiting here would leave a
-        // WhatsApp turn apparently frozen for its one-hour default timeout.
-        // It is also removed from the advertised WhatsApp schemas, but keep
-        // this guard for providers that emit textual/unadvertised tool calls.
+        // AskUserQuestion is a browser widget: non-interactive channels must
+        // never wait on it. WhatsApp asks in the reply; an isolated native
+        // worker returns the blocker to its parent. Keep these guards even
+        // though the schema is hidden from both kinds of worker.
+        "AskUserQuestion" if is_native_delegate_scope(&tool_ctx.session_key) => Ok(json!({
+            "channel": "native_delegate",
+            "interactive_widget_available": false,
+            "questions": args.get("questions").cloned().unwrap_or_else(|| json!([])),
+            "instruction": "Do not ask the human directly from this isolated worker. Return the questions or blocker to the parent agent and stop."
+        })),
         "AskUserQuestion" if is_whatsapp_scope(&tool_ctx.session_key) => Ok(json!({
             "channel": "whatsapp",
             "interactive_widget_available": false,
@@ -1040,7 +1049,7 @@ async fn execute_tool_call(
                     web_sandbox_mode(cfg),
                     SandboxMode::Normal | SandboxMode::IsolatedWorkspaceWrite
                 )
-                && !is_whatsapp_scope(&tool_ctx.approval_scope);
+                && !is_preapproved_scope(&tool_ctx.approval_scope);
             tool_node(cfg, args, root_approved).await
         }
         "Sudo" => {
@@ -1423,7 +1432,7 @@ fn resolve_agent_provider(
         preset(&provider_id).ok_or_else(|| anyhow!("Unknown subagent provider: {provider_id}"))?;
     if provider.auth == AuthKind::Account {
         bail!(
-            "WhatsApp subagents require an API provider; account-backed provider {} is available only in the native app",
+            "Subagents require an API provider; account-backed provider {} can only be used as the root agent",
             provider.name
         );
     }
@@ -1483,15 +1492,40 @@ async fn tool_agent(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "general-purpose".into());
     let agent_profile = AgentProfile::from_subagent_type(&subagent_type);
-    let requested_provider = value_string(args, "provider_id").unwrap_or_else(|| "inherit".into());
-    let requested_model = value_string(args, "model")
-        .filter(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("inherit"));
-    let (agent_cfg, agent_provider, agent_model) = resolve_agent_provider(
+    let explicit_provider = value_string(args, "provider_id")
+        .map(|value| normalize_ws(&value))
+        .filter(|value| !value.is_empty());
+    let explicit_model = value_string(args, "model")
+        .map(|value| normalize_ws(&value))
+        .filter(|value| !value.is_empty());
+    // Dedicated-worker settings are defaults, not forced routing. Preserve
+    // the old semantics whenever a caller explicitly supplied either field.
+    let use_worker_defaults = cfg.subagent_use_separate_model
+        && explicit_provider.is_none()
+        && explicit_model.is_none();
+    let requested_provider = explicit_provider.unwrap_or_else(|| {
+        if use_worker_defaults {
+            cfg.subagent_provider_id.clone()
+        } else {
+            "inherit".into()
+        }
+    });
+    let requested_model = if use_worker_defaults {
+        let model = normalize_ws(&cfg.subagent_model);
+        (!model.is_empty() && !model.eq_ignore_ascii_case("inherit")).then_some(model)
+    } else {
+        explicit_model.filter(|value| !value.eq_ignore_ascii_case("inherit"))
+    };
+    let (mut agent_cfg, agent_provider, agent_model) = resolve_agent_provider(
         cfg,
         current_model,
         &requested_provider,
         requested_model.as_deref(),
     )?;
+    if use_worker_defaults {
+        agent_cfg.reasoning_effort = cfg.subagent_reasoning_effort.clone();
+        agent_cfg.normalize();
+    }
     let isolation = value_string(args, "isolation")
         .unwrap_or_else(|| "local".into())
         .to_lowercase();
@@ -1534,6 +1568,7 @@ async fn tool_agent(
             "requested_agent_type": subagent_type.as_str(),
             "provider_id": agent_provider.as_str(),
             "model": agent_model.as_str(),
+            "reasoning_effort": agent_cfg.reasoning_effort.as_str(),
             "isolation": "local",
             "background": run_in_background,
             "parent_agent_id": tool_ctx.agent_id,
@@ -1739,7 +1774,7 @@ pub async fn launch_background_subagent(
     description: &str,
     prompt: &str,
     subagent_type: &str,
-    provider_id: &str,
+    provider_id: Option<&str>,
     model: Option<&str>,
     memory_block: Option<String>,
 ) -> anyhow::Result<Value> {
@@ -1747,8 +1782,12 @@ pub async fn launch_background_subagent(
     args.insert("description".into(), json!(description));
     args.insert("prompt".into(), json!(prompt));
     args.insert("subagent_type".into(), json!(subagent_type));
-    args.insert("provider_id".into(), json!(provider_id));
-    args.insert("model".into(), json!(model.unwrap_or("inherit")));
+    if let Some(provider_id) = provider_id.map(str::trim).filter(|value| !value.is_empty()) {
+        args.insert("provider_id".into(), json!(provider_id));
+    }
+    if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
+        args.insert("model".into(), json!(model));
+    }
     args.insert("run_in_background".into(), json!(true));
     args.insert("isolation".into(), json!("local"));
     let session_key = normalize_ws(scope_key);
@@ -1916,7 +1955,7 @@ async fn authorize_standard(
         SandboxMode::ReadOnly => bail!("{tool} is disabled in read-only mode"),
         SandboxMode::FullAccess => Ok(()),
         SandboxMode::Normal | SandboxMode::IsolatedWorkspaceWrite
-            if is_whatsapp_scope(scope_key) =>
+            if is_preapproved_scope(scope_key) =>
         {
             Ok(())
         }
@@ -2033,6 +2072,9 @@ async fn tool_sudo(
     }
     if web_sandbox_mode(cfg) == SandboxMode::ReadOnly {
         bail!("Sudo is disabled in read-only mode")
+    }
+    if is_native_delegate_scope(scope_key) {
+        bail!("Sudo is not delegated to native subagents; return the privileged step to the parent agent")
     }
     let command = required_string(args, "command")?;
     let cwd = resolve_workspace_path(
@@ -2656,7 +2698,7 @@ async fn tool_run_skill(
             let root_approved = matches!(
                 web_sandbox_mode(cfg),
                 SandboxMode::Normal | SandboxMode::IsolatedWorkspaceWrite
-            ) && !is_whatsapp_scope(&tool_ctx.approval_scope);
+            ) && !is_preapproved_scope(&tool_ctx.approval_scope);
             nodes::local_client(cfg.node_hub_port, &cfg.node_hub_admin_token)
                 .execute(
                     &node_id,
@@ -3175,13 +3217,11 @@ fn openai_tool_schemas() -> Vec<Value> {
                     },
                     "provider_id": {
                         "type": "string",
-                        "default": "inherit",
-                        "description": "Provider preset for this subagent (for example inherit, openai, anthropic, deepseek, openrouter, custom). The provider's saved API key is reused."
+                        "description": "Optional provider override for this subagent (for example inherit, openai, anthropic, deepseek, openrouter, custom). Omit it to use the delegated-worker default configured by the user. The provider's saved API key is reused."
                     },
                     "model": {
                         "type": "string",
-                        "default": "inherit",
-                        "description": "Use inherit for the parent's model or provide another model id from the active provider."
+                        "description": "Optional model override. Omit it to use the delegated-worker default configured by the user; explicit inherit keeps the legacy inherited/provider-default model behavior."
                     },
                     "run_in_background": {"type": "boolean", "default": false},
                     "isolation": {"type": "string", "enum": ["local", "remote"], "default": "local"}
@@ -4086,9 +4126,19 @@ fn is_whatsapp_scope(scope_key: &str) -> bool {
     scope_key.starts_with("wa_") || scope_key.starts_with("whatsapp_")
 }
 
+fn is_native_delegate_scope(scope_key: &str) -> bool {
+    scope_key.starts_with("native_delegate_")
+}
+
+fn is_preapproved_scope(scope_key: &str) -> bool {
+    is_whatsapp_scope(scope_key) || is_native_delegate_scope(scope_key)
+}
+
 fn source_channel_for_scope(scope_key: &str) -> &'static str {
     if is_whatsapp_scope(scope_key) {
         "whatsapp"
+    } else if is_native_delegate_scope(scope_key) {
+        "native"
     } else {
         "webtool"
     }

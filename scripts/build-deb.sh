@@ -9,14 +9,13 @@ version="$(sed -n 's/^Version: //p' "$control_file" | head -n 1)"
 architecture="$(sed -n 's/^Architecture: //p' "$control_file" | head -n 1)"
 output_dir="${GNOMEAI_OUTPUT_DIR:-$project_root/dist}"
 binary_dir="${GNOMEAI_BIN_DIR:-$project_root/target/release}"
-codex_version="0.145.0"
+codex_version="0.153.4"
 codex_target="x86_64-unknown-linux-musl"
-codex_tar_sha256="11239480f8e3efd1430f23bbe91c1a397856b8bbe6185ccbaee2382d25e03df2"
-codex_bin_sha256="a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14"
-dotnet_sdk_version="8.0.424"
+codex_package_sha256="a822187e1a2420c61c5926721bfbd878701ed95547c9bb0d4de4498a16ba1821"
+dotnet_sdk_version="10.0.400"
 dotnet_sdk_filename="dotnet-sdk-${dotnet_sdk_version}-linux-x64.tar.gz"
 dotnet_sdk_url="https://builds.dotnet.microsoft.com/dotnet/Sdk/${dotnet_sdk_version}/${dotnet_sdk_filename}"
-dotnet_sdk_sha512="6503fd9f464d5e3a4f43a881d2b74afc6a2c46ceda74d027f1565b7239f4b3ec884857c03c0dcd49eb52f384d5ae1fa5aaf135f0a6aabc5518103aceed643c74"
+dotnet_sdk_sha512="1033977dd837150e0814cf0c5d5b17ceb63925fda7ba2158b47258a4bd7c048cf82eac3bc1166f3146f53124a3f5fba09db1de1260d2ce96399860303b404b48"
 
 download_file() {
     local url="$1"
@@ -278,25 +277,25 @@ install -m 0644 third_party/firecrawl/README.md \
     "$package_root/usr/share/doc/gnomeai-rs/firecrawl/README.md"
 install -m 0644 third_party/firecrawl/IMAGE-DIGESTS \
     "$package_root/usr/share/doc/gnomeai-rs/firecrawl/IMAGE-DIGESTS"
-install -m 0644 third_party/firecrawl/firecrawl-v2.11.134.tar.gz \
-    "$package_root/usr/share/doc/gnomeai-rs/firecrawl/firecrawl-v2.11.134.tar.gz"
+install -m 0644 third_party/firecrawl/SOURCE.txt \
+    "$package_root/usr/share/doc/gnomeai-rs/firecrawl/SOURCE.txt"
 
 codex_vendor_root="${GNOMEAI_CODEX_VENDOR_ROOT:-}"
 if [[ -z "$codex_vendor_root" ]]; then
-    if ! command -v npm >/dev/null 2>&1; then
-        echo "npm is required to fetch the pinned official Codex platform package" >&2
-        exit 1
-    fi
-    (
-        cd "$build_root"
-        npm --cache "$npm_cache" \
-            pack "@openai/codex@${codex_version}-linux-x64" --silent >/dev/null
-    )
-    codex_archive="$build_root/openai-codex-${codex_version}-linux-x64.tgz"
-    printf '%s  %s\n' "$codex_tar_sha256" "$codex_archive" | sha256sum --check -
+    codex_archive_name="codex-package-${codex_target}.tar.gz"
+    codex_archive="$build_root/$codex_archive_name"
+    codex_url="https://github.com/openai/codex/releases/download/rust-v${codex_version}/${codex_archive_name}"
+    echo "Downloading official Codex package $codex_version ($codex_target)..." >&2
+    download_file "$codex_url" "$codex_archive"
+    printf '%s  %s\n' "$codex_package_sha256" "$codex_archive" | sha256sum --check -
     mkdir -p "$build_root/codex-extract"
     tar --no-same-owner -xzf "$codex_archive" -C "$build_root/codex-extract"
-    codex_vendor_root="$build_root/codex-extract/package/vendor/$codex_target"
+    codex_package_json="$(find "$build_root/codex-extract" -type f -name codex-package.json -print -quit)"
+    if [[ -z "$codex_package_json" ]]; then
+        echo "Official Codex package does not contain codex-package.json." >&2
+        exit 1
+    fi
+    codex_vendor_root="$(dirname "$codex_package_json")"
 fi
 
 if [[ ! -f "$codex_vendor_root/codex-package.json" || ! -x "$codex_vendor_root/bin/codex" ]]; then
@@ -311,7 +310,6 @@ if ! grep -Fq "\"target\": \"$codex_target\"" "$codex_vendor_root/codex-package.
     echo "Codex vendor metadata does not match target $codex_target" >&2
     exit 1
 fi
-printf '%s  %s\n' "$codex_bin_sha256" "$codex_vendor_root/bin/codex" | sha256sum --check -
 
 mkdir -p "$package_root/usr/lib/gnomeai-rs/codex"
 cp -a "$codex_vendor_root/." "$package_root/usr/lib/gnomeai-rs/codex/"

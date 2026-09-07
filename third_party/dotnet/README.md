@@ -1,15 +1,16 @@
-Microsoft .NET SDK 8.0.424
-==========================
+Microsoft .NET SDK 10.0.400
+===========================
 
 The Debian package builder downloads the official Linux x64 SDK archive from:
 
-https://builds.dotnet.microsoft.com/dotnet/Sdk/8.0.424/dotnet-sdk-8.0.424-linux-x64.tar.gz
+https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.400/dotnet-sdk-10.0.400-linux-x64.tar.gz
 
 Expected SHA-512:
 
-6503fd9f464d5e3a4f43a881d2b74afc6a2c46ceda74d027f1565b7239f4b3ec884857c03c0dcd49eb52f384d5ae1fa5aaf135f0a6aabc5518103aceed643c74
+1033977dd837150e0814cf0c5d5b17ceb63925fda7ba2158b47258a4bd7c048cf82eac3bc1166f3146f53124a3f5fba09db1de1260d2ce96399860303b404b48
 
 The verified archive is extracted into `/usr/lib/gnomeai-rs/dotnet` in the
 generated package. Upstream `LICENSE.txt` and `ThirdPartyNotices.txt` remain
-alongside the SDK. GnomeAI-RS configures `DOTNET_ROOT` privately and does not
-add a Microsoft APT source or replace a system-wide .NET installation.
+alongside the SDK. GnomeAI-RS targets `net10.0`, configures `DOTNET_ROOT`
+privately, and does not add a Microsoft APT source or replace a system-wide
+.NET installation.

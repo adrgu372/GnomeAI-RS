@@ -110,6 +110,7 @@ pub struct Agent {
     pub store: Store,
     pub session_id: String,
     pub model: String,
+    pub reasoning_effort: String,
     pub approval: ApprovalPolicy,
     pub workspace: PathBuf,
     pub verify_policy: SandboxPolicy,
@@ -156,6 +157,7 @@ impl Agent {
         store: Store,
         session_id: String,
         model: String,
+        reasoning_effort: String,
         approval: ApprovalPolicy,
         workspace: PathBuf,
         verify_policy: SandboxPolicy,
@@ -171,6 +173,7 @@ impl Agent {
             store,
             session_id,
             model,
+            reasoning_effort,
             approval,
             workspace,
             verify_policy,
@@ -268,6 +271,8 @@ impl Agent {
             let messages = self.build_messages()?;
             let req = Request {
                 model: self.model.clone(),
+                reasoning_effort: (self.reasoning_effort != "default")
+                    .then(|| self.reasoning_effort.clone()),
                 messages,
                 tools: self.registry.specs(),
                 max_tokens: 8192,
@@ -859,6 +864,7 @@ impl Agent {
 
         let request = Request {
             model: self.model.clone(),
+            reasoning_effort: None,
             messages: vec![
                 Message::System {
                     content: CONTEXT_COMPACTOR_SYSTEM_PROMPT.into(),
@@ -927,6 +933,7 @@ impl Agent {
             store: self.store.clone(),
             session_id: self.session_id.clone(),
             model: self.model.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
             approval: self.approval,
             workspace: self.workspace.clone(),
             verify_policy: self.verify_policy.clone(),
@@ -959,7 +966,8 @@ impl DelegatedToolExecutor for AgentDelegatedToolExecutor {
             });
         };
         let definition = tool.definition();
-        if definition.approval != ApprovalRequirement::External {
+        let delegated_agent = name == "agent" && definition.approval == ApprovalRequirement::Standard;
+        if definition.approval != ApprovalRequirement::External && !delegated_agent {
             return Ok(DelegatedToolResult {
                 content: format!("`{name}` is not an external MCP tool"),
                 success: false,
@@ -998,7 +1006,12 @@ impl DelegatedToolExecutor for AgentDelegatedToolExecutor {
                 success: false,
             });
         }
-        if !self.agent.approved(&call, &tool, &summary).await? {
+        // Account-backed coding providers already required approval for the
+        // delegated turn itself in normal mode. Do not ask a second time when
+        // that approved turn delegates one of its steps to the configured
+        // GnomeAI worker. Non-account providers still use the normal Standard
+        // approval path in execute_tool_call().
+        if !delegated_agent && !self.agent.approved(&call, &tool, &summary).await? {
             end_delegated_tool(&self.agent, &call.id, false, 0).await;
             return Ok(DelegatedToolResult {
                 content: "denied by the user".into(),

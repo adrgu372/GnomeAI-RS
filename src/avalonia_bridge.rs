@@ -74,6 +74,14 @@ impl WhatsAppLaunchConfig {
             launch_error: None,
         }
     }
+
+    pub fn native_api_base(&self) -> &str {
+        &self.api_base
+    }
+
+    pub fn native_api_token(&self) -> &str {
+        &self.token
+    }
 }
 
 #[derive(Serialize)]
@@ -290,8 +298,8 @@ fn resolve_frontend() -> Result<FrontendLaunch> {
             .map(|root| root.join("Resources/ui/GnomeAI.UI")),
         Some(current.with_file_name("ui").join("GnomeAI.UI")),
         Some(current.with_file_name("GnomeAI.UI")),
-        Some(manifest.join("ui/GnomeAI.UI/bin/Release/net8.0/GnomeAI.UI")),
-        Some(manifest.join("ui/GnomeAI.UI/bin/Debug/net8.0/GnomeAI.UI")),
+        Some(manifest.join("ui/GnomeAI.UI/bin/Release/net10.0/GnomeAI.UI")),
+        Some(manifest.join("ui/GnomeAI.UI/bin/Debug/net10.0/GnomeAI.UI")),
     ];
     if let Some(program) = candidates
         .into_iter()

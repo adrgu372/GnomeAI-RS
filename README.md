@@ -5,8 +5,20 @@ application keeps the proven agent core and `Op`/`Event` protocol of the former
 terminal interface while replacing the TUI and browser page with one native
 window.
 
-Current package version: **2.3.0**. See [CHANGELOG.md](CHANGELOG.md) for the
+Current package version: **2.4.0**. See [CHANGELOG.md](CHANGELOG.md) for the
 historical release notes.
+
+## What changed in 2.4
+
+Version 2.4 hardens draft recovery and desktop reliability and ships the
+Avalonia desktop interface improvements.
+
+| Area | Version 2.4 |
+| --- | --- |
+| Drafts | Unsent text, attachments, caret position and queues persist per conversation and restore automatically |
+| Recovery | Queued messages resume in a paused state; explicit resume and clear controls; failed UI handlers surface in-window errors |
+| Desktop | Transcript stays available when the core connection drops; WhatsApp pairing status refreshes automatically |
+| Workers | Delegated-worker defaults stay unset (`inherit`) so every user picks their own provider/model in Settings |
 
 ## What changed in 2.3
 
@@ -17,7 +29,6 @@ against stalled upstream connections.
 | --- | --- |
 | Providers | Z.ai Coding Plan subscription endpoint with `glm-5.3-flash` as multimodal default |
 | WhatsApp | Clarifying questions answered inline; inbound turns serialize per conversation; provider requests honor `llama_timeout` |
-| Responses | Native Markdown layout for headings, lists, quotes, tables and fenced code, with one-click code copying |
 | Responses | Native Markdown layout for headings, lists, quotes, tables and fenced code, with one-click code copying |
 | Transcript | Reliable mouse-wheel scrolling over selectable text, including while a selection is active |
 | Clipboard | Native keyboard, context-menu and Linux primary-selection copy/paste behavior |
@@ -55,7 +66,10 @@ The GUI includes:
 - a full-width, multiline composer that grows to eight rows, wraps long text,
   supports Romanian diacritics and focuses when any empty point in it is
   clicked; Enter sends and Shift+Enter inserts a new line;
-- a local message queue while the agent is busy;
+- a local message queue while the agent is busy, with explicit resume/clear
+  controls; Stop pauses pending messages as well as interrupting the turn;
+- automatic per-conversation recovery of unsent drafts, attachment references
+  and queued messages; recovered queues remain paused until resumed;
 - concurrent saved conversations: start or resume another chat while the first
   keeps running in the background, with independent Stop/queue state and live
   sidebar status;
@@ -70,6 +84,8 @@ The GUI includes:
 - `read-only`, `normal` and `full-access` sandbox selection;
 - Web Search, memory, skills, diagnostics, diff, rollback and compaction;
 - transcript search, token totals, notifications and Markdown export;
+- a readable transcript after a core disconnection, so it can still be copied
+  or exported before restarting;
 - native WhatsApp setup, live status, QR pairing and test messaging;
 - a Hub for weak Linux devices, with root policy controlled per device;
 - slash-command suggestions in the composer;
@@ -148,13 +164,13 @@ Package builders:
 ./scripts/build-macos-arm64.sh
 ```
 
-The Debian builder pins Microsoft .NET SDK 8.0.424 for Linux x64. It downloads
+The Debian builder pins Microsoft .NET SDK 10.0.400 for Linux x64. It downloads
 the official tar.gz directly from Microsoft, verifies the published SHA-512,
 uses that SDK to publish Avalonia and includes the complete SDK privately under
 `/usr/lib/gnomeai-rs/dotnet` in the generated package. The installed app does
-not need `dotnet-sdk-8.0` from a Debian or Microsoft APT repository. Repeated
+not need `dotnet-sdk-10.0` from a Debian or Microsoft APT repository. Repeated
 builds reuse the verified archive from the user cache. For offline builds, set
-`GNOMEAI_DOTNET_SDK_ARCHIVE=/path/to/dotnet-sdk-8.0.424-linux-x64.tar.gz`.
+`GNOMEAI_DOTNET_SDK_ARCHIVE=/path/to/dotnet-sdk-10.0.400-linux-x64.tar.gz`.
 
 The Debian launcher uses `Terminal=false`; the macOS application launches the
 native Rust window directly rather than opening Terminal or a browser.
@@ -472,5 +488,5 @@ only on loopback, requires a per-process token and serves no web page.
 ## Third-party notices
 
 GnomeAI-RS is GPL-3.0. The optional OpenAI Codex sidecar is distributed under
-Apache-2.0. The optional Firecrawl deployment is AGPL-3.0, with its matching
-source and license included under `third_party/firecrawl/`.
+Apache-2.0. The optional Firecrawl deployment is AGPL-3.0; its exact upstream source tag,
+commit, image pins and license are recorded under `third_party/firecrawl/`.

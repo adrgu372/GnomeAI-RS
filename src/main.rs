@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod app_dirs;
 mod chat_logic;
 mod codex_app_server;
@@ -962,6 +964,11 @@ async fn api_preview_models(
             .into_response());
     }
 
+    // The Avalonia process owns the live Settings UI and may have persisted
+    // provider credentials after this helper started. Refresh the shared
+    // config before previewing a delegated-worker provider so model discovery
+    // uses the latest saved credentials without a helper restart.
+    let current_cfg = reload_native_config(&state).await?;
     let settings = ProviderSettingsStore::new(state.paths.store_dir.join("providers.json"));
     let existing = settings.load()?;
     let supplied_key = payload
@@ -970,10 +977,7 @@ async fn api_preview_models(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let api_key = state
-        .config
-        .read()
-        .await
+    let api_key = current_cfg
         .resolve_provider_api_key(provider_id, supplied_key)
         .or_else(|| {
             existing
@@ -996,7 +1000,7 @@ async fn api_preview_models(
             return Ok(Json(json!(models)).into_response());
         }
     };
-    let mut cfg = state.config.read().await.clone();
+    let mut cfg = current_cfg;
     apply_provider_selection(&selection, &mut cfg);
     let models = state
         .llama
@@ -1350,7 +1354,8 @@ async fn api_launch_agent(
     let provider_id = payload
         .get("provider_id")
         .and_then(Value::as_str)
-        .unwrap_or("inherit");
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -1362,7 +1367,11 @@ async fn api_launch_agent(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("manual");
-    let cfg = state.config.read().await.clone();
+    // The native Avalonia process may have changed delegated-worker defaults
+    // in the shared owner-only config after this companion started. Reload it
+    // for every manual/native subagent launch so those settings take effect
+    // immediately without restarting the background service.
+    let cfg = reload_native_config(&state).await?;
     let execution_paths = runtime_paths(&state).await;
     let runtime_profile = RuntimeProfile::detect(&execution_paths);
     let memory_block = cfg
@@ -2201,6 +2210,8 @@ async fn generate_account_whatsapp_response(
 
     let request = ProviderRequest {
         model: model.to_string(),
+        reasoning_effort: (cfg.reasoning_effort != "default")
+            .then(|| cfg.reasoning_effort.clone()),
         messages,
         tools: Vec::new(),
         max_tokens: cfg.llama_max_tokens,

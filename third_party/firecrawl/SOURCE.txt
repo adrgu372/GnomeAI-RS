@@ -1,0 +1,12 @@
+Firecrawl upstream source
+=========================
+Project: https://github.com/firecrawl/firecrawl
+Tag: v2.11.302
+Commit: e3b72346c28224dd8f0673224cf90f692b0c3964
+Source tree: https://github.com/firecrawl/firecrawl/tree/v2.11.302
+License: AGPL-3.0
+
+Runtime API image:
+ghcr.io/firecrawl/firecrawl:sha-e3b72346c282-linux-amd64
+
+This reference is immutable and maps to the exact upstream commit above.

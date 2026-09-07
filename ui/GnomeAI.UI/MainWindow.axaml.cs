@@ -93,6 +93,11 @@ public sealed partial class MainWindow : Window
     private string? _gitBranch;
     private string _providerName = "";
     private string _model = "";
+    private string _reasoningEffort = "default";
+    private bool _subagentUseSeparateModel;
+    private string _subagentProviderId = "inherit";
+    private string _subagentModel = "inherit";
+    private string _subagentReasoningEffort = "default";
     private string _sandbox = "normal";
     private string _transcriptSearch = "";
     private bool _webSearchEnabled;
@@ -135,6 +140,7 @@ public sealed partial class MainWindow : Window
         TranscriptContent.SizeChanged += TranscriptContent_SizeChanged;
         _streamFlushTimer.Tick += StreamFlushTimer_Tick;
         _scrollSettleTimer.Tick += ScrollSettleTimer_Tick;
+        _draftSaveTimer.Tick += (_, _) => SaveComposerDrafts();
 
         if (Environment.GetCommandLineArgs().Contains("--ipc"))
         {
@@ -148,12 +154,18 @@ public sealed partial class MainWindow : Window
         }
 
         Opened += (_, _) => Composer.Focus();
+        RefreshComposer();
     }
 
     protected override void OnClosed(EventArgs e)
     {
+        CaptureComposerDraft();
+        _closed = true;
+        SaveComposerDrafts();
         _streamFlushTimer.Stop();
         _scrollSettleTimer.Stop();
+        _bridge.EventReceived -= OnBridgeEvent;
+        _bridge.Disconnected -= OnBridgeDisconnected;
         _ = _bridge.DisposeAsync();
         _windowRecovery.Dispose();
         _http.Dispose();
@@ -162,19 +174,35 @@ public sealed partial class MainWindow : Window
 
     private Task OnBridgeEvent(JsonElement node) => RunUiAsync(() => HandleEventAsync(node));
 
-    private async void OnBridgeDisconnected(string reason) => await RunUiAsync(async () =>
+    private void OnBridgeDisconnected(string reason)
     {
+        if (_closed) return;
+        _coreConnected = false;
+        _sessionTransitioning = false;
+        _busy = false;
+        foreach (var runtime in _sessionRuntimes.Values)
+        {
+            runtime.Busy = false;
+            runtime.QueuePaused = true;
+        }
+        CaptureComposerDraft();
+        SaveComposerDrafts();
+        FinishStreamingSegment();
         ConnectionText.Text = "Disconnected from the core";
         ConnectionText.Foreground = FailureBrush;
-        ShowNotice(reason);
-        await Task.Delay(250);
-        Close();
-    });
+        ShowError($"{reason}\n\nYou can copy or export this conversation before closing the window. Reopen GnomeAI to reconnect.");
+        RefreshComposer();
+        RefreshSessionRuntimeIndicators();
+    }
 
     private async Task RunUiAsync(Func<Task> action)
     {
+        if (_closed) return;
         try { await action(); }
-        catch (Exception error) { ShowError($"UI error: {error.Message}"); }
+        catch (Exception error)
+        {
+            if (!_closed) ShowError($"The action could not be completed: {error.Message}");
+        }
     }
 
     private async Task HandleEventAsync(JsonElement node)
@@ -187,6 +215,10 @@ public sealed partial class MainWindow : Window
         }
         switch (kind)
         {
+            case "ui_bridge_warning":
+                ShowError(String(node, "message"));
+                break;
+
             case "ui_config":
                 VersionText.Text = "v" + node.GetProperty("version").GetString();
                 _providers.Clear();
@@ -205,13 +237,19 @@ public sealed partial class MainWindow : Window
                 break;
 
             case "ready":
-                _currentSessionId = String(node, "session_id");
+                SwitchComposerSession(String(node, "session_id"));
                 _sessionTransitioning = false;
+                _coreConnected = true;
                 _providerName = String(node, "provider");
                 _model = String(node, "model");
+                _reasoningEffort = String(node, "reasoning_effort", "default");
                 _workspace = String(node, "workspace");
                 _sandbox = String(node, "sandbox", "normal");
                 _webSearchEnabled = Bool(node, "web_search_enabled");
+                _subagentUseSeparateModel = Bool(node, "subagent_use_separate_model");
+                _subagentProviderId = String(node, "subagent_provider_id", "inherit");
+                _subagentModel = String(node, "subagent_model", "inherit");
+                _subagentReasoningEffort = String(node, "subagent_reasoning_effort", "default");
                 _gitBranch = node.TryGetProperty("git_branch", out var branch) && branch.ValueKind == JsonValueKind.String
                     ? branch.GetString()
                     : null;
@@ -224,6 +262,8 @@ public sealed partial class MainWindow : Window
                 break;
 
             case "session_reset":
+                CaptureComposerDraft();
+                SaveComposerDrafts();
                 _sessionTransitioning = true;
                 ResetTranscript();
                 RefreshHeader();
@@ -272,14 +312,21 @@ public sealed partial class MainWindow : Window
                 RefreshHeader();
                 break;
 
+            case "subagent_defaults_changed":
+                _subagentUseSeparateModel = Bool(node, "enabled");
+                _subagentProviderId = String(node, "provider_id", "inherit");
+                _subagentModel = String(node, "model", "inherit");
+                _subagentReasoningEffort = String(node, "reasoning_effort", "default");
+                break;
+
             case "provider_login_device_code":
             {
                 var url = String(node, "verification_url");
                 var code = String(node, "user_code");
                 var card = AppendMessage("notice", "Connect OpenAI Codex",
                     $"Open {url} and enter this one-time code:\n\n{code}", NoticeBrush);
-                card.Actions.Add(new MessageAction { Label = "Copy code", Handler = () => CopyTextAsync(code) });
-                card.Actions.Add(new MessageAction { Label = "Open browser", Handler = () => OpenUrlAsync(url) });
+                card.Actions.Add(new MessageAction { Label = "Copy code", Handler = () => RunUiAsync(() => CopyTextAsync(code)) });
+                card.Actions.Add(new MessageAction { Label = "Open browser", Handler = () => RunUiAsync(() => OpenUrlAsync(url)) });
                 ScrollDown();
                 break;
             }
@@ -419,9 +466,9 @@ public sealed partial class MainWindow : Window
             case "interrupted":
                 FinishStreamingSegment();
                 _busy = false;
+                RuntimeFor(_currentSessionId).QueuePaused = true;
                 RefreshComposer();
                 RefreshConnectionState("Ready", SuccessBrush);
-                await SendNextQueuedAsync();
                 break;
 
             case "web_search_changed":
@@ -463,7 +510,9 @@ public sealed partial class MainWindow : Window
             case "error":
                 FlushStreamingText();
                 ShowError(String(node, "message"), Bool(node, "fatal"));
-                if (!Bool(node, "fatal")) _busy = false;
+                _sessionTransitioning = false;
+                _busy = RuntimeFor(_currentSessionId).Busy;
+                RuntimeFor(_currentSessionId).QueuePaused = true;
                 RefreshComposer();
                 ScrollDown();
                 break;
@@ -490,17 +539,20 @@ public sealed partial class MainWindow : Window
         if (kind is "approval_request" or "privilege_credential_request")
             runtime.NeedsAttention = !isCurrent;
 
-        if (isCurrent) await HandleEventAsync(payload);
-
         var terminal = kind is "turn_completed" or "interrupted" or "error";
         if (terminal)
         {
             runtime.Busy = false;
             runtime.LiveEvents.Clear();
             runtime.NeedsAttention = !isCurrent;
+            if (kind != "turn_completed") runtime.QueuePaused = true;
             if (!isCurrent && _notifications)
                 SendDesktopNotification("GnomeAI-RS", $"A background conversation {(kind == "turn_completed" ? "is ready" : "stopped")}.");
         }
+
+        // Completion may send the next queued turn. Clear the old turn's state
+        // first so we cannot overwrite the new turn's Busy flag afterwards.
+        if (isCurrent) await HandleEventAsync(payload);
 
         RefreshSessionRuntimeIndicators();
     }
@@ -623,8 +675,8 @@ public sealed partial class MainWindow : Window
         var card = AppendMessage("notice", "Administrator credential",
             $"{command}\n\n{(dynamic ? "Authentication step" : "Attempt")} {attempt}", NoticeBrush,
             hasInput: true, inputHint: prompt, rememberVisible: Bool(node, "keyring_available"));
-        card.Actions.Add(new MessageAction { Label = "Continue", Handler = () => SendCredentialAsync(requestId, card, true) });
-        card.Actions.Add(new MessageAction { Label = "Cancel", Handler = () => SendCredentialAsync(requestId, card, false) });
+        card.Actions.Add(new MessageAction { Label = "Continue", Handler = () => RunUiAsync(() => SendCredentialAsync(requestId, card, true)) });
+        card.Actions.Add(new MessageAction { Label = "Cancel", Handler = () => RunUiAsync(() => SendCredentialAsync(requestId, card, false)) });
         ScrollDown();
     }
 
@@ -722,7 +774,6 @@ public sealed partial class MainWindow : Window
         _allMessages.Clear();
         Messages.Clear();
         _busy = false;
-        _attachments.Clear();
         _totalInputTokens = 0;
         _totalOutputTokens = 0;
         _tokenHistory.Clear();
@@ -882,8 +933,8 @@ public sealed partial class MainWindow : Window
         WorkspaceText.Text = string.IsNullOrEmpty(_workspace)
             ? "Choose a project folder to begin"
             : _workspace + (string.IsNullOrWhiteSpace(_gitBranch) ? "" : $"  ·  {_gitBranch}");
-        ConnectionText.Text = $"{_providerName} · {_model}";
-        ConnectionText.Foreground = SuccessBrush;
+        ConnectionText.Text = _coreConnected ? $"{_providerName} · {_model}" : "Disconnected from the core";
+        ConnectionText.Foreground = _coreConnected ? SuccessBrush : FailureBrush;
         if (!string.IsNullOrEmpty(_workspace))
             WorkspaceLabel.Text = Path.GetFileName(_workspace.TrimEnd(Path.DirectorySeparatorChar));
         ModelLabel.Text = string.IsNullOrWhiteSpace(_model) ? "Model" : _model;
@@ -900,13 +951,43 @@ public sealed partial class MainWindow : Window
     private void RefreshComposer()
     {
         var queue = CurrentQueue;
+        var paused = RuntimeFor(_currentSessionId).QueuePaused;
         SendButton.Content = _busy ? "Stop" : "Send";
+        SendButton.IsEnabled = _coreConnected && !_sessionTransitioning && !_dispatching;
+        Composer.IsEnabled = !_sessionTransitioning && _currentSessionId.Length > 0;
         QueueText.Text = queue.Count == 0
             ? "Enter sends · Shift+Enter inserts a new line"
-            : $"{queue.Count} message{(queue.Count == 1 ? "" : "s")} queued";
+            : $"{queue.Count} message{(queue.Count == 1 ? "" : "s")} queued{(paused ? " · paused" : "")}";
+        ResumeQueueButton.IsVisible = queue.Count > 0 && paused;
+        ResumeQueueButton.IsEnabled = _coreConnected && !_sessionTransitioning && !_busy && !_dispatching;
+        ClearQueueButton.IsVisible = queue.Count > 0;
+        ClearQueueButton.IsEnabled = !_dispatching;
     }
 
-    private Task SendAsync(Dictionary<string, object?> operation) => _bridge.SendAsync(operation);
+    private async Task SendAsync(Dictionary<string, object?> operation)
+    {
+        if (!_coreConnected) throw new InvalidOperationException("The Rust core is disconnected. Reopen GnomeAI to reconnect.");
+        operation.TryGetValue("op", out var op);
+        // Forks wait in the core until all turns are idle. Keep Stop and the
+        // composer available during that wait; SessionReset will latch later.
+        var navigates = op is "new_session" or "resume_session" or "set_workspace"
+            || (op is "fork_session" && !_sessionRuntimes.Values.Any(runtime => runtime.Busy));
+        if (navigates)
+        {
+            if (_sessionTransitioning) throw new InvalidOperationException("A conversation is still opening. Please wait.");
+            CaptureComposerDraft();
+            SaveComposerDrafts();
+            _sessionTransitioning = true;
+            RefreshComposer();
+        }
+        try { await _bridge.SendAsync(operation); }
+        catch
+        {
+            if (navigates) _sessionTransitioning = false;
+            RefreshComposer();
+            throw;
+        }
+    }
 
     private Task DecideAsync(string callId, string decision) => SendAsync(new()
     {
@@ -931,69 +1012,121 @@ public sealed partial class MainWindow : Window
 
     private async Task DispatchComposerAsync()
     {
-        var text = Composer.Text?.Trim() ?? "";
+        if (_dispatching || _sessionTransitioning) return;
+        var originalText = Composer.Text ?? "";
+        var text = originalText.Trim();
         var attachment = _attachments.FirstOrDefault();
         if (text.Length == 0 && attachment is null) return;
-        Composer.Clear();
-        _attachments.Clear();
-        RefreshAttachmentBar();
-        if (text.Length > 0)
+        var sessionId = _currentSessionId;
+        CaptureComposerDraft();
+        _dispatching = true;
+        RefreshComposer();
+        try
         {
-            _commandHistory.Add(text);
-            _historyPosition = null;
+            // Keep the editor intact until the action succeeds. Navigation
+            // commands remain available while a different turn is running.
+            var handled = attachment is null && text.StartsWith('/') && await HandleSlashCommandAsync(text);
+            if (!handled && attachment is null && WorkspacePathFromMessage(text) is { Length: > 0 } workspacePath)
+            {
+                await SendAsync(new() { ["op"] = "set_workspace", ["path"] = workspacePath });
+                handled = true;
+            }
+            if (!handled)
+            {
+                if (!_coreConnected) throw new InvalidOperationException("The Rust core is disconnected. Your message has been kept in the editor.");
+                if (_busy || CurrentQueue.Count > 0)
+                {
+                    CurrentQueue.Enqueue(new QueuedSubmission(text, attachment));
+                    MarkDraftChanged(sessionId);
+                }
+                else await SubmitMessageAsync(text, attachment);
+            }
+            CompleteComposerSubmission(sessionId, originalText, attachment);
+            if (text.Length > 0)
+            {
+                _commandHistory.Add(text);
+                _historyPosition = null;
+            }
         }
-        // Navigation slash commands (especially /new and /resume) must remain
-        // available while this conversation is working, otherwise a second
-        // concurrent chat could only be opened with the sidebar buttons.
-        if (attachment is null && text.StartsWith('/') && await HandleSlashCommandAsync(text)) return;
-        if (_busy)
+        finally
         {
-            CurrentQueue.Enqueue(new QueuedSubmission(text, attachment));
+            _dispatching = false;
             RefreshComposer();
-            return;
         }
-        await SubmitMessageAsync(text, attachment);
+        await SendNextQueuedAsync();
     }
 
     private async Task SubmitMessageAsync(string text, AttachedFile? attachment)
     {
-        if (attachment is null && await HandleSlashCommandAsync(text)) return;
-        if (attachment is null && WorkspacePathFromMessage(text) is { Length: > 0 } workspacePath)
+        if (attachment is not null && !File.Exists(attachment.Path))
+            throw new FileNotFoundException("The attachment is no longer available. Remove it or select the file again.", attachment.Path);
+        var sessionId = _currentSessionId;
+        var runtime = RuntimeFor(sessionId);
+        _busy = runtime.Busy = true;
+        RefreshComposer();
+        try
         {
-            await SendAsync(new() { ["op"] = "set_workspace", ["path"] = workspacePath });
-            return;
+            if (attachment is null)
+                await SendAsync(new() { ["op"] = "submit", ["text"] = text });
+            else
+                await SendAsync(new() { ["op"] = "submit_attachment", ["text"] = text, ["path"] = attachment.Path });
+        }
+        catch
+        {
+            runtime.Busy = false;
+            if (_currentSessionId == sessionId) _busy = false;
+            RefreshComposer();
+            throw;
         }
         var display = text;
         if (attachment is not null)
             display += (display.Length == 0 ? "" : "\n") + $"📎 {attachment.Name}";
-        AppendMessage("user", "You", display, UserBrush, HorizontalAlignment.Right);
-        ScrollDown();
-        if (attachment is null)
-            await SendAsync(new() { ["op"] = "submit", ["text"] = text });
-        else
-            await SendAsync(new() { ["op"] = "submit_attachment", ["text"] = text, ["path"] = attachment.Path });
+        if (_currentSessionId == sessionId)
+        {
+            AppendMessage("user", "You", display, UserBrush, HorizontalAlignment.Right);
+            ScrollDown();
+        }
     }
 
     private async Task SendNextQueuedAsync()
     {
-        var queue = CurrentQueue;
-        if (_busy || queue.Count == 0) return;
-        var next = queue.Dequeue();
+        var sessionId = _currentSessionId;
+        var runtime = RuntimeFor(sessionId);
+        var queue = runtime.Queue;
+        if (_busy || _dispatching || _sessionTransitioning || !_coreConnected || runtime.QueuePaused || queue.Count == 0) return;
+        var next = queue.Peek();
+        _dispatching = true;
         RefreshComposer();
-        await SubmitMessageAsync(next.Text, next.Attachment);
+        try
+        {
+            await SubmitMessageAsync(next.Text, next.Attachment);
+            queue.Dequeue();
+            MarkDraftChanged(sessionId);
+            SaveComposerDrafts();
+        }
+        catch
+        {
+            runtime.QueuePaused = true;
+            throw;
+        }
+        finally
+        {
+            _dispatching = false;
+            RefreshComposer();
+        }
     }
 
-    private async void Send_Click(object? sender, RoutedEventArgs e)
+    private async void Send_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () =>
     {
         if (_busy)
         {
-            await SendAsync(new() { ["op"] = "interrupt" });
+            await PauseAndInterruptAsync();
             return;
         }
         await DispatchComposerAsync();
-    }
+    });
 
-    private async void Composer_KeyDown(object? sender, KeyEventArgs e)
+    private async void Composer_KeyDown(object? sender, KeyEventArgs e) => await RunUiAsync(async () =>
     {
         if (e.Key == Key.Tab && SlashSuggestions.Count > 0)
         {
@@ -1030,10 +1163,11 @@ public sealed partial class MainWindow : Window
         if (e.Key is not (Key.Enter or Key.Return) || e.KeyModifiers.HasFlag(KeyModifiers.Shift)) return;
         e.Handled = true;
         await DispatchComposerAsync();
-    }
+    });
 
     private void Composer_TextChanged(object? sender, TextChangedEventArgs e)
     {
+        CaptureComposerDraft();
         SlashSuggestions.Clear();
         var prefix = Composer.Text?.TrimStart() ?? "";
         if (prefix.StartsWith('/') && !prefix.Any(char.IsWhiteSpace))
@@ -1256,6 +1390,8 @@ public sealed partial class MainWindow : Window
 
     private async Task ExportConversationAsync()
     {
+        FlushStreamingText();
+        var markdown = BuildExportMarkdown();
         var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
         {
             Title = "Export conversation",
@@ -1266,7 +1402,8 @@ public sealed partial class MainWindow : Window
         await using var stream = await file.OpenWriteAsync();
         stream.SetLength(0);
         await using var writer = new StreamWriter(stream, Encoding.UTF8);
-        await writer.WriteAsync(BuildExportMarkdown());
+        await writer.WriteAsync(markdown);
+        await writer.FlushAsync();
         ShowNotice($"Conversation exported to {file.Name}.");
     }
 
@@ -1299,6 +1436,12 @@ public sealed partial class MainWindow : Window
 
     private static string? WorkspacePathFromMessage(string text)
     {
+        // Natural-language workspace detection is intentionally single-line.
+        // Long coding prompts commonly contain words such as "project" and
+        // "change" plus slash separators on unrelated lines; combining those
+        // fragments used to turn a harmless multiline prompt into
+        // set_workspace("/") and therefore a fresh conversation.
+        if (text.Contains('\n') || text.Contains('\r')) return null;
         var lower = text.ToLowerInvariant();
         var namesWorkspace = new[] { "workspace", "folder", "director", "proiect", "directory", "project" }
             .Any(lower.Contains);
@@ -1330,6 +1473,10 @@ public sealed partial class MainWindow : Window
         foreach (var part in text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
         {
             var candidate = part.Trim('"', '\'', '(', ')', '[', ']', '{', '}', ',', ';', ':', '!', '?').TrimEnd('.');
+            // A standalone slash is often prose punctuation ("inherit / current")
+            // rather than an intentional request to use the filesystem root.
+            // `/workspace /` remains available for the real root-workspace case.
+            if (candidate == "/") continue;
             if (LooksLikePath(candidate)) return candidate;
         }
         return null;
@@ -1339,7 +1486,7 @@ public sealed partial class MainWindow : Window
         || value.StartsWith("~/", StringComparison.Ordinal) || value.StartsWith("./", StringComparison.Ordinal)
         || value.StartsWith("../", StringComparison.Ordinal);
 
-    private async void Attach_Click(object? sender, RoutedEventArgs e)
+    private async void Attach_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () =>
     {
         var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
         {
@@ -1356,7 +1503,7 @@ public sealed partial class MainWindow : Window
         });
         if (files.Count == 0) return;
         SetAttachment(files[0]);
-    }
+    });
 
     private void Files_Drop(object? sender, DragEventArgs e)
     {
@@ -1384,6 +1531,7 @@ public sealed partial class MainWindow : Window
     {
         AttachmentBar.IsVisible = _attachments.Count > 0;
         AttachmentText.Text = _attachments.Count == 0 ? "" : $"File · {_attachments[0].Name}";
+        CaptureComposerDraft();
     }
 
     private void RemoveAttachment_Click(object? sender, RoutedEventArgs e)
@@ -1392,24 +1540,24 @@ public sealed partial class MainWindow : Window
         RefreshAttachmentBar();
     }
 
-    private async void NewSession_Click(object? sender, RoutedEventArgs e) => await SendAsync(new() { ["op"] = "new_session" });
+    private async void NewSession_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await SendAsync(new() { ["op"] = "new_session" }));
 
-    private async void ResumeSession_Click(object? sender, RoutedEventArgs e)
+    private async void ResumeSession_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () =>
     {
         if ((sender as Button)?.Tag?.ToString() is { Length: > 0 } id)
             await SendAsync(new() { ["op"] = "resume_session", ["id"] = id });
-    }
+    });
 
-    private async void DeleteSession_Click(object? sender, RoutedEventArgs e)
+    private async void DeleteSession_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () =>
     {
         if ((sender as Button)?.Tag?.ToString() is not { Length: > 0 } id) return;
         if (await ConfirmAsync("Delete conversation", "Delete this saved conversation?"))
             await SendAsync(new() { ["op"] = "delete_session", ["id"] = id });
-    }
+    });
 
-    private async void AllSessions_Click(object? sender, RoutedEventArgs e) => await ShowSessionsAsync();
+    private async void AllSessions_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await ShowSessionsAsync());
 
-    private async void Workspace_Click(object? sender, RoutedEventArgs e) => await ChooseWorkspaceAsync();
+    private async void Workspace_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await ChooseWorkspaceAsync());
 
     private async Task ChooseWorkspaceAsync()
     {
@@ -1423,21 +1571,21 @@ public sealed partial class MainWindow : Window
         await SendAsync(new() { ["op"] = "set_workspace", ["path"] = path });
     }
 
-    private async void Model_Click(object? sender, RoutedEventArgs e) => await ShowModelAsync();
-    private async void Provider_Click(object? sender, RoutedEventArgs e) => await ShowProviderAsync();
-    private async void WhatsApp_Click(object? sender, RoutedEventArgs e) => await ShowWhatsAppConversationsAsync();
-    private async void Nodes_Click(object? sender, RoutedEventArgs e) => await ShowNodesAsync();
-    private async void Settings_Click(object? sender, RoutedEventArgs e) => await ShowSettingsAsync();
+    private async void Model_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await ShowModelAsync());
+    private async void Provider_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await ShowProviderAsync());
+    private async void WhatsApp_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await ShowWhatsAppConversationsAsync());
+    private async void Nodes_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await ShowNodesAsync());
+    private async void Settings_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await ShowSettingsAsync());
     private void Theme_Click(object? sender, RoutedEventArgs e) => ToggleTheme();
-    private async void Help_Click(object? sender, RoutedEventArgs e) => await ShowHelpAsync();
-    private async void Search_Click(object? sender, RoutedEventArgs e) => await SendAsync(new() { ["op"] = "set_web_search", ["enabled"] = !_webSearchEnabled });
+    private async void Help_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await ShowHelpAsync());
+    private async void Search_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await SendAsync(new() { ["op"] = "set_web_search", ["enabled"] = !_webSearchEnabled }));
 
     private void Activity_Click(object? sender, RoutedEventArgs e) => ActivityPane.IsVisible = !ActivityPane.IsVisible;
     private void CloseActivity_Click(object? sender, RoutedEventArgs e) => ActivityPane.IsVisible = false;
-    private async void RefreshDiff_Click(object? sender, RoutedEventArgs e) => await SendAsync(new() { ["op"] = "show_diff" });
-    private async void Skills_Click(object? sender, RoutedEventArgs e) => await SendAsync(new() { ["op"] = "skills_list" });
-    private async void Memory_Click(object? sender, RoutedEventArgs e) => await SendAsync(new() { ["op"] = "memory_show" });
-    private async void Doctor_Click(object? sender, RoutedEventArgs e) => await SendAsync(new() { ["op"] = "doctor" });
+    private async void RefreshDiff_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await SendAsync(new() { ["op"] = "show_diff" }));
+    private async void Skills_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await SendAsync(new() { ["op"] = "skills_list" }));
+    private async void Memory_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await SendAsync(new() { ["op"] = "memory_show" }));
+    private async void Doctor_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await SendAsync(new() { ["op"] = "doctor" }));
 
     private void Suggestion_Click(object? sender, RoutedEventArgs e)
     {
@@ -1446,13 +1594,13 @@ public sealed partial class MainWindow : Window
         Composer.Focus();
     }
 
-    private async void ShowChangesSuggestion_Click(object? sender, RoutedEventArgs e)
+    private async void ShowChangesSuggestion_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () =>
     {
         ActivityPane.IsVisible = true;
         await SendAsync(new() { ["op"] = "show_diff" });
-    }
+    });
 
-    private async void ConfigureWhatsAppSuggestion_Click(object? sender, RoutedEventArgs e) => await ShowWhatsAppSettingsAsync();
+    private async void ConfigureWhatsAppSuggestion_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await ShowWhatsAppSettingsAsync());
 
     private void SessionSearch_TextChanged(object? sender, TextChangedEventArgs e) => RefreshSessionFilter();
 
@@ -1474,7 +1622,7 @@ public sealed partial class MainWindow : Window
         if (e.GetCurrentPoint(this).Properties.IsLeftButtonPressed) BeginMoveDrag(e);
     }
 
-    private async void Window_KeyDown(object? sender, KeyEventArgs e)
+    private async void Window_KeyDown(object? sender, KeyEventArgs e) => await RunUiAsync(async () =>
     {
         if (e.Key == Key.F1)
         {
@@ -1494,14 +1642,14 @@ public sealed partial class MainWindow : Window
         else if (e.Key == Key.OemPeriod && e.KeyModifiers.HasFlag(KeyModifiers.Control) && _busy)
         {
             e.Handled = true;
-            await SendAsync(new() { ["op"] = "interrupt" });
+            await PauseAndInterruptAsync();
         }
         else if (e.Key == Key.Escape && ActivityPane.IsVisible)
         {
             ActivityPane.IsVisible = false;
             e.Handled = true;
         }
-    }
+    });
 
     private async Task ShowProviderAsync()
     {
@@ -1538,7 +1686,7 @@ public sealed partial class MainWindow : Window
 
         providerBox.SelectionChanged += (_, _) => RefreshProviderForm();
         cancel.Click += (_, _) => dialog.Close();
-        apply.Click += async (_, _) =>
+        apply.Click += async (_, _) => await RunUiAsync(async () =>
         {
             var selected = providerBox.SelectedItem as ProviderInfo ?? _providers[0];
             dialog.Close();
@@ -1555,7 +1703,7 @@ public sealed partial class MainWindow : Window
                 };
                 await SendAsync(operation);
             }
-        };
+        });
         RefreshProviderForm();
 
         dialog.Content = DialogLayout("Provider", "Choose an API provider or an official account-backed connection.",
@@ -1597,8 +1745,8 @@ public sealed partial class MainWindow : Window
             await SendAsync(new() { ["op"] = "set_model", ["model"] = model });
         }
         cancel.Click += (_, _) => dialog.Close();
-        use.Click += async (_, _) => await UseSelectedAsync();
-        list.DoubleTapped += async (_, _) => await UseSelectedAsync();
+        use.Click += async (_, _) => await RunUiAsync(async () => await UseSelectedAsync());
+        list.DoubleTapped += async (_, _) => await RunUiAsync(async () => await UseSelectedAsync());
         Refresh();
         dialog.Content = DialogLayout("Model", _models.Count == 0
                 ? "No provider model list is available. Enter /model MODEL in the composer."
@@ -1628,28 +1776,30 @@ public sealed partial class MainWindow : Window
         var fresh = new Button { Content = "New conversation" };
         var close = new Button { Content = "Close" };
 
-        resume.Click += async (_, _) =>
+        resume.Click += async (_, _) => await RunUiAsync(async () =>
         {
             if (list.SelectedItem is not SessionItem session) return;
             dialog.Close();
             await SendAsync(new() { ["op"] = "resume_session", ["id"] = session.Id });
-        };
-        rename.Click += async (_, _) =>
+        });
+        rename.Click += async (_, _) => await RunUiAsync(async () =>
         {
             if (list.SelectedItem is not SessionItem session) return;
             var title = await PromptAsync("Rename conversation", "Conversation title", session.Title);
             if (title is null) return;
             await SendAsync(new() { ["op"] = "rename_session", ["id"] = session.Id, ["title"] = title.Trim() });
             dialog.Close();
-        };
-        delete.Click += async (_, _) =>
+        });
+        delete.Click += async (_, _) => await RunUiAsync(async () =>
         {
             if (list.SelectedItem is not SessionItem session || !await ConfirmAsync("Delete conversation", $"Delete “{session.Title}”?")) return;
             await SendAsync(new() { ["op"] = "delete_session", ["id"] = session.Id });
             dialog.Close();
-        };
-        fork.Click += async (_, _) => { dialog.Close(); await SendAsync(new() { ["op"] = "fork_session" }); };
-        fresh.Click += async (_, _) => { dialog.Close(); await SendAsync(new() { ["op"] = "new_session" }); };
+        });
+        fork.Click += async (_, _) => await RunUiAsync(async () =>
+        { dialog.Close(); await SendAsync(new() { ["op"] = "fork_session" }); });
+        fresh.Click += async (_, _) => await RunUiAsync(async () =>
+        { dialog.Close(); await SendAsync(new() { ["op"] = "new_session" }); });
         close.Click += (_, _) => dialog.Close();
 
         var actions = new WrapPanel { Orientation = Orientation.Horizontal, ItemWidth = double.NaN };
@@ -1681,6 +1831,119 @@ public sealed partial class MainWindow : Window
             connectionActions.Children.Add(button);
         }
         content.Children.Add(Surface(connectionActions));
+        var reasoningLevels = new[] { "default", "low", "medium", "high", "xhigh", "max" };
+        var mainReasoning = new ComboBox
+        {
+            ItemsSource = reasoningLevels,
+            SelectedItem = reasoningLevels.Contains(_reasoningEffort) ? _reasoningEffort : "default",
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+        };
+        content.Children.Add(Surface(new StackPanel
+        {
+            Spacing = 6,
+            Children =
+            {
+                Labeled("Reasoning effort", mainReasoning),
+                MutedText("Default leaves the provider/model default unchanged. Explicit effort is applied when the selected provider supports it."),
+            },
+        }));
+
+        content.Children.Add(Section("DELEGATED WORKERS"));
+        var workerEnabled = new CheckBox
+        {
+            Content = "Use a different provider/model for subagents",
+            IsChecked = _subagentUseSeparateModel,
+        };
+        var workerProviders = new List<ProviderInfo>
+        {
+            new()
+            {
+                Id = "inherit",
+                Name = "Inherit from main agent",
+                Auth = "inherit",
+                DefaultModel = "inherit",
+                Description = "Keep the root agent provider.",
+            },
+        };
+        workerProviders.AddRange(_providers.Where(provider => provider.Auth != "account"));
+        var workerProvider = new ComboBox
+        {
+            ItemsSource = workerProviders,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            SelectedItem = workerProviders.FirstOrDefault(provider => provider.Id == _subagentProviderId)
+                ?? workerProviders[0],
+        };
+        var workerModel = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch };
+        var workerReasoning = new ComboBox
+        {
+            ItemsSource = reasoningLevels,
+            SelectedItem = reasoningLevels.Contains(_subagentReasoningEffort) ? _subagentReasoningEffort : "default",
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+        };
+        var workerNote = MutedText("Normal Agent delegations use this worker only when they omit provider_id and model. Explicit Agent overrides still win.");
+        var workerModelStatus = MutedText("");
+        var workerFields = new StackPanel
+        {
+            Spacing = 7,
+            Children =
+            {
+                Labeled("Provider", workerProvider),
+                Labeled("Model", workerModel),
+                Labeled("Reasoning effort", workerReasoning),
+                workerModelStatus,
+                MutedText("Dedicated workers use API providers with credentials already saved in Provider settings. Account-backed providers remain root-only."),
+            },
+        };
+
+        void RefreshWorkerEnabled()
+        {
+            workerFields.IsEnabled = workerEnabled.IsChecked == true;
+            workerFields.Opacity = workerFields.IsEnabled ? 1.0 : 0.55;
+        }
+
+        async Task RefreshWorkerModelsAsync(bool preserveConfiguredModel)
+        {
+            var selected = workerProvider.SelectedItem as ProviderInfo ?? workerProviders[0];
+            var rows = new List<string> { "inherit" };
+            workerModelStatus.Text = "";
+            if (selected.Id == "inherit")
+            {
+                rows.AddRange(_models);
+            }
+            else
+            {
+                try
+                {
+                    var response = await PostWhatsAppAsync("/api/models", new { provider_id = selected.Id });
+                    if (response.HasValue && response.Value.ValueKind == JsonValueKind.Array)
+                        rows.AddRange(response.Value.EnumerateArray()
+                            .Where(item => item.ValueKind == JsonValueKind.String)
+                            .Select(item => item.GetString() ?? "")
+                            .Where(model => model.Length > 0));
+                }
+                catch (Exception error)
+                {
+                    workerModelStatus.Text = $"Could not refresh models: {error.Message}";
+                }
+                if (!string.IsNullOrWhiteSpace(selected.DefaultModel)) rows.Add(selected.DefaultModel);
+            }
+            rows = rows.Distinct(StringComparer.Ordinal).ToList();
+            var desired = preserveConfiguredModel ? _subagentModel : "inherit";
+            if (!string.IsNullOrWhiteSpace(desired) && !rows.Contains(desired, StringComparer.Ordinal))
+                rows.Insert(1, desired);
+            workerModel.ItemsSource = rows;
+            workerModel.SelectedItem = rows.Contains(desired, StringComparer.Ordinal) ? desired : "inherit";
+        }
+
+        workerEnabled.IsCheckedChanged += (_, _) => RefreshWorkerEnabled();
+        workerProvider.SelectionChanged += async (_, _) => await RunUiAsync(async () => await RefreshWorkerModelsAsync(false));
+        RefreshWorkerEnabled();
+        await RefreshWorkerModelsAsync(true);
+        content.Children.Add(Surface(new StackPanel
+        {
+            Spacing = 8,
+            Children = { workerEnabled, workerFields, workerNote },
+        }));
 
         content.Children.Add(Section("MCP SERVERS"));
         content.Children.Add(MutedText("Generic Streamable HTTP and stdio servers. MCP calls remain approval-gated, including for delegated providers."));
@@ -1764,7 +2027,7 @@ public sealed partial class MainWindow : Window
         var footer = ButtonRow(save, close);
         content.Children.Add(footer);
         close.Click += (_, _) => dialog.Close();
-        save.Click += async (_, _) =>
+        save.Click += async (_, _) => await RunUiAsync(async () =>
         {
             dialog.Close();
             _notifications = notifications.IsChecked == true;
@@ -1785,8 +2048,20 @@ public sealed partial class MainWindow : Window
                     ["bind"] = hubBind.Text?.Trim() ?? "0.0.0.0",
                     ["port"] = port,
                 });
+            var requestedReasoning = mainReasoning.SelectedItem?.ToString() ?? "default";
+            if (!string.Equals(requestedReasoning, _reasoningEffort, StringComparison.Ordinal))
+                await SendAsync(new() { ["op"] = "set_reasoning_effort", ["effort"] = requestedReasoning });
+            var selectedWorkerProvider = workerProvider.SelectedItem as ProviderInfo ?? workerProviders[0];
+            await SendAsync(new()
+            {
+                ["op"] = "set_subagent_defaults",
+                ["enabled"] = workerEnabled.IsChecked == true,
+                ["provider_id"] = selectedWorkerProvider.Id,
+                ["model"] = workerModel.SelectedItem?.ToString() ?? "inherit",
+                ["reasoning_effort"] = workerReasoning.SelectedItem?.ToString() ?? "default",
+            });
             await SendAsync(new() { ["op"] = "set_mcp_servers", ["servers"] = workingServers });
-        };
+        });
 
         dialog.Content = new ScrollViewer { Content = content, VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto };
         dialog.Opened += (_, _) => { if (focusSearch) search.Focus(); };
@@ -1982,9 +2257,9 @@ public sealed partial class MainWindow : Window
             catch (Exception error) { status.Text = $"WhatsApp is unavailable: {error.Message}"; }
         }
 
-        list.SelectionChanged += async (_, _) => await LoadSelectedAsync();
-        refresh.Click += async (_, _) => await LoadChatsAsync();
-        settings.Click += async (_, _) => await ShowWhatsAppSettingsAsync();
+        list.SelectionChanged += async (_, _) => await RunUiAsync(async () => await LoadSelectedAsync());
+        refresh.Click += async (_, _) => await RunUiAsync(async () => await LoadChatsAsync());
+        settings.Click += async (_, _) => await RunUiAsync(async () => await ShowWhatsAppSettingsAsync());
         close.Click += (_, _) => dialog.Close();
 
         var header = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto,Auto,Auto"), ColumnSpacing = 7 };
@@ -2010,7 +2285,7 @@ public sealed partial class MainWindow : Window
             Children = { header, chatPanel },
         };
         Grid.SetRow(chatPanel, 1);
-        dialog.Opened += async (_, _) => await LoadChatsAsync();
+        dialog.Opened += async (_, _) => await RunUiAsync(async () => await LoadChatsAsync());
         await dialog.ShowDialog(this);
     }
 
@@ -2054,17 +2329,26 @@ public sealed partial class MainWindow : Window
         };
         var qrImage = new Image { Width = 280, Height = 280, Stretch = Stretch.Uniform, IsVisible = false, HorizontalAlignment = HorizontalAlignment.Left };
         var qrNote = MutedText("");
+        var actionFeedback = MutedText("");
+        var dialogClosed = false;
+        var refreshingStatus = false;
+        var actionInProgress = false;
+        var lastQr = "";
+        Bitmap? qrBitmap = null;
+        var statusTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
         var testJid = new TextBox { Watermark = "40700000000@s.whatsapp.net" };
         var testMessage = new TextBox { AcceptsReturn = true, MinHeight = 70, Watermark = "Test message" };
         var log = new TextBox { IsReadOnly = true, AcceptsReturn = true, TextWrapping = TextWrapping.NoWrap, MinHeight = 120, FontFamily = new FontFamily("monospace") };
 
         async Task RefreshStatusAsync()
         {
+            if (dialogClosed || refreshingStatus) return;
+            refreshingStatus = true;
             try
             {
                 var payload = await GetWhatsAppJsonAsync("/api/whatsapp/status");
                 _whatsappStatus = payload;
-                if (payload is null) return;
+                if (payload is null || dialogClosed) return;
                 var running = Bool(payload.Value, "bridge_running");
                 var authenticated = Bool(payload.Value, "authenticated");
                 var connected = Bool(payload.Value, "connected");
@@ -2076,10 +2360,22 @@ public sealed partial class MainWindow : Window
                 var qr = String(payload.Value, "qr");
                 qrImage.IsVisible = qr.Length > 0 && !connected;
                 qrNote.Text = qrImage.IsVisible ? "Scan this code in WhatsApp → Linked devices." : connected ? "WhatsApp is connected." : "No pairing QR is available yet.";
-                if (qrImage.IsVisible) qrImage.Source = CreateQrBitmap(qr);
+                var visibleQr = qrImage.IsVisible ? qr : "";
+                if (visibleQr != lastQr)
+                {
+                    var nextBitmap = visibleQr.Length == 0 ? null : CreateQrBitmap(visibleQr);
+                    qrImage.Source = nextBitmap;
+                    qrBitmap?.Dispose();
+                    qrBitmap = nextBitmap;
+                    lastQr = visibleQr;
+                }
                 log.Text = ReadLogTail(_whatsapp.LogFile, 12 * 1024);
             }
-            catch (Exception error) { status.Text = $"WhatsApp is unavailable: {error.Message}"; }
+            catch (Exception error)
+            {
+                if (!dialogClosed) status.Text = $"WhatsApp is unavailable: {error.Message}";
+            }
+            finally { refreshingStatus = false; }
         }
 
         var save = AccentButton("Save and apply");
@@ -2091,7 +2387,31 @@ public sealed partial class MainWindow : Window
         var sendTest = new Button { Content = "Send test message" };
         var close = new Button { Content = "Close" };
 
-        save.Click += async (_, _) =>
+        async Task RunConnectionActionAsync(Func<Task> action)
+        {
+            if (dialogClosed || actionInProgress) return;
+            actionInProgress = true;
+            var buttons = new[] { save, stop, restart, newQr, refresh, sendTest };
+            foreach (var button in buttons) button.IsEnabled = false;
+            actionFeedback.Text = "Working…";
+            try
+            {
+                await action();
+                if (!dialogClosed && actionFeedback.Text == "Working…") actionFeedback.Text = "Done.";
+            }
+            catch (Exception error)
+            {
+                if (!dialogClosed) actionFeedback.Text = $"The action failed: {error.Message}. You can try again.";
+            }
+            finally
+            {
+                actionInProgress = false;
+                if (!dialogClosed)
+                    foreach (var button in buttons) button.IsEnabled = true;
+            }
+        }
+
+        save.Click += async (_, _) => await RunConnectionActionAsync(async () =>
         {
             var jids = Lines(allowed.Text).Distinct(StringComparer.Ordinal).OrderBy(value => value, StringComparer.Ordinal).ToList();
             await SendAsync(new()
@@ -2102,39 +2422,44 @@ public sealed partial class MainWindow : Window
                 ["has_own_number"] = ownNumber.IsChecked == true,
                 ["allowed_jids"] = jids,
             });
-            status.Text = "Saving settings…";
-        };
-        stop.Click += async (_, _) => await SendAsync(new()
+            actionFeedback.Text = "Settings submitted.";
+        });
+        stop.Click += async (_, _) => await RunConnectionActionAsync(() => SendAsync(new()
         {
             ["op"] = "set_whatsapp", ["enabled"] = false,
             ["assistant_name"] = assistantName.Text?.Trim() ?? "GnomeAI",
             ["has_own_number"] = ownNumber.IsChecked == true,
             ["allowed_jids"] = Lines(allowed.Text),
-        });
-        restart.Click += async (_, _) => { await PostWhatsAppAsync("/api/whatsapp/reload"); await RefreshStatusAsync(); };
-        newQr.Click += async (_, _) =>
+        }));
+        restart.Click += async (_, _) => await RunConnectionActionAsync(async () =>
         {
-            status.Text = "Generating a new QR code…";
-            await PostWhatsAppAsync("/api/whatsapp/qr/refresh");
-            await Task.Delay(900);
+            await PostWhatsAppAsync("/api/whatsapp/reload");
             await RefreshStatusAsync();
-        };
-        refresh.Click += async (_, _) => await RefreshStatusAsync();
-        conversations.Click += async (_, _) => await ShowWhatsAppConversationsAsync();
-        sendTest.Click += async (_, _) =>
+        });
+        newQr.Click += async (_, _) => await RunConnectionActionAsync(async () =>
+        {
+            actionFeedback.Text = "Generating a new QR code…";
+            await PostWhatsAppAsync("/api/whatsapp/qr/refresh");
+            actionFeedback.Text = "Pairing requested. The QR code will update automatically.";
+            await RefreshStatusAsync();
+        });
+        refresh.Click += async (_, _) => await RunUiAsync(async () => await RefreshStatusAsync());
+        conversations.Click += async (_, _) => await RunUiAsync(async () => await ShowWhatsAppConversationsAsync());
+        sendTest.Click += async (_, _) => await RunConnectionActionAsync(async () =>
         {
             if (string.IsNullOrWhiteSpace(testJid.Text) || string.IsNullOrWhiteSpace(testMessage.Text))
             {
-                status.Text = "Enter the recipient JID and test message.";
+                actionFeedback.Text = "Enter the recipient JID and test message.";
                 return;
             }
             await SendWhatsAppTestAsync(testJid.Text.Trim(), testMessage.Text.Trim());
-            status.Text = "The test message was queued.";
+            actionFeedback.Text = "The test message was queued.";
             testMessage.Clear();
-        };
+        });
         close.Click += (_, _) => dialog.Close();
 
         body.Children.Add(status);
+        body.Children.Add(actionFeedback);
         body.Children.Add(ButtonRow(refresh, conversations));
         body.Children.Add(Section("CONNECTION"));
         body.Children.Add(enabled);
@@ -2154,7 +2479,19 @@ public sealed partial class MainWindow : Window
         body.Children.Add(log);
         body.Children.Add(ButtonRow(close));
         dialog.Content = new ScrollViewer { Content = body, VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto };
-        dialog.Opened += async (_, _) => await RefreshStatusAsync();
+        dialog.Opened += async (_, _) => await RunUiAsync(async () => await RefreshStatusAsync());
+        statusTimer.Tick += async (_, _) => await RunUiAsync(async () =>
+        {
+            if (!actionInProgress) await RefreshStatusAsync();
+        });
+        dialog.Opened += (_, _) => statusTimer.Start();
+        dialog.Closed += (_, _) =>
+        {
+            dialogClosed = true;
+            statusTimer.Stop();
+            qrImage.Source = null;
+            qrBitmap?.Dispose();
+        };
         await dialog.ShowDialog(this);
     }
 
@@ -2199,9 +2536,9 @@ public sealed partial class MainWindow : Window
             catch (Exception error) { nodesHost.Children.Add(MutedText($"Cannot load devices: {error.Message}")); }
         }
 
-        refresh.Click += async (_, _) => await RefreshNodesAsync();
-        copyNormal.Click += async (_, _) => await CopyTextAsync(normalCommand);
-        copyRoot.Click += async (_, _) => await CopyTextAsync(rootCommand);
+        refresh.Click += async (_, _) => await RunUiAsync(async () => await RefreshNodesAsync());
+        copyNormal.Click += async (_, _) => await RunUiAsync(async () => await CopyTextAsync(normalCommand));
+        copyRoot.Click += async (_, _) => await RunUiAsync(async () => await CopyTextAsync(rootCommand));
         close.Click += (_, _) => dialog.Close();
         body.Children.Add(status);
         body.Children.Add(ButtonRow(refresh, close));
@@ -2219,7 +2556,7 @@ public sealed partial class MainWindow : Window
         body.Children.Add(Section("PAIRED DEVICES"));
         body.Children.Add(nodesHost);
         dialog.Content = new ScrollViewer { Content = body, VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto };
-        dialog.Opened += async (_, _) => await RefreshNodesAsync();
+        dialog.Opened += async (_, _) => await RunUiAsync(async () => await RefreshNodesAsync());
         await dialog.ShowDialog(this);
     }
 
@@ -2233,12 +2570,12 @@ public sealed partial class MainWindow : Window
         };
         var apply = new Button { Content = "Apply policy" };
         var feedback = MutedText(node.RootAvailable ? "Local root is available" : "Local root is unavailable");
-        apply.Click += async (_, _) =>
+        apply.Click += async (_, _) => await RunUiAsync(async () =>
         {
             await NodeRequestAsync(HttpMethod.Post, $"/v1/nodes/{Uri.EscapeDataString(node.Id)}/policy",
                 new { policy = policy.SelectedItem?.ToString() ?? "ask" });
             feedback.Text = "Root policy was updated.";
-        };
+        });
         var title = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto"), ColumnSpacing = 8 };
         title.Children.Add(new TextBlock { Text = $"{(node.Online ? "●" : "○")} {node.Name}", FontWeight = FontWeight.SemiBold });
         var platform = MutedText(node.Platform); Grid.SetColumn(platform, 1); title.Children.Add(platform);
@@ -2321,9 +2658,10 @@ public sealed partial class MainWindow : Window
     {
         using var generator = new QRCodeGenerator();
         using var data = generator.CreateQrCode(payload, QRCodeGenerator.ECCLevel.Q);
-        var qr = new PngByteQRCode(data);
+        using var qr = new PngByteQRCode(data);
         var bytes = qr.GetGraphic(8);
-        return new Bitmap(new MemoryStream(bytes));
+        using var stream = new MemoryStream(bytes);
+        return new Bitmap(stream);
     }
 
     private static string ReadLogTail(string path, int limit)
@@ -2331,9 +2669,18 @@ public sealed partial class MainWindow : Window
         try
         {
             if (!File.Exists(path)) return "The log is empty.";
-            var bytes = File.ReadAllBytes(path);
-            var start = Math.Max(0, bytes.Length - limit);
-            return Encoding.UTF8.GetString(bytes, start, bytes.Length - start);
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var length = (int)Math.Min(stream.Length, Math.Max(0, limit));
+            stream.Seek(-length, SeekOrigin.End);
+            var bytes = new byte[length];
+            var read = 0;
+            while (read < length)
+            {
+                var count = stream.Read(bytes, read, length - read);
+                if (count == 0) break;
+                read += count;
+            }
+            return Encoding.UTF8.GetString(bytes, 0, read);
         }
         catch (Exception error) { return $"Cannot read the log: {error.Message}"; }
     }
@@ -2534,10 +2881,10 @@ public sealed partial class MainWindow : Window
         return button;
     }
 
-    private static Button ActionButton(string text, Func<Task> action)
+    private Button ActionButton(string text, Func<Task> action)
     {
         var button = new Button { Content = text };
-        button.Click += async (_, _) => await action();
+        button.Click += async (_, _) => await RunUiAsync(async () => await action());
         return button;
     }
 
@@ -2558,6 +2905,9 @@ public sealed partial class MainWindow : Window
     {
         public bool Busy { get; set; }
         public bool NeedsAttention { get; set; }
+        public bool QueuePaused { get; set; }
+        public bool DraftLoaded { get; set; }
+        public ComposerDraft Draft { get; set; } = ComposerDraft.Empty;
         public Queue<QueuedSubmission> Queue { get; } = new();
         public List<BufferedSessionEvent> LiveEvents { get; } = [];
     }
@@ -2569,5 +2919,4 @@ public sealed partial class MainWindow : Window
         public StringBuilder Text { get; } = new(text);
     }
 
-    private sealed record QueuedSubmission(string Text, AttachedFile? Attachment);
 }

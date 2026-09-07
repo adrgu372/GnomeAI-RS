@@ -15,7 +15,7 @@ the desktop window is closed.
 Never start GnomeAI-RS with sudo. Install-time elevation does not change the
 per-user runtime at `${XDG_STATE_HOME:-$HOME/.local/state}/gnomeai-rs`.
 
-The package already contains Microsoft .NET SDK 8.0.424 in
+The package already contains Microsoft .NET SDK 10.0.400 in
 `/usr/lib/gnomeai-rs/dotnet`; no external .NET package repository is needed.
 
 Optional provider integrations:

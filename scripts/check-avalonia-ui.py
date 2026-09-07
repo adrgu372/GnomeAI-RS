@@ -33,7 +33,7 @@ def main() -> None:
         fail(f"invalid XAML/XML: {error}")
 
     xaml = XAML.read_text(encoding="utf-8")
-    code = CODE.read_text(encoding="utf-8")
+    code = "\n".join(path.read_text(encoding="utf-8") for path in sorted(UI.glob("MainWindow*.cs")))
     models = (UI / "Models.cs").read_text(encoding="utf-8")
     markdown = (UI / "MarkdownView.cs").read_text(encoding="utf-8")
     bridge = (UI / "AgentBridge.cs").read_text(encoding="utf-8")

@@ -22,7 +22,9 @@ version="$(cargo metadata --no-deps --format-version 1 \
 
 output_dir="${GNOMEAI_OUTPUT_DIR:-$project_root/dist}"
 binary_dir="${GNOMEAI_BIN_DIR:-$project_root/target/release}"
-codex_version="0.145.0"
+codex_version="0.153.4"
+codex_target="aarch64-apple-darwin"
+codex_package_sha256="35438da1fbf7a6db7ddb3bcec84448fa6015ba188461472a97d9d1da7d9c4353"
 package_name="GnomeAI-RS-${version}-macos-arm64"
 app_identity="${GNOMEAI_APP_SIGN_IDENTITY:--}"
 installer_identity="${GNOMEAI_INSTALLER_SIGN_IDENTITY:-}"
@@ -145,17 +147,22 @@ if [[ -n "${GNOMEAI_CODEX_DIR:-}" ]]; then
     }
     cp -a "$GNOMEAI_CODEX_DIR/." "$resources_root/codex/"
 else
-    (
-        cd "$build_root"
-        npm --cache "$npm_cache" pack \
-            "@openai/codex@${codex_version}-darwin-arm64" --silent >/dev/null
-    )
-    codex_archive="$build_root/openai-codex-${codex_version}-darwin-arm64.tgz"
+    codex_archive_name="codex-package-${codex_target}.tar.gz"
+    codex_archive="$build_root/$codex_archive_name"
+    curl --fail --location --retry 3 \
+        --output "$codex_archive" \
+        "https://github.com/openai/codex/releases/download/rust-v${codex_version}/${codex_archive_name}"
+    printf '%s  %s\n' "$codex_package_sha256" "$codex_archive" | shasum -a 256 -c -
     mkdir -p "$build_root/codex-extract"
     tar -xzf "$codex_archive" -C "$build_root/codex-extract"
-    codex_vendor="$build_root/codex-extract/package/vendor/aarch64-apple-darwin"
+    codex_package_json="$(find "$build_root/codex-extract" -type f -name codex-package.json -print -quit)"
+    [[ -n "$codex_package_json" ]] || {
+        echo "Official Codex arm64 package does not contain codex-package.json." >&2
+        exit 1
+    }
+    codex_vendor="$(dirname "$codex_package_json")"
     [[ -x "$codex_vendor/bin/codex" ]] || {
-        echo "Official Codex arm64 binary was not found in npm package." >&2
+        echo "Official Codex arm64 binary was not found in release package." >&2
         exit 1
     }
     cp -a "$codex_vendor/." "$resources_root/codex/"

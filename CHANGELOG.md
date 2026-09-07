@@ -1,7 +1,33 @@
-# Unreleased
+# GnomeAI-RS 2.4.0 - 2026-09-07
+
+## Draft recovery and desktop reliability
+
+- Save unsent text, attachment references, caret position and queued messages
+  separately for each conversation. Drafts use debounced, atomic, private
+  local files and are restored when their conversation is reopened.
+- Restore queued messages in a paused state. Stop also pauses the queue;
+  Resume queue and Clear queue provide explicit control over pending work.
+- Keep the composer intact when dispatch fails, check missing attachments,
+  prevent overlapping submissions, and remove queue items only after writing
+  their operation to the core. Finish the previous turn's runtime state before
+  starting the next queued turn.
+- Guard asynchronous UI event handlers so failed HTTP requests, clipboard
+  operations, file pickers and bridge writes show an error in the window.
+- Keep the transcript available for copying/export when the Rust connection
+  closes. Deliver buffered events before announcing EOF and skip malformed
+  protocol lines without abandoning the rest of the stream.
+- Refresh WhatsApp pairing status automatically while its settings window is
+  open, serialize connection actions and display their errors in that dialog.
+  Reuse QR bitmaps until their content changes and dispose them on close.
+- Read only the requested tail of the WhatsApp log, instead of loading the
+  entire file, and capture Markdown exports before the save dialog opens.
 
 ## Avalonia desktop frontend
 
+- Updated bundled third-party integration pins to OpenAI Codex 0.153.4, Firecrawl v2.11.302 and Microsoft .NET SDK 10.0.400 / `net10.0`.
+- Added GPT-6 Astra (`gpt-6-astra`) and Claude Fable 5.1 (`claude-fable-5-1`) model entries plus persisted main/worker reasoning-effort controls (`default`, `low`, `medium`, `high`, `xhigh`, `max`).
+- Added Avalonia settings for a default delegated-worker provider, model and reasoning effort; explicit `Agent` provider/model arguments still override those defaults.
+- Prevented multiline coding prompts from being misread as natural-language workspace changes, including the previous standalone `/` false positive that could switch to the filesystem root and appear to open another conversation.
 - Make command-approval feedback explicit: choosing Allow once, Always allow
   or Deny immediately removes all decision buttons, records the selected state
   on the card and prevents duplicate/conflicting submissions.
@@ -10,10 +36,10 @@
   while the UI and service share a private stable per-user loopback token.
 - Reuse the application path retained by `AppPaths` when creating that token,
   avoiding a moved-`PathBuf` compilation failure in `gnomef-whatsapp`.
-- Download the pinned Microsoft .NET SDK 8.0.424 Linux x64 archive directly
+- Download the pinned Microsoft .NET SDK 10.0.400 Linux x64 archive directly
   during Debian packaging, verify its official SHA-512 and bundle the complete
   SDK privately in the `.deb`. The installed package no longer depends on a
-  Microsoft APT repository or a separately installed `dotnet-sdk-8.0` package.
+  Microsoft APT repository or a separately installed `dotnet-sdk-10.0` package.
 - Route transcript wheel input through the outer ScrollViewer and render chat
   text with SelectableTextBlock instead of nested read-only TextBox scrollers,
   preventing mouse-wheel input from terminating the Avalonia process.
@@ -40,7 +66,7 @@
   turns when the foreground conversation changes workspace. Sensitive approval
   and sudo interactions remain serialized so replies cannot cross sessions.
 - Removed the `eframe` and `egui` dependencies; the Rust executable stays the
-  sole core and packaging builds the Avalonia .NET 8 UI with its private SDK.
+  sole core and packaging builds the Avalonia .NET 10 UI with its private SDK.
 - Restored feature parity with the previous native window: every slash command,
   session rename/delete/fork flow, provider and model selection, MCP editor,
   memory and skill tools, transcript search/export, activity/diff pane,

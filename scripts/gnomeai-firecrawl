@@ -12,11 +12,11 @@ RABBIT_CONTAINER=gnomeai-firecrawl-rabbitmq
 POSTGRES_CONTAINER=gnomeai-firecrawl-postgres
 PLAYWRIGHT_CONTAINER=gnomeai-firecrawl-playwright
 
-# Official public Firecrawl images, pinned to the linux/amd64 manifests used
-# when this package was assembled. The complete matching source is distributed
-# beside the package documentation.
-API_IMAGE=ghcr.io/firecrawl/firecrawl@sha256:14baa3de4ed7636524359e21b01a86e5042997ab384eec5b1d77f5e1342d1222
-PLAYWRIGHT_IMAGE=ghcr.io/firecrawl/playwright-service@sha256:bd504f4f1068bbba36599bea38f4971d4d2e6b09a030a8b19baf0021ddbaedbc
+# Official public Firecrawl images, pinned to an immutable API build/tag and
+# linux/amd64 image digests. Matching upstream source is identified precisely
+# in the packaged Firecrawl SOURCE.txt.
+API_IMAGE=ghcr.io/firecrawl/firecrawl:sha-e3b72346c282-linux-amd64
+PLAYWRIGHT_IMAGE=ghcr.io/firecrawl/playwright-service@sha256:5cd4c2590eebcb8e0932553187d36ab7e76249165712b2bdbae6438b0b033d40
 POSTGRES_IMAGE=ghcr.io/firecrawl/nuq-postgres@sha256:4ca6718b2cef40404b046db5cd37ae45db3e44d1a5750c80522f3587a5b193d5
 REDIS_IMAGE=docker.io/library/redis:7-alpine
 RABBIT_IMAGE=docker.io/library/rabbitmq:3.13-management-alpine

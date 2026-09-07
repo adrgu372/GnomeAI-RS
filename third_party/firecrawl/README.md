@@ -8,16 +8,15 @@ binds the API only to `127.0.0.1:3002`.
 Upstream source:
 
 - Project: <https://github.com/firecrawl/firecrawl>
-- Version: `v2.11.134`
-- Commit: `4f8c82f0762ccd9614ef45de80c74457b21b24f8`
+- Version: `v2.11.302`
+- Commit: `e3b72346c28224dd8f0673224cf90f692b0c3964`
 - License: GNU Affero General Public License 3.0
-- Source archive: `firecrawl-v2.11.134.tar.gz`
-- Source SHA-256:
-  `62c3fd48e01c766b17eb437eb53c3edef4f17eba277c61c4f9984658aaaeeee5`
+- Canonical source tag: <https://github.com/firecrawl/firecrawl/tree/v2.11.302>
 
-The source archive is an unmodified snapshot of the upstream tag. GnomeAI-RS
-does not modify Firecrawl itself; its own launcher and integration code remain
-part of the GnomeAI-RS source tree.
+GnomeAI-RS does not modify Firecrawl itself. `SOURCE.txt` records the exact
+upstream tag and commit corresponding to the pinned API build. The previous
+v2.11.134 source tarball was removed rather than leaving a stale vendor copy in
+the source tree.
 
 The first Web Search use downloads the pinned images into the current user's
 rootless Podman storage. Image layers are not embedded in the `.deb`, because

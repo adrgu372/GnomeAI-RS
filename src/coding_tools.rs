@@ -8,10 +8,11 @@
 //! Output sizing is centralised: the model sees a bounded head/tail preview and
 //! can retrieve the complete stored result with `read_tool_output`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -25,7 +26,10 @@ use crate::privilege::{PrivilegeBroker, command_requests_privilege};
 use crate::provider::ToolSpec;
 use crate::sandbox::{SandboxMode, SandboxPolicy, spawn_sandboxed_with_cancel};
 use crate::skills;
-use crate::tooling::{FilePatch, Registry, Tool, ToolDefinition, ToolOutcome, ToolOutputStore};
+use crate::tooling::{
+    ApprovalRequirement, FilePatch, Registry, Tool, ToolConcurrency, ToolDefinition, ToolEffect,
+    ToolOutcome, ToolOutputStore,
+};
 
 const MAX_TOOL_OUTPUT: usize = 16 * 1024;
 const MAX_READ_LINES: usize = 800;
@@ -74,6 +78,12 @@ pub fn build_system_prompt(root: &Path) -> String {
          them. Inspect the list before choosing a node. Remote root is a\n\
          separate, centrally controlled permission and never follows ordinary\n\
          full-access automatically.\n\
+         For complex or tool-heavy work, use `agent` to delegate a focused\n\
+         task to an isolated subagent. Omit provider_id and model for normal\n\
+         delegation so the provider/model selected under Settings > Delegated\n\
+         Workers is used. Supply either field only for an intentional one-off\n\
+         override. Review the returned work before giving the user the final\n\
+         answer.\n\
          Use `learn_skill` only when the user explicitly asks to retain a\n\
          reusable workflow. Learning stores instructions and an optional POSIX\n\
          shell entrypoint; it never runs it. Use `run_skill` as a separate\n\
@@ -1307,6 +1317,235 @@ impl Tool for NodeTool {
 }
 
 // ---------------------------------------------------------------------------
+// delegated subagent
+// ---------------------------------------------------------------------------
+
+/// Bridge the native coding agent to the mature subagent runtime hosted by
+/// the private loopback companion. That runtime already owns provider-scoped
+/// credentials, depth/concurrency limits, task history and the tool loop, so
+/// the desktop agent only has to launch a worker and wait for its durable
+/// result.
+pub struct AgentTool {
+    pub native_api_base: String,
+    pub native_api_token: String,
+}
+
+#[async_trait::async_trait]
+impl Tool for AgentTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            spec: ToolSpec {
+                name: "agent".into(),
+                description: "Delegate a focused task to an isolated subagent. Omit provider_id and model to use the Delegated Workers defaults from Settings; provide them only for a one-off override. The call waits for the worker and returns its result.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "description": {
+                            "type": "string",
+                            "description": "Short label for the delegated task."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "Complete task and context for the isolated worker."
+                        },
+                        "subagent_type": {
+                            "type": "string",
+                            "enum": ["general-purpose", "Explore", "Plan"],
+                            "description": "Explore and Plan are read-only; general-purpose can implement changes."
+                        },
+                        "provider_id": {
+                            "type": "string",
+                            "description": "Optional provider override. Omit to use the Settings default; explicit inherit keeps legacy inheritance."
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Optional model override. Omit to use the Settings default."
+                        }
+                    },
+                    "required": ["description", "prompt"],
+                    "additionalProperties": false
+                }),
+            },
+            // The helper may write the workspace and run user-level commands.
+            // ExternalWrite also makes read-only mode reject delegation before
+            // a worker starts.
+            effects: vec![ToolEffect::ExternalWrite, ToolEffect::UserProcess],
+            concurrency: ToolConcurrency::Parallel,
+            // Standard keeps normal/full-access behavior consistent with local
+            // shell/write tools. Registry::external_specs exposes this one
+            // Standard tool to account-backed coding runtimes as a dynamic
+            // delegated tool as well.
+            approval: ApprovalRequirement::Standard,
+        }
+    }
+
+    async fn call(&self, args: Value, cancel: &CancellationToken) -> Result<ToolOutcome> {
+        let prompt = args["prompt"].as_str().unwrap_or_default().trim();
+        if prompt.is_empty() {
+            return Ok(failed_outcome("missing `prompt`"));
+        }
+        let description = args["description"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Delegated task");
+        let subagent_type = args["subagent_type"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("general-purpose");
+        let scope = format!("native_delegate_{}", uuid::Uuid::new_v4().simple());
+
+        let mut payload = serde_json::Map::new();
+        payload.insert("description".into(), json!(description));
+        payload.insert("prompt".into(), json!(prompt));
+        payload.insert("subagent_type".into(), json!(subagent_type));
+        payload.insert("scope".into(), json!(scope.clone()));
+        for key in ["provider_id", "model"] {
+            if let Some(value) = args[key]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                payload.insert(key.into(), json!(value));
+            }
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .context("cannot create delegated-worker client")?;
+        let base = self.native_api_base.trim_end_matches('/');
+        if base.is_empty() || self.native_api_token.trim().is_empty() {
+            return Ok(failed_outcome(
+                "the native delegated-worker service is not configured",
+            ));
+        }
+
+        let launch = tokio::select! {
+            _ = cancel.cancelled() => return Ok(cancelled_outcome()),
+            response = client
+                .post(format!("{base}/api/agents"))
+                .header("X-Gnomef-Token", &self.native_api_token)
+                .json(&Value::Object(payload))
+                .send() => response,
+        };
+        let launch = match launch {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(failed_outcome(&format!(
+                    "cannot reach delegated-worker service: {error}"
+                )))
+            }
+        };
+        let launch_status = launch.status();
+        let launch_text = launch.text().await.unwrap_or_default();
+        if !launch_status.is_success() {
+            return Ok(failed_outcome(&format!(
+                "subagent launch failed ({launch_status}): {}",
+                cap(&launch_text, 2_000)
+            )));
+        }
+        let launch_json: Value = match serde_json::from_str(&launch_text) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(failed_outcome(&format!(
+                    "subagent launch returned invalid JSON: {error}"
+                )))
+            }
+        };
+        let agent_id = launch_json
+            .get("agentId")
+            .or_else(|| launch_json.get("taskId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let Some(agent_id) = agent_id else {
+            return Ok(failed_outcome("subagent launch did not return an agent id"));
+        };
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = client
+                        .post(format!("{base}/api/tasks/{agent_id}/stop"))
+                        .header("X-Gnomef-Token", &self.native_api_token)
+                        .json(&json!({"scope": scope}))
+                        .send()
+                        .await;
+                    return Ok(cancelled_outcome());
+                }
+                _ = tokio::time::sleep(Duration::from_millis(350)) => {}
+            }
+
+            let response = tokio::select! {
+                _ = cancel.cancelled() => continue,
+                response = client
+                    .get(format!("{base}/api/agents/{agent_id}"))
+                    .header("X-Gnomef-Token", &self.native_api_token)
+                    .send() => response,
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    return Ok(failed_outcome(&format!(
+                        "cannot read subagent status: {error}"
+                    )))
+                }
+            };
+            let status_code = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if !status_code.is_success() {
+                return Ok(failed_outcome(&format!(
+                    "cannot read subagent status ({status_code}): {}",
+                    cap(&body, 2_000)
+                )));
+            }
+            let value: Value = match serde_json::from_str(&body) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Ok(failed_outcome(&format!(
+                        "subagent status returned invalid JSON: {error}"
+                    )))
+                }
+            };
+            let agent = &value["agent"];
+            let status = agent["status"].as_str().unwrap_or_default();
+            if !matches!(status, "completed" | "failed" | "killed" | "cancelled") {
+                continue;
+            }
+
+            let result = agent["result"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    agent["output"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                })
+                .unwrap_or("Subagent finished without textual output");
+            if status == "completed" {
+                return Ok(ToolOutcome {
+                    content: cap(result, MAX_TOOL_OUTPUT),
+                    ok: true,
+                    touched: Vec::new(),
+                    patches: Vec::new(),
+                });
+            }
+            let error = agent["error"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(result);
+            return Ok(failed_outcome(&format!("subagent {status}: {error}")));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -1318,7 +1557,13 @@ pub fn register_all(
     config: Arc<RwLock<AppConfig>>,
     output_store: Arc<ToolOutputStore>,
     privilege_broker: Arc<PrivilegeBroker>,
+    native_api_base: String,
+    native_api_token: String,
 ) {
+    registry.register(Arc::new(AgentTool {
+        native_api_base,
+        native_api_token,
+    }));
     registry.register(Arc::new(DesktopTool {
         generated_dir: generated_dir.to_path_buf(),
         enabled: policy.mode != SandboxMode::ReadOnly,

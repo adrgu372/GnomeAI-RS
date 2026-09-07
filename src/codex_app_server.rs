@@ -26,8 +26,8 @@ use crate::provider::{
 };
 use crate::sandbox::SandboxMode;
 
-pub const UPSTREAM_VERSION: &str = "0.145.0";
-pub const UPSTREAM_COMMIT: &str = "25af12f7e61572b0bc18ddb1008be543b91519b0";
+pub const UPSTREAM_VERSION: &str = "0.153.4";
+pub const UPSTREAM_COMMIT: &str = "3d2ee51ca2d5db578f328aa75e20aa22c0197c9a";
 
 // GnomeAI's account-backed provider must remain independent from provider
 // routing in the user's normal Codex config.  In particular, a user may keep
@@ -74,6 +74,7 @@ impl Provider for CodexAppServer {
         let workspace = self.workspace.clone();
         let sandbox = self.sandbox;
         let model = req.model.clone();
+        let reasoning_effort = req.reasoning_effort.clone();
         let prompt = codex_prompt(&req.messages);
         let delegated_tools = req.delegated_tools;
         let delegated_tool_executor = req.delegated_tool_executor;
@@ -108,6 +109,11 @@ impl Provider for CodexAppServer {
             });
             if model != "default" {
                 thread_params["model"] = json!(model);
+            }
+            if let Some(effort) = reasoning_effort.as_deref() {
+                thread_params["config"] = json!({
+                    "model_reasoning_effort": effort,
+                });
             }
             if !delegated_tools.is_empty() {
                 thread_params["dynamicTools"] = json!(codex_dynamic_tools(&delegated_tools));
@@ -1100,7 +1106,7 @@ mod tests {
 
     #[test]
     fn pinned_codex_release_is_explicit() {
-        assert_eq!(UPSTREAM_VERSION, "0.145.0");
+        assert_eq!(UPSTREAM_VERSION, "0.153.4");
         assert_eq!(UPSTREAM_COMMIT.len(), 40);
     }
 

@@ -216,6 +216,9 @@ pub enum Delta {
 #[derive(Clone)]
 pub struct Request {
     pub model: String,
+    /// Provider-neutral reasoning-effort hint. None leaves the model/provider
+    /// default untouched.
+    pub reasoning_effort: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub max_tokens: u32,
@@ -340,6 +343,14 @@ impl OpenAiCompatible {
             body["max_completion_tokens"] = json!(req.max_tokens);
         } else {
             body["max_tokens"] = json!(req.max_tokens);
+        }
+        if self.name.eq_ignore_ascii_case("OpenAI") {
+            if req.model.starts_with("gpt-6-astra") {
+                body.as_object_mut().map(|object| object.remove("temperature"));
+            }
+            if let Some(effort) = req.reasoning_effort.as_deref() {
+                body["reasoning_effort"] = json!(effort);
+            }
         }
 
         if !req.tools.is_empty() {
@@ -612,6 +623,9 @@ impl Anthropic {
             || req.model.starts_with("claude-opus-4-8")
         {
             body["thinking"] = json!({ "type": "disabled" });
+        }
+        if let Some(effort) = req.reasoning_effort.as_deref() {
+            body["output_config"] = json!({ "effort": effort });
         }
         if !req.tools.is_empty() {
             body["tools"] = json!(
@@ -923,6 +937,7 @@ impl Provider for CliProvider {
         let workspace = self.workspace.clone();
         let sandbox = self.sandbox;
         let model = req.model.clone();
+        let reasoning_effort = req.reasoning_effort.clone();
         let prompt = cli_prompt(&req.messages);
         let mcp_servers = req.mcp_servers;
 
@@ -936,6 +951,7 @@ impl Provider for CliProvider {
                 &workspace,
                 sandbox,
                 &model,
+                reasoning_effort.as_deref(),
                 mcp_config.as_ref().map(|config| config.path.as_path()),
             );
             let mut child = tokio::process::Command::new(&program)
@@ -981,6 +997,7 @@ fn cli_command(
     _workspace: &Path,
     sandbox: SandboxMode,
     model: &str,
+    reasoning_effort: Option<&str>,
     mcp_config: Option<&Path>,
 ) -> (PathBuf, Vec<String>) {
     match flavor {
@@ -1004,6 +1021,9 @@ fn cli_command(
             }
             if model != "default" {
                 args.extend(["--model".to_string(), model.to_string()]);
+            }
+            if let Some(effort) = reasoning_effort {
+                args.extend(["--effort".to_string(), effort.to_string()]);
             }
             if let Some(path) = mcp_config {
                 args.extend([
@@ -1477,6 +1497,7 @@ mod tests {
         provider.use_max_completion_tokens = true;
         let request = Request {
             model: "gpt-5.6-terra".into(),
+            reasoning_effort: None,
             messages: vec![Message::User {
                 content: "hello".into(),
             }],
@@ -1611,6 +1632,7 @@ mod tests {
             SandboxMode::ReadOnly,
             "default",
             None,
+            None,
         );
         assert!(
             claude
@@ -1627,6 +1649,7 @@ mod tests {
             Path::new("/tmp/project"),
             SandboxMode::Normal,
             "default",
+            None,
             Some(path),
         );
         assert!(
@@ -1768,6 +1791,7 @@ mod http_tests {
     fn request(model: &str) -> Request {
         Request {
             model: model.into(),
+            reasoning_effort: None,
             messages: vec![Message::User {
                 content: "salut".into(),
             }],

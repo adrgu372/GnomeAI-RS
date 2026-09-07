@@ -5,7 +5,7 @@ Primary executable: /usr/lib/gnomeai-rs/gnomef-rs
 Persistent WhatsApp service: /usr/lib/systemd/user/gnomeai-whatsapp.service
 Private WhatsApp helper: /usr/lib/gnomeai-rs/gnomef-whatsapp
 Launchers: /usr/bin/gnomeai-rs, /usr/bin/gnomef-rs, /usr/bin/gnomef-agent
-Interface: native Avalonia UI 11 desktop frontend (bundled .NET SDK 8.0.424)
+Interface: native Avalonia UI 11 desktop frontend (bundled .NET SDK 10.0.400)
 Web interface: removed
 State: ${XDG_STATE_HOME:-$HOME/.local/state}/gnomeai-rs
 Skills: ${XDG_DATA_HOME:-$HOME/.local/share}/gnomeai-rs/skills

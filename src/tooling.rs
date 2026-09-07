@@ -158,7 +158,9 @@ impl Registry {
             .values()
             .filter_map(|tool| {
                 let definition = tool.definition();
-                (definition.approval == ApprovalRequirement::External).then_some(definition.spec)
+                (definition.approval == ApprovalRequirement::External
+                    || definition.spec.name == "agent")
+                    .then_some(definition.spec)
             })
             .collect()
     }

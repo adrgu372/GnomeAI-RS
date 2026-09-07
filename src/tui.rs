@@ -630,6 +630,8 @@ fn apply_event(app: &mut App, ev: Event) {
 
         Event::McpConfigChanged { .. } => {}
 
+        Event::SubagentDefaultsChanged { .. } => {}
+
         Event::TurnStarted { .. } => {
             app.busy = true;
             app.turn_started = Some(Instant::now());

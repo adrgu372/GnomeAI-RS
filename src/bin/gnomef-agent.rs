@@ -71,7 +71,7 @@ mod workspaces;
 use agent::{Agent, ApprovalPolicy};
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
-use config::AppConfig;
+use config::{AppConfig, normalize_reasoning_effort};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use memory_engine::{DreamHandle, MemoryEngine, spawn_dream_worker};
 use privilege::{PrivilegeBroker, PrivilegeCredential};
@@ -221,6 +221,8 @@ async fn async_main() -> Result<()> {
     apply_selection_to_config(&provider_selection, &mut runtime_config);
     let whatsapp_launch =
         avalonia_bridge::WhatsAppLaunchConfig::from_config(&runtime_config, &app_home);
+    let native_api_base = whatsapp_launch.native_api_base().to_string();
+    let native_api_token = whatsapp_launch.native_api_token().to_string();
     let config_state = Arc::new(RwLock::new(runtime_config));
     let models = fetch_model_ids(&config_state, &model).await;
     if provider_selection.provider_id == "openai-account"
@@ -257,6 +259,8 @@ async fn async_main() -> Result<()> {
         config_state.clone(),
         output_store.clone(),
         privilege_broker.clone(),
+        native_api_base.clone(),
+        native_api_token.clone(),
     );
     let mcp_config = config_state.read().await.clone();
     let mcp_runtime = mcp_client::register_configured(&mut registry, &mcp_config).await;
@@ -268,6 +272,7 @@ async fn async_main() -> Result<()> {
         store,
         session_id,
         model,
+        mcp_config.reasoning_effort.clone(),
         approval_for(cli.sandbox),
         workspace,
         policy.clone(),
@@ -304,6 +309,8 @@ async fn async_main() -> Result<()> {
         approval_tx,
         privilege_tx,
         privilege_broker,
+        native_api_base,
+        native_api_token,
     ));
     // Avalonia owns the native event loop in a private child process. The
     // bridge forwards the same serialisable Op/Event protocol used by the
@@ -344,6 +351,8 @@ struct Core {
     memory: Arc<MemoryEngine>,
     dream: DreamHandle,
     models: Vec<String>,
+    native_api_base: String,
+    native_api_token: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -364,6 +373,8 @@ async fn core_loop(
     approvals: mpsc::Sender<(String, Decision)>,
     privilege_replies: mpsc::Sender<PrivilegeCredential>,
     privilege_broker: Arc<PrivilegeBroker>,
+    native_api_base: String,
+    native_api_token: String,
 ) -> Result<()> {
     let events = agent.event_sender();
     let mut core = Core {
@@ -383,6 +394,8 @@ async fn core_loop(
         memory,
         dream,
         models,
+        native_api_base,
+        native_api_token,
     };
     let mut active: HashMap<String, ActiveTurn> = HashMap::new();
     let mut turns: FuturesUnordered<TurnFuture> = FuturesUnordered::new();
@@ -626,6 +639,17 @@ async fn handle_idle_op(
             )
             .await;
         }
+        Op::SetReasoningEffort { effort } => {
+            set_reasoning_effort(core, effort, events).await?;
+            send_ready(
+                &core.agent,
+                &core.policy,
+                &core.config_state,
+                &core.workspace_history,
+                &core.models,
+            )
+            .await;
+        }
         Op::SetProvider {
             provider_id,
             api_key,
@@ -636,6 +660,25 @@ async fn handle_idle_op(
                 provider_id,
                 api_key.map(|secret| secret.expose().to_string()),
                 base_url,
+                events,
+            )
+            .await
+            {
+                recoverable_error(events, error).await;
+            }
+        }
+        Op::SetSubagentDefaults {
+            enabled,
+            provider_id,
+            model,
+            reasoning_effort,
+        } => {
+            if let Err(error) = set_subagent_defaults(
+                core,
+                enabled,
+                provider_id,
+                model,
+                reasoning_effort,
                 events,
             )
             .await
@@ -1140,6 +1183,23 @@ async fn set_model(core: &mut Core, model: String, events: &mpsc::Sender<Event>)
     Ok(())
 }
 
+async fn set_reasoning_effort(
+    core: &mut Core,
+    effort: String,
+    events: &mpsc::Sender<Event>,
+) -> Result<()> {
+    let effort = normalize_reasoning_effort(&effort);
+    core.agent.reasoning_effort = effort.clone();
+    {
+        let mut config = core.config_state.write().await;
+        config.reasoning_effort = effort.clone();
+        config.normalize();
+        config.save(&core.config_path)?;
+    }
+    notice(events, &format!("reasoning effort set to {effort}")).await;
+    Ok(())
+}
+
 async fn set_provider(
     core: &mut Core,
     provider_id: String,
@@ -1166,6 +1226,7 @@ async fn set_provider(
 
     core.agent.provider = provider;
     core.agent.model = selection.model.clone();
+    core.agent.reasoning_effort = core.config_state.read().await.reasoning_effort.clone();
     core.provider_selection = selection;
 
     // Fetch once, outside the configuration lock. The helper falls back to
@@ -1222,6 +1283,8 @@ async fn build_registry(
         core.config_state.clone(),
         core.agent.output_store.clone(),
         core.privilege_broker.clone(),
+        core.native_api_base.clone(),
+        core.native_api_token.clone(),
     );
     let config = core.config_state.read().await.clone();
     let mcp_runtime = mcp_client::register_configured(&mut registry, &config).await;
@@ -1300,6 +1363,15 @@ async fn set_workspace(
 ) -> Result<()> {
     let workspace = resolve_workspace_request(&core.agent.workspace, &requested)?;
     if workspace == core.agent.workspace {
+        // A no-op navigation still completes the frontend's pending transition.
+        send_ready(
+            &core.agent,
+            &core.policy,
+            &core.config_state,
+            &core.workspace_history,
+            &core.models,
+        )
+        .await;
         notice(
             events,
             &format!("workspace is already {}", workspace.display()),
@@ -1411,6 +1483,60 @@ async fn set_mcp_servers(
         &core.models,
     )
     .await;
+    Ok(())
+}
+
+async fn set_subagent_defaults(
+    core: &mut Core,
+    enabled: bool,
+    provider_id: String,
+    model: String,
+    reasoning_effort: String,
+    events: &mpsc::Sender<Event>,
+) -> Result<()> {
+    let provider_id = provider_id.trim().to_lowercase();
+    let provider_id = if provider_id.is_empty() {
+        "inherit".to_string()
+    } else {
+        provider_id
+    };
+    let model = model.trim();
+    let model = if model.is_empty() { "inherit" } else { model };
+    let reasoning_effort = normalize_reasoning_effort(&reasoning_effort);
+
+    if enabled && provider_id != "inherit" {
+        let provider = preset(&provider_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown delegated-worker provider `{provider_id}`"))?;
+        if provider.auth == provider_catalog::AuthKind::Account {
+            bail!(
+                "account-backed providers cannot be delegated workers; choose an API provider or inherit"
+            );
+        }
+    }
+
+    let (provider_id, model, reasoning_effort) = {
+        let mut config = core.config_state.write().await;
+        config.subagent_use_separate_model = enabled;
+        config.subagent_provider_id = provider_id;
+        config.subagent_model = model.to_string();
+        config.subagent_reasoning_effort = reasoning_effort;
+        config.normalize();
+        config.save(&core.config_path)?;
+        (
+            config.subagent_provider_id.clone(),
+            config.subagent_model.clone(),
+            config.subagent_reasoning_effort.clone(),
+        )
+    };
+    let _ = events
+        .send(Event::SubagentDefaultsChanged {
+            enabled,
+            provider_id,
+            model,
+            reasoning_effort,
+        })
+        .await;
+    notice(events, "delegated-worker defaults saved").await;
     Ok(())
 }
 
@@ -1977,7 +2103,12 @@ async fn send_ready(
 ) {
     let config = config_state.read().await;
     let web_search_enabled = config.web_search_enabled;
+    let reasoning_effort = config.reasoning_effort.clone();
     let mcp_servers = config.mcp_servers.clone();
+    let subagent_use_separate_model = config.subagent_use_separate_model;
+    let subagent_provider_id = config.subagent_provider_id.clone();
+    let subagent_model = config.subagent_model.clone();
+    let subagent_reasoning_effort = config.subagent_reasoning_effort.clone();
     let models = if config.provider_id == "openai-account" {
         let metadata = models
             .iter()
@@ -1997,6 +2128,7 @@ async fn send_ready(
             session_id: agent.session_id.clone(),
             provider: agent.provider.name().to_string(),
             model: agent.model.clone(),
+            reasoning_effort,
             workspace: agent.workspace.clone(),
             sandbox: sandbox_name(policy.mode).to_string(),
             web_search_enabled,
@@ -2008,6 +2140,10 @@ async fn send_ready(
                 .collect(),
             models,
             mcp_servers,
+            subagent_use_separate_model,
+            subagent_provider_id,
+            subagent_model,
+            subagent_reasoning_effort,
         })
         .await;
 }
