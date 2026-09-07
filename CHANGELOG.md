@@ -1,3 +1,17 @@
+# GnomeAI-RS 2.4-1 - 2026-09-07
+
+## Skill installation
+
+- Remove the 512-file and 16 MiB package limits from both validation and copying.
+- Accept a standalone `SKILL.md` source and install only that file, excluding
+  neighboring project sources, dependencies and build outputs.
+- Pass the selected file directly from the graphical skill installer.
+- Keep directory and Git sources for skills with supporting resources, along
+  with existing package symlink and path-traversal checks.
+- Add regression coverage for packages above both former limits and isolated
+  installation of a standalone instruction file.
+- Use Debian package version `2.4-1`; the Rust core remains at `2.4.0`.
+
 # GnomeAI-RS 2.4.0 - 2026-09-07
 
 ## Draft recovery and desktop reliability

@@ -673,15 +673,9 @@ async fn handle_idle_op(
             model,
             reasoning_effort,
         } => {
-            if let Err(error) = set_subagent_defaults(
-                core,
-                enabled,
-                provider_id,
-                model,
-                reasoning_effort,
-                events,
-            )
-            .await
+            if let Err(error) =
+                set_subagent_defaults(core, enabled, provider_id, model, reasoning_effort, events)
+                    .await
             {
                 recoverable_error(events, error).await;
             }

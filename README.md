@@ -5,8 +5,14 @@ application keeps the proven agent core and `Op`/`Event` protocol of the former
 terminal interface while replacing the TUI and browser page with one native
 window.
 
-Current package version: **2.4.0**. See [CHANGELOG.md](CHANGELOG.md) for the
+Current Debian package version: **2.4-1** (Rust core: **2.4.0**). See [CHANGELOG.md](CHANGELOG.md) for the
 historical release notes.
+
+## What changed in 2.4-1
+
+Skill installation accepts a standalone `SKILL.md` without copying neighboring
+project files. Directory and Git packages no longer have the previous limits of
+512 files or 16 MiB during validation and copying.
 
 ## What changed in 2.4
 
@@ -277,6 +283,11 @@ path-traversal protection and atomic activation.
 /skill verify NAME
 /skill remove NAME
 ```
+
+Use `/skill install ./SKILL.md` to install a standalone instruction file without
+copying neighboring project files. For skills with supporting resources, pass
+the skill directory or Git URL instead. Packages have no total file-count or
+size limit.
 
 Managed packages live under:
 

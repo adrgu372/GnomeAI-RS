@@ -966,7 +966,8 @@ impl DelegatedToolExecutor for AgentDelegatedToolExecutor {
             });
         };
         let definition = tool.definition();
-        let delegated_agent = name == "agent" && definition.approval == ApprovalRequirement::Standard;
+        let delegated_agent =
+            name == "agent" && definition.approval == ApprovalRequirement::Standard;
         if definition.approval != ApprovalRequirement::External && !delegated_agent {
             return Ok(DelegatedToolResult {
                 content: format!("`{name}` is not an external MCP tool"),

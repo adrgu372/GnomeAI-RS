@@ -2142,9 +2142,8 @@ public sealed partial class MainWindow : Window
             return;
         }
         var path = files[0].TryGetLocalPath();
-        var directory = path is null ? null : Path.GetDirectoryName(path);
-        if (directory is null) ShowError("SKILL.md does not have a valid local parent directory.");
-        else await SendAsync(new() { ["op"] = "skill_install", ["source"] = directory });
+        if (path is null) ShowError("SKILL.md does not have a valid local path.");
+        else await SendAsync(new() { ["op"] = "skill_install", ["source"] = path });
     }
 
     private async Task ShowHelpAsync()

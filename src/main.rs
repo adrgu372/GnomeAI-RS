@@ -2210,8 +2210,7 @@ async fn generate_account_whatsapp_response(
 
     let request = ProviderRequest {
         model: model.to_string(),
-        reasoning_effort: (cfg.reasoning_effort != "default")
-            .then(|| cfg.reasoning_effort.clone()),
+        reasoning_effort: (cfg.reasoning_effort != "default").then(|| cfg.reasoning_effort.clone()),
         messages,
         tools: Vec::new(),
         max_tokens: cfg.llama_max_tokens,

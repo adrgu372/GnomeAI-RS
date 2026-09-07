@@ -1500,9 +1500,8 @@ async fn tool_agent(
         .filter(|value| !value.is_empty());
     // Dedicated-worker settings are defaults, not forced routing. Preserve
     // the old semantics whenever a caller explicitly supplied either field.
-    let use_worker_defaults = cfg.subagent_use_separate_model
-        && explicit_provider.is_none()
-        && explicit_model.is_none();
+    let use_worker_defaults =
+        cfg.subagent_use_separate_model && explicit_provider.is_none() && explicit_model.is_none();
     let requested_provider = explicit_provider.unwrap_or_else(|| {
         if use_worker_defaults {
             cfg.subagent_provider_id.clone()
@@ -2074,7 +2073,9 @@ async fn tool_sudo(
         bail!("Sudo is disabled in read-only mode")
     }
     if is_native_delegate_scope(scope_key) {
-        bail!("Sudo is not delegated to native subagents; return the privileged step to the parent agent")
+        bail!(
+            "Sudo is not delegated to native subagents; return the privileged step to the parent agent"
+        )
     }
     let command = required_string(args, "command")?;
     let cwd = resolve_workspace_path(

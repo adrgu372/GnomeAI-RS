@@ -346,7 +346,8 @@ impl OpenAiCompatible {
         }
         if self.name.eq_ignore_ascii_case("OpenAI") {
             if req.model.starts_with("gpt-6-astra") {
-                body.as_object_mut().map(|object| object.remove("temperature"));
+                body.as_object_mut()
+                    .map(|object| object.remove("temperature"));
             }
             if let Some(effort) = req.reasoning_effort.as_deref() {
                 body["reasoning_effort"] = json!(effort);

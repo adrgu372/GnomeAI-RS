@@ -20,8 +20,6 @@ use uuid::Uuid;
 
 const MAX_SKILL_MD_BYTES: u64 = 256 * 1024;
 const MAX_RESOURCE_BYTES: u64 = 1024 * 1024;
-const MAX_PACKAGE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_PACKAGE_FILES: usize = 512;
 const ORIGIN_FILE: &str = ".gnomeai-origin.json";
 
 #[derive(Debug, Clone, Serialize)]
@@ -597,6 +595,21 @@ fn prepare_source(source: &str, workspace: &Path) -> Result<PreparedSource> {
     }
 
     let root = expand_path(source, workspace)?;
+    // A standalone SKILL.md installs only that file. Its parent may be a
+    // workspace with unrelated sources, build outputs and dependencies.
+    if root.is_file() {
+        if root.file_name() != Some(OsStr::new("SKILL.md")) {
+            bail!("a standalone skill source must be named SKILL.md")
+        }
+        let temporary = TemporaryDirectory::create("gnomeai-skill")?;
+        fs::copy(&root, temporary.0.join("SKILL.md"))?;
+        return Ok(PreparedSource {
+            root: temporary.0.clone(),
+            source: root.to_string_lossy().into_owned(),
+            commit: None,
+            _temporary: Some(temporary),
+        });
+    }
     Ok(PreparedSource {
         source: root.to_string_lossy().into_owned(),
         root,
@@ -888,9 +901,6 @@ fn validate_package(root: &Path) -> Result<(usize, u64)> {
             } else if metadata.is_file() {
                 files += 1;
                 bytes = bytes.saturating_add(metadata.len());
-                if files > MAX_PACKAGE_FILES || bytes > MAX_PACKAGE_BYTES {
-                    bail!("skill package exceeds 512 files or 16 MiB")
-                }
             } else {
                 bail!("skill packages may contain only regular files and directories")
             }
@@ -903,8 +913,6 @@ fn copy_package(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir(destination)?;
     fs::set_permissions(destination, fs::Permissions::from_mode(0o700))?;
     let mut stack = vec![(source.to_path_buf(), destination.to_path_buf())];
-    let mut files = 0usize;
-    let mut bytes = 0u64;
     while let Some((from, to)) = stack.pop() {
         for entry in fs::read_dir(&from)? {
             let entry = entry?;
@@ -927,11 +935,6 @@ fn copy_package(source: &Path, destination: &Path) -> Result<()> {
             }
             if !metadata.is_file() {
                 bail!("unsupported object in skill package")
-            }
-            files += 1;
-            bytes = bytes.saturating_add(metadata.len());
-            if files > MAX_PACKAGE_FILES || bytes > MAX_PACKAGE_BYTES {
-                bail!("skill package exceeds 512 files or 16 MiB")
             }
             let mut input = OpenOptions::new()
                 .read(true)
@@ -1028,11 +1031,54 @@ mod tests {
     }
 
     #[test]
-    fn validates_package_limits_and_symlinks() {
+    fn rejects_package_symlinks() {
         use std::os::unix::fs::symlink;
         let (_temporary, root) = test_skill();
         assert!(validate_package(&root).is_ok());
         symlink("/etc/passwd", root.join("escape")).unwrap();
         assert!(validate_package(&root).is_err());
+    }
+
+    #[test]
+    fn validates_and_copies_packages_above_old_limits() {
+        let (temporary, root) = test_skill();
+        for index in 0..512 {
+            fs::write(root.join(format!("resource-{index}")), "resource").unwrap();
+        }
+        let large = fs::File::create(root.join("large-resource")).unwrap();
+        large.set_len(16 * 1024 * 1024 + 1).unwrap();
+        let expected = validate_package(&root).unwrap();
+        assert!(expected.0 > 512);
+        assert!(expected.1 > 16 * 1024 * 1024);
+
+        let destination = temporary.0.join("copy");
+        copy_package(&root, &destination).unwrap();
+        assert_eq!(validate_package(&destination).unwrap(), expected);
+        assert_eq!(
+            fs::read(destination.join("resource-511")).unwrap(),
+            b"resource"
+        );
+    }
+
+    #[test]
+    fn standalone_skill_source_excludes_neighboring_files() {
+        let (temporary, root) = test_skill();
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(root.join("target/unrelated"), "build output").unwrap();
+        let prepared = prepare_source("SKILL.md", &root).unwrap();
+        assert_eq!(prepared.source, root.join("SKILL.md").to_string_lossy());
+        let source_root = locate_skill_root(&prepared.root).unwrap();
+        assert_eq!(
+            load_skill_dir(&source_root, "source").unwrap().summary.name,
+            "rust-review"
+        );
+        let destination = temporary.0.join("installed");
+        copy_package(&source_root, &destination).unwrap();
+        assert_eq!(
+            fs::read(destination.join("SKILL.md")).unwrap(),
+            fs::read(root.join("SKILL.md")).unwrap()
+        );
+        assert_eq!(validate_package(&destination).unwrap().0, 1);
+        assert!(!destination.join("target").exists());
     }
 }

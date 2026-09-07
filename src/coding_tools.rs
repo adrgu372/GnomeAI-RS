@@ -1435,7 +1435,7 @@ impl Tool for AgentTool {
             Err(error) => {
                 return Ok(failed_outcome(&format!(
                     "cannot reach delegated-worker service: {error}"
-                )))
+                )));
             }
         };
         let launch_status = launch.status();
@@ -1451,7 +1451,7 @@ impl Tool for AgentTool {
             Err(error) => {
                 return Ok(failed_outcome(&format!(
                     "subagent launch returned invalid JSON: {error}"
-                )))
+                )));
             }
         };
         let agent_id = launch_json
@@ -1491,7 +1491,7 @@ impl Tool for AgentTool {
                 Err(error) => {
                     return Ok(failed_outcome(&format!(
                         "cannot read subagent status: {error}"
-                    )))
+                    )));
                 }
             };
             let status_code = response.status();
@@ -1507,7 +1507,7 @@ impl Tool for AgentTool {
                 Err(error) => {
                     return Ok(failed_outcome(&format!(
                         "subagent status returned invalid JSON: {error}"
-                    )))
+                    )));
                 }
             };
             let agent = &value["agent"];

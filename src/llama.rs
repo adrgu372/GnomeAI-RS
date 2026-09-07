@@ -803,7 +803,9 @@ fn apply_openai_reasoning_options(cfg: &AppConfig, model: &str, payload: &mut Va
     }
     // Astra's reasoning models do not accept sampling temperature.
     if model.starts_with("gpt-6-astra") {
-        payload.as_object_mut().map(|object| object.remove("temperature"));
+        payload
+            .as_object_mut()
+            .map(|object| object.remove("temperature"));
     }
     if let Some(effort) = configured_reasoning_effort(cfg) {
         payload["reasoning_effort"] = json!(effort);
