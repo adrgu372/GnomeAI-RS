@@ -4,7 +4,7 @@ using Avalonia.Threading;
 
 namespace GnomeAI.UI;
 
-public sealed class AgentBridge : IAsyncDisposable
+public sealed class AgentBridge : GnomeAI.Client.IAgentBridge
 {
     private readonly StreamReader _reader = new(Console.OpenStandardInput());
     private readonly StreamWriter _writer = new(Console.OpenStandardOutput()) { AutoFlush = true };

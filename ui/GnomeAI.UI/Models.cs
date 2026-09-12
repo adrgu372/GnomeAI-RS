@@ -90,7 +90,8 @@ public sealed class SessionItem : ObservableObject
     public string Model { get; init; } = "";
     public long Turns { get; init; }
     public long UpdatedAt { get; init; }
-    public bool IsCurrent { get; init; }
+    private bool _isCurrent;
+    public bool IsCurrent { get=>_isCurrent; set { if(Set(ref _isCurrent,value))OnPropertyChanged(nameof(Caption)); } }
     public bool IsBusy
     {
         get => _isBusy;

@@ -1,4 +1,4 @@
-GnomeAI-RS 2.4-1 — native graphical package
+GnomeAI-RS 3.0-1 — native graphical package
 
 Launch from the desktop menu or with:
 

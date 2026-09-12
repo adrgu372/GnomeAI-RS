@@ -11,3 +11,6 @@
 __pycache__/
 *.pyc
 descriere
+
+/relay/target/
+/ui/GnomeAI.UI.Android/native/

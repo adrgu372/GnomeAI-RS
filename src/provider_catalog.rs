@@ -405,6 +405,9 @@ pub fn build_provider(
 ) -> Result<Arc<dyn Provider>> {
     let selected = preset(&selection.provider_id)
         .with_context(|| format!("unknown provider `{}`", selection.provider_id))?;
+    if cfg!(target_os = "android") && matches!(selected.protocol, WireProtocol::CodexAppServer | WireProtocol::ClaudeCli) {
+        anyhow::bail!("Use an API-key provider on Android; account CLI providers require the desktop");
+    }
     let provider: Arc<dyn Provider> = match selected.protocol {
         WireProtocol::OpenAi => {
             let base_url = selection

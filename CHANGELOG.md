@@ -1,3 +1,28 @@
+# GnomeAI-RS 3.0-1 - 2026-09-12
+
+## Android & multi-device preview
+
+- Add the native Android ARM64 client built with .NET 10 + Avalonia
+  (`ui/GnomeAI.UI.Android`), sharing the Rust core through
+  `libgnomeai_core.so` and built with `scripts/build-android.sh`.
+- Add QR-based pairing with a shared confirmation code, persistent device
+  identity, ephemeral ECDH P-256 keys, one-time invitations and SAS
+  confirmation; Android pairing material is protected by the Android
+  Keystore.
+- Add the native QR scanner with NV21 preview, sharp JPEG capture, inverted
+  and cropped decoding attempts and `Enlarge QR` for dense invitations.
+- Add the Tor/Arti multi-device transport with Onion Services, tested on
+  Wi-Fi and across 5G, plus the `DeviceHub`, `PeerLink`, `PeerTransport` and
+  `DeviceSessionClient` infrastructure with remote conversations.
+- Add the desktop device selector (`This PC` / phone / paired devices) and
+  remote approvals bound to the peer captured when the approval card is
+  created.
+- Introduce `relay/` (pairing relay), Android sandbox support
+  (`src/sandbox_android.rs`), mobile tools, the device store and the
+  `tests/DeviceLifecycle` harness.
+- Bump the Debian package to `3.0-1` and the Rust core to `3.0.0`; the
+  Android app is published as version `3.0.0` (versionCode `9`).
+
 # GnomeAI-RS 2.4-1 - 2026-09-07
 
 ## Skill installation

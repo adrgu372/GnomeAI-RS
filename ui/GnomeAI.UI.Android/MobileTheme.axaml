@@ -1,0 +1,72 @@
+<Styles xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Style Selector="UserControl">
+    <Setter Property="Foreground" Value="#EEF4F0" />
+    <Setter Property="FontSize" Value="15" />
+  </Style>
+  <Style Selector="Button">
+    <Setter Property="MinHeight" Value="48" />
+    <Setter Property="CornerRadius" Value="14" />
+    <Setter Property="Padding" Value="16,12" />
+    <Setter Property="Background" Value="#202C32" />
+    <Setter Property="Foreground" Value="#EEF4F0" />
+    <Setter Property="BorderThickness" Value="0" />
+    <Setter Property="HorizontalContentAlignment" Value="Left" />
+  </Style>
+  <Style Selector="Button:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+    <Setter Property="Background" Value="#2A3D40" />
+  </Style>
+  <Style Selector="Button:pressed /template/ ContentPresenter#PART_ContentPresenter">
+    <Setter Property="Background" Value="#35534F" />
+  </Style>
+  <Style Selector="Button.icon">
+    <Setter Property="Width" Value="48" />
+    <Setter Property="Height" Value="48" />
+    <Setter Property="Padding" Value="12" />
+    <Setter Property="HorizontalContentAlignment" Value="Center" />
+    <Setter Property="VerticalContentAlignment" Value="Center" />
+    <Setter Property="Background" Value="Transparent" />
+  </Style>
+  <Style Selector="Button.send">
+    <Setter Property="Background" Value="#A5E3C5" />
+    <Setter Property="Foreground" Value="#11251C" />
+    <Setter Property="CornerRadius" Value="24" />
+  </Style>
+  <Style Selector="Button.send:pressed /template/ ContentPresenter#PART_ContentPresenter">
+    <Setter Property="Background" Value="#77C9A4" />
+    <Setter Property="Foreground" Value="#11251C" />
+  </Style>
+  <Style Selector="Button.nav">
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="Foreground" Value="#93A59F" />
+    <Setter Property="HorizontalContentAlignment" Value="Center" />
+    <Setter Property="Padding" Value="6,8" />
+    <Setter Property="CornerRadius" Value="16" />
+  </Style>
+  <Style Selector="Button.nav.active">
+    <Setter Property="Background" Value="#233B32" />
+    <Setter Property="Foreground" Value="#B4EFCF" />
+  </Style>
+  <Style Selector="TextBox">
+    <Setter Property="Background" Value="#182329" />
+    <Setter Property="Foreground" Value="#EEF4F0" />
+    <Setter Property="BorderBrush" Value="#35453F" />
+    <Setter Property="CornerRadius" Value="12" />
+    <Setter Property="Padding" Value="14,12" />
+    <Setter Property="MinHeight" Value="48" />
+  </Style>
+  <Style Selector="TextBox:focus /template/ Border#PART_BorderElement">
+    <Setter Property="BorderBrush" Value="#A5E3C5" />
+  </Style>
+  <Style Selector="TextBox.composer">
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderThickness" Value="0" />
+    <Setter Property="Padding" Value="8,8" />
+  </Style>
+  <Style Selector="ComboBox">
+    <Setter Property="MinHeight" Value="44" />
+    <Setter Property="CornerRadius" Value="14" />
+    <Setter Property="Background" Value="#202C32" />
+    <Setter Property="BorderThickness" Value="0" />
+    <Setter Property="Padding" Value="12,8" />
+  </Style>
+</Styles>

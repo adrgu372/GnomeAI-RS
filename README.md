@@ -1,12 +1,41 @@
+> **Current release: 3.0 — Android & multi-device preview.** See
+> [RELEASE_NOTES_v3.0.md](RELEASE_NOTES_v3.0.md) for the native Android client,
+> QR pairing, the Tor/Arti mesh transport and the current known issues. The
+> notes below describe earlier versions.
+
 # GnomeAI-RS
+
+**Android / multi-device source preview:** see [ANDROID_PORT.md](ANDROID_PORT.md)
+for the new native Android client, pairing relay, remote sessions, execution
+handoff, build instructions and the current uncompiled-preview limitations.
 
 GnomeAI-RS is a native graphical coding agent written in Rust. The desktop
 application keeps the proven agent core and `Op`/`Event` protocol of the former
 terminal interface while replacing the TUI and browser page with one native
 window.
 
-Current Debian package version: **2.4-1** (Rust core: **2.4.0**). See [CHANGELOG.md](CHANGELOG.md) for the
+Current Debian package version: **3.0-1** (Rust core: **3.0.0**). See [CHANGELOG.md](CHANGELOG.md) for the
 historical release notes.
+
+## What changed in 3.0
+
+Version 3.0 is the Android and multi-device preview release. It adds a native
+.NET 10 + Avalonia Android ARM64 client that shares the same Rust core
+(`libgnomeai_core.so`) as the desktop, QR-based pairing with a shared
+confirmation code and SAS verification, and a Tor/Arti Onion Service transport
+tested both on Wi-Fi and across 5G.
+
+| Area | Version 3.0 |
+| --- | --- |
+| Android | Full ARM64 client with providers, streaming, web search, vision, files/PDFs, sub-agents, camera, file picker and a foreground service |
+| QR scanner | NV21 preview plus sharp JPEG capture, inverted/cropped decoding attempts and `Enlarge QR` for dense invitations |
+| Pairing | Persistent device identity, ephemeral ECDH P-256 keys, one-time invitations, SAS confirmation; Android Keystore protection on the phone |
+| Mesh | `DeviceHub`/`PeerLink`/`PeerTransport`/`DeviceSessionClient` over Tor/Arti Onion Services, with remote conversations |
+| Desktop | Device selector (`This PC` / phone / paired devices) and remote approvals bound to the peer captured at card creation |
+| Builds | `scripts/build-deb.sh` and `scripts/build-android.sh` produce the Debian package and the signed APK |
+
+Known issues and the full change summary are in
+[RELEASE_NOTES_v3.0.md](RELEASE_NOTES_v3.0.md).
 
 ## What changed in 2.4-1
 

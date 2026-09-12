@@ -53,6 +53,23 @@ impl Drop for SecretString {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
+    /// Local authenticated device adapter. Remote peers can only request the
+    /// limited session actions enforced by the runtime, not arbitrary UI ops.
+    DeviceRequest {
+        request_id: String,
+        peer_id: String,
+        action: String,
+        payload: serde_json::Value,
+    },
+    SubmitAttachmentTo {
+        session_id: String,
+        path: PathBuf,
+        text: String,
+    },
+    SetBrave {
+        api_key: Option<SecretString>,
+        mode: String,
+    },
     /// Start a turn with this user message.
     Submit {
         text: String,
@@ -287,6 +304,10 @@ pub enum Decision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    DeviceResponse {
+        request_id: String,
+        result: serde_json::Value,
+    },
     /// A turn-scoped event tagged with the conversation that produced it.
     /// Global lifecycle/configuration events stay at the top level. This lets
     /// desktop interfaces keep several turns streaming concurrently without

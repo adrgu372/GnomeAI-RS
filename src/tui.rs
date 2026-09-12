@@ -775,6 +775,7 @@ fn apply_event(app: &mut App, ev: Event) {
 
         Event::Notice { message } => app.blocks.push(Block_::Note(message)),
 
+        Event::DeviceResponse { .. } => {}
         Event::Error { message, fatal } => {
             app.busy = false;
             if fatal {

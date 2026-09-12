@@ -1,7 +1,8 @@
 [package]
 name = "gnomef-rs"
-version = "2.4.0"
+version = "3.0.0"
 edition = "2024"
+rust-version = "1.91"
 autobins = false
 default-run = "gnomef-rs"
 
@@ -37,6 +38,10 @@ path = "src/bin/gnomeai-hubctl.rs"
 test = false
 bench = false
 
+[lib]
+name = "gnomeai_core"
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 anyhow = "1"
 async-stream = "0.3"
@@ -52,11 +57,17 @@ qrcode = "0.14"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
-rusqlite = { version = "0.32.1", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+safelog = "=0.9.1"
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
+arti-client = { version = "=0.46.0", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "onion-service-service", "static-sqlite"] }
+tor-hsservice = "=0.46.0"
+tor-cell = "=0.46.0"
+tor-proto = "=0.46.0"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -68,3 +79,6 @@ zeroize = "1"
 atspi = { version = "0.30", default-features = false, features = ["connection", "proxies", "tokio", "zbus"] }
 landlock = "0.4.5"
 seccompiler = "0.5"
+
+[target.'cfg(target_os = "android")'.dependencies]
+pdf-extract = "0.7"

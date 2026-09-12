@@ -27,7 +27,7 @@ public sealed partial class MainWindow
     private void MarkDraftChanged(string sessionId)
     {
         if (sessionId.Length == 0) return;
-        _dirtyDraftSessions.Add(sessionId);
+        _dirtyDraftSessions.Add(RuntimeKey(sessionId));
         _draftSaveTimer.Stop();
         if (!_closed) _draftSaveTimer.Start();
     }
@@ -37,7 +37,7 @@ public sealed partial class MainWindow
         _draftSaveTimer.Stop();
         foreach (var sessionId in _dirtyDraftSessions.ToArray())
         {
-            var runtime = RuntimeFor(sessionId);
+            var runtime = _sessionRuntimes[sessionId];
             try
             {
                 _draftStore.Save(sessionId, new(runtime.Draft, runtime.Queue.ToList()));
@@ -68,7 +68,7 @@ public sealed partial class MainWindow
             runtime.DraftLoaded = true;
             try
             {
-                var saved = _draftStore.Load(sessionId);
+                var saved = _draftStore.Load(RuntimeKey(sessionId));
                 runtime.Draft = saved.Draft;
                 foreach (var item in saved.Queue) runtime.Queue.Enqueue(item);
                 // Restoring a window must never execute pending work by itself.

@@ -96,10 +96,17 @@ CREATE INDEX idx_patches_session ON patches(session_id, id);
 
 #[derive(Clone)]
 pub struct Store {
-    conn: Arc<Mutex<Connection>>,
+    pub(crate) conn: Arc<Mutex<Connection>>,
 }
 
 impl Store {
+    pub fn assert_active_status(&self, id: &str) -> Result<()> {
+        let session = self.get_session(id)?.context("Session not found")?;
+        if session.status != "active" {
+            bail!("Session is {} and cannot be modified", session.status);
+        }
+        Ok(())
+    }
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -231,6 +238,7 @@ impl Store {
     }
 
     pub fn rename_session(&self, id: &str, title: &str) -> Result<()> {
+        self.assert_active_status(id)?;
         let title = title.trim();
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
@@ -250,6 +258,7 @@ impl Store {
     /// Remove a session and everything hanging off it. Patch pre-images go
     /// with it, so a deleted session can no longer be rolled back.
     pub fn delete_session(&self, id: &str) -> Result<()> {
+        self.assert_active_status(id)?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         // Forks keep living when their parent goes away; parent_id has no ON
@@ -361,6 +370,15 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
+        let status: String = tx.query_row(
+            "SELECT status FROM sessions WHERE id=?1",
+            [session_id],
+            |r| r.get(0),
+        )?;
+        if status != "active" {
+            bail!("Session is {status} and cannot be modified");
+        }
+
         let seq: i64 = tx.query_row(
             "SELECT COALESCE(MAX(seq), -1) + 1 FROM turns WHERE session_id = ?1",
             params![session_id],
@@ -428,6 +446,7 @@ impl Store {
     }
 
     pub fn set_model(&self, session_id: &str, model: &str) -> Result<()> {
+        self.assert_active_status(session_id)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
@@ -509,6 +528,7 @@ impl Store {
         summary: &str,
         summary_tokens: i64,
     ) -> Result<()> {
+        self.assert_active_status(session_id)?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let ts = now_ms();
@@ -610,6 +630,7 @@ impl Store {
     /// oldest pre-image is the one you want, and you only reach it correctly by
     /// unwinding in reverse.
     pub fn rollback_session(&self, session_id: &str, workspace: &Path) -> Result<Vec<PathBuf>> {
+        self.assert_active_status(session_id)?;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, path, before FROM patches

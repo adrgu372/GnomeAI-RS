@@ -42,7 +42,7 @@ def main() -> None:
     app_xaml = (UI / "App.axaml").read_text(encoding="utf-8")
     protocol = (ROOT / "src" / "protocol.rs").read_text(encoding="utf-8")
     agent = (ROOT / "src" / "agent.rs").read_text(encoding="utf-8")
-    desktop_core = (ROOT / "src" / "bin" / "gnomef-agent.rs").read_text(encoding="utf-8")
+    desktop_core = (ROOT / "src" / "agent_runtime.rs").read_text(encoding="utf-8")
     background_core = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
     native_service = (ROOT / "src" / "native_service.rs").read_text(encoding="utf-8")
     deb_service = (ROOT / "packaging" / "debian" / "gnomeai-whatsapp.service").read_text(encoding="utf-8")

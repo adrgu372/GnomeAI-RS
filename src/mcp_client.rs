@@ -133,6 +133,7 @@ async fn connect(server: &McpServerConfig) -> Result<RunningService<RoleClient, 
                 .with_context(|| format!("cannot initialize {}", server.url))
         }
         McpTransport::Stdio => {
+            if cfg!(target_os = "android") { bail!("Android supports HTTP MCP transports only"); }
             if server.command.is_empty() {
                 bail!("stdio command is empty");
             }

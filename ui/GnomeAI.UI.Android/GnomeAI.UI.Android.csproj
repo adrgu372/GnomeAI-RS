@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-android</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <SupportedOSPlatformVersion>26</SupportedOSPlatformVersion>
+    <ApplicationId>io.github.adrgu372.gnomeai</ApplicationId>
+    <ApplicationTitle>GnomeAI</ApplicationTitle>
+    <ApplicationVersion>9</ApplicationVersion>
+    <ApplicationDisplayVersion>3.0.0</ApplicationDisplayVersion>
+    <RuntimeIdentifier>android-arm64</RuntimeIdentifier>
+    <AndroidPackageFormats>apk</AndroidPackageFormats>
+    <AndroidEnableProfiledAot>false</AndroidEnableProfiledAot>
+    <PublishTrimmed>true</PublishTrimmed>
+  </PropertyGroup>
+  <ItemGroup>
+    <TrimmerRootAssembly Include="GnomeAI.Client" RootMode="All" />
+    <ProjectReference Include="../GnomeAI.Client/GnomeAI.Client.csproj" />
+    <PackageReference Include="QRCoder" Version="1.6.0" />
+    <PackageReference Include="ZXing.Net" Version="0.16.11" />
+    <PackageReference Include="Avalonia.Android" Version="11.3.20" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.20" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="11.3.20" />
+    <AndroidNativeLibrary Include="native/arm64-v8a/libgnomeai_core.so" Abi="arm64-v8a" />
+  </ItemGroup>
+  <Target Name="RequireNativeCore" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('native/arm64-v8a/libgnomeai_core.so')" Text="Build the native core first with scripts/build-android.sh." />
+  </Target>
+</Project>

@@ -1,0 +1,4 @@
+PASS: authenticated connection idle does not rewrite identity at the old 5-second interval.
+PASS: repeated authenticated confirmation is idempotent.
+PASS: a plaintext revocation cannot remove pairing.
+PASS: authenticated revoke/ack removes both peer stores and associated sync baseline.

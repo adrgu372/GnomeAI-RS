@@ -1,0 +1,2699 @@
+use crate::*;
+use agent::{Agent, ApprovalPolicy};
+use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use config::{AppConfig, normalize_reasoning_effort};
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+use memory_engine::{DreamHandle, MemoryEngine, spawn_dream_worker};
+use privilege::{PrivilegeBroker, PrivilegeCredential};
+use protocol::{Decision, Event, HistoryTurn, Op, SessionSummary};
+use provider_catalog::{ProviderSelection, ProviderSettingsStore, build_provider, preset};
+use sandbox::{SandboxMode, SandboxPolicy};
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+use store::Store;
+use tokio::sync::{RwLock, mpsc};
+use tokio_util::sync::CancellationToken;
+use tooling::{Registry, ToolOutputStore};
+use workspaces::{WorkspaceHistory, resolve_startup_workspace};
+
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+struct Cli {
+    workspace: Option<PathBuf>,
+    session: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    sandbox: SandboxMode,
+}
+
+struct ActiveTurn {
+    cancel: CancellationToken,
+    agent: Agent,
+    queued: VecDeque<String>,
+}
+
+type TurnFuture = Pin<Box<dyn Future<Output = (String, Result<()>)> + Send>>;
+
+pub fn run_desktop() -> Result<()> {
+    // sudo invokes this executable as its askpass helper for interactive PAM
+    // conversations. Exit before argument parsing, sandboxing or Tokio so the
+    // helper can only relay one local credential response.
+    if privilege::maybe_run_as_askpass()? {
+        return Ok(());
+    }
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        bail!("gnomef-agent currently supports Linux and macOS");
+    }
+
+    // This must run before Tokio creates worker threads. The helper re-execs a
+    // command only after applying Landlock and seccomp restrictions.
+    sandbox::maybe_run_as_helper()?;
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
+    let cli = parse_cli()?;
+    let launch_dir = std::env::current_dir().context("cannot determine current directory")?;
+    let app_home = app_dirs::resolve_app_home(&launch_dir)?;
+    run_engine(cli, launch_dir, app_home, None).await
+}
+
+pub async fn run_native(
+    app_home: PathBuf,
+    ops: mpsc::Receiver<Op>,
+    events: mpsc::Sender<Event>,
+) -> Result<()> {
+    std::fs::create_dir_all(app_home.join("workspace"))?;
+    let workspace = app_home.join("workspace");
+    let cli = Cli {
+        workspace: Some(workspace.clone()),
+        session: None,
+        model: None,
+        base_url: None,
+        sandbox: SandboxMode::Normal,
+    };
+    run_engine(cli, workspace, app_home, Some((ops, events))).await
+}
+
+async fn run_engine(
+    cli: Cli,
+    launch_dir: PathBuf,
+    app_home: PathBuf,
+    native: Option<(mpsc::Receiver<Op>, mpsc::Sender<Event>)>,
+) -> Result<()> {
+    let is_native = native.is_some();
+    let config_path = app_home.join("config.json");
+    let config = AppConfig::load(&config_path)?;
+    // Save generated persistent secrets (notably node enrollment) before the
+    // background Hub process loads the same configuration.
+    config.save(&config_path)?;
+    let store = Store::open(&app_home.join("store/agent.db"))?;
+    store.device_schema()?;
+    let provider_settings = ProviderSettingsStore::new(app_home.join("store/providers.json"));
+    let app_paths = storage::AppPaths::new(app_home.clone())?;
+    let memory_engine = MemoryEngine::open(&app_paths)?;
+    let mut workspace_history = WorkspaceHistory::load(app_home.join("store/workspaces.json"));
+
+    let model_override = cli.model.or_else(|| non_empty_env("GNOMEF_MODEL"));
+    let (startup_workspace, workspace_note) =
+        resolve_startup_workspace(cli.workspace, &launch_dir, &workspace_history);
+    let requested_workspace = Some(startup_workspace);
+    let base_override = cli.base_url.or_else(|| non_empty_env("GNOMEF_BASE_URL"));
+    let key_override = non_empty_env("GNOMEF_API_KEY");
+    let explicit_legacy_provider = base_override.is_some() || key_override.is_some();
+    let saved_provider = if explicit_legacy_provider {
+        None
+    } else {
+        provider_settings.load()?
+    };
+    let provider_is_persisted = saved_provider.is_some();
+    let mut provider_selection = if explicit_legacy_provider {
+        ProviderSelection::legacy(
+            base_override.unwrap_or_else(|| config.llama_base_url.clone()),
+            key_override.or_else(|| {
+                let key = config.llama_api_key.trim();
+                (!key.is_empty()).then(|| key.to_string())
+            }),
+            model_override
+                .clone()
+                .unwrap_or_else(|| config.default_model.clone()),
+        )
+    } else if let Some(saved) = saved_provider {
+        saved
+    } else {
+        ProviderSelection::legacy(
+            config.llama_base_url.clone(),
+            {
+                let key = config.llama_api_key.trim();
+                (!key.is_empty()).then(|| key.to_string())
+            },
+            config.default_model.clone(),
+        )
+    };
+
+    let (session_id, workspace, mut model) = if let Some(id) = cli.session {
+        let session = store
+            .get_session(&id)?
+            .with_context(|| format!("agent session `{id}` does not exist"))?;
+        let saved_workspace = canonical_workspace(&session.workspace)?;
+        if let Some(requested) = requested_workspace {
+            let requested = canonical_workspace(&requested)?;
+            if requested != saved_workspace {
+                bail!(
+                    "session `{id}` belongs to {}, not {}",
+                    saved_workspace.display(),
+                    requested.display()
+                );
+            }
+        }
+        let model = model_override.unwrap_or_else(|| {
+            if provider_is_persisted {
+                provider_selection.model.clone()
+            } else {
+                session.model
+            }
+        });
+        store.set_model(&id, &model)?;
+        (id, saved_workspace, model)
+    } else {
+        let workspace = canonical_workspace(requested_workspace.as_deref().unwrap_or(&launch_dir))?;
+        let model = model_override.unwrap_or_else(|| provider_selection.model.clone());
+        let session = store.create_session(&workspace, &model)?;
+        (session.id, workspace, model)
+    };
+
+    workspace_history.record(&workspace);
+    initialize_session(&store, &session_id, &workspace, &config, &memory_engine)?;
+    let policy = policy_for(cli.sandbox, &workspace);
+    provider_selection.model = model.clone();
+    let provider = build_provider(&provider_selection, &workspace, policy.mode)?;
+    let mut runtime_config = config;
+    apply_selection_to_config(&provider_selection, &mut runtime_config);
+    let whatsapp_launch =
+        avalonia_bridge::WhatsAppLaunchConfig::from_config(&runtime_config, &app_home);
+    let native_api_base = whatsapp_launch.native_api_base().to_string();
+    let native_api_token = whatsapp_launch.native_api_token().to_string();
+    let config_state = Arc::new(RwLock::new(runtime_config));
+    let models = fetch_model_ids(&config_state, &model).await;
+    if provider_selection.provider_id == "openai-account"
+        && !models.iter().any(|available| available == &model)
+    {
+        model = "default".to_string();
+        provider_selection.model = model.clone();
+        provider_settings.save(&provider_selection)?;
+        store.set_model(&session_id, &model)?;
+        let mut config = config_state.write().await;
+        config.default_model = model.clone();
+        config.save(&config_path)?;
+    }
+    let dream = spawn_dream_worker(
+        memory_engine.clone(),
+        llama::LlamaClient::new(),
+        config_state.clone(),
+    );
+    let (op_tx, op_rx) = mpsc::channel(256);
+    let (event_tx, event_rx) = mpsc::channel(1_024);
+    let (op_rx, event_tx) = if let Some((ops, events)) = native {
+        (ops, events)
+    } else {
+        (op_rx, event_tx)
+    };
+    let (approval_tx, approval_rx) = mpsc::channel(64);
+    let (privilege_tx, privilege_rx) = mpsc::channel(8);
+    let output_store = Arc::new(ToolOutputStore::new(
+        app_paths.store_dir.join("tool_outputs"),
+    )?);
+    let privilege_broker = Arc::new(PrivilegeBroker::new(event_tx.clone(), privilege_rx));
+
+    let mut registry = Registry::default();
+    tools::register_all(
+        &mut registry,
+        &workspace,
+        &app_paths.generated_dir,
+        policy.clone(),
+        config_state.clone(),
+        output_store.clone(),
+        privilege_broker.clone(),
+        native_api_base.clone(),
+        native_api_token.clone(),
+    );
+    let mcp_config = config_state.read().await.clone();
+    let mcp_runtime = mcp_client::register_configured(&mut registry, &mcp_config).await;
+    let mcp_notices = mcp_runtime.notices().to_vec();
+
+    let agent = Agent::new(
+        provider,
+        Arc::new(registry),
+        store,
+        session_id,
+        model,
+        mcp_config.reasoning_effort.clone(),
+        approval_for(cli.sandbox),
+        workspace,
+        policy.clone(),
+        output_store,
+        mcp_config.mcp_servers.clone(),
+        event_tx.clone(),
+        approval_rx,
+    );
+
+    send_ready(&agent, &policy, &config_state, &workspace_history, &models).await;
+    if let Some(note) = workspace_note {
+        let _ = agent
+            .event_sender()
+            .send(Event::Notice { message: note })
+            .await;
+    }
+    for message in mcp_notices {
+        let _ = agent.event_sender().send(Event::Notice { message }).await;
+    }
+    let core = tokio::spawn(core_loop(
+        agent,
+        mcp_runtime,
+        policy,
+        provider_selection,
+        provider_settings,
+        config_state,
+        config_path,
+        workspace_history,
+        app_paths,
+        memory_engine,
+        dream,
+        models,
+        op_rx,
+        approval_tx,
+        privilege_tx,
+        privilege_broker,
+        native_api_base,
+        native_api_token,
+    ));
+    // Avalonia owns the native event loop in a private child process. The
+    // bridge forwards the same serialisable Op/Event protocol used by the
+    // core, keeping all agent state and credentials in this Rust process.
+    if is_native {
+        return core.await.context("native core task panicked")?;
+    }
+    let ui_result = avalonia_bridge::run(op_tx.clone(), event_rx, whatsapp_launch).await;
+    let _ = op_tx.send(Op::Shutdown).await;
+    let core_result = core.await.context("agent core task panicked")?;
+
+    ui_result?;
+    core_result
+}
+
+/// What the idle op handler asks the loop to do next.
+enum IdleOutcome {
+    Continue,
+    StartTurn(String),
+    Shutdown,
+}
+
+/// Everything the op handlers need. One struct so the busy branch can defer
+/// an op and the drain loop can replay it against identical state.
+struct Core {
+    mesh: crate::mesh_transport::Mesh,
+    agent: Agent,
+    mcp_runtime: mcp_client::McpRuntime,
+    /// Old MCP transports stay alive while a turn that captured their registry
+    /// is still running in another conversation/workspace.
+    retired_mcp_runtimes: Vec<mcp_client::McpRuntime>,
+    policy: SandboxPolicy,
+    provider_selection: ProviderSelection,
+    provider_settings: ProviderSettingsStore,
+    config_state: Arc<RwLock<AppConfig>>,
+    config_path: PathBuf,
+    approvals: mpsc::Sender<(String, Decision)>,
+    privilege_replies: mpsc::Sender<PrivilegeCredential>,
+    privilege_broker: Arc<PrivilegeBroker>,
+    workspace_history: WorkspaceHistory,
+    app_paths: storage::AppPaths,
+    memory: Arc<MemoryEngine>,
+    dream: DreamHandle,
+    models: Vec<String>,
+    native_api_base: String,
+    native_api_token: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn core_loop(
+    agent: Agent,
+    mcp_runtime: mcp_client::McpRuntime,
+    policy: SandboxPolicy,
+    provider_selection: ProviderSelection,
+    provider_settings: ProviderSettingsStore,
+    config_state: Arc<RwLock<AppConfig>>,
+    config_path: PathBuf,
+    workspace_history: WorkspaceHistory,
+    app_paths: storage::AppPaths,
+    memory: Arc<MemoryEngine>,
+    dream: DreamHandle,
+    models: Vec<String>,
+    mut ops: mpsc::Receiver<Op>,
+    approvals: mpsc::Sender<(String, Decision)>,
+    privilege_replies: mpsc::Sender<PrivilegeCredential>,
+    privilege_broker: Arc<PrivilegeBroker>,
+    native_api_base: String,
+    native_api_token: String,
+) -> Result<()> {
+    let events = agent.event_sender();
+    let mut core = Core {
+        mesh: crate::mesh_transport::Mesh::new(app_paths.app_dir.clone()),
+        agent,
+        mcp_runtime,
+        retired_mcp_runtimes: Vec::new(),
+        policy,
+        provider_selection,
+        provider_settings,
+        config_state,
+        config_path,
+        approvals,
+        privilege_replies,
+        privilege_broker,
+        workspace_history,
+        app_paths,
+        memory,
+        dream,
+        models,
+        native_api_base,
+        native_api_token,
+    };
+    let mut active: HashMap<String, ActiveTurn> = HashMap::new();
+    let mut turns: FuturesUnordered<TurnFuture> = FuturesUnordered::new();
+    // Global state-changing ops still wait until every turn is idle. Session
+    // navigation and submissions are handled immediately, so users can open a
+    // second conversation while the first one keeps working.
+    let mut deferred: VecDeque<Op> = VecDeque::new();
+
+    loop {
+        tokio::select! {
+            completed = turns.next(), if !turns.is_empty() => {
+                let Some((session_id, result)) = completed else { continue };
+                let Some(mut finished) = active.remove(&session_id) else { continue };
+                report_turn_result(&events, &session_id, result).await;
+                spawn_agent_memory_refresh(&finished.agent, &core);
+                // The first user turn assigns the automatic conversation title.
+                send_session_list(&core, &events).await;
+
+                if let Some(text) = finished.queued.pop_front() {
+                    let agent = finished.agent.clone();
+                    let (cancel, future) = start_turn(&agent, text);
+                    finished.cancel = cancel;
+                    active.insert(session_id, finished);
+                    turns.push(future);
+                }
+
+                if active.is_empty() {
+                    core.retired_mcp_runtimes.clear();
+                    while let Some(op) = deferred.pop_front() {
+                        match handle_idle_op(&mut core, op, &events).await? {
+                            IdleOutcome::Continue => {}
+                            IdleOutcome::StartTurn(text) => {
+                                launch_turn(&core.agent, text, &mut active, &mut turns);
+                                break;
+                            }
+                            IdleOutcome::Shutdown => {
+                                core.dream.shutdown();
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+            op = ops.recv() => {
+                let Some(op) = op else {
+                    cancel_all_turns(&active);
+                    break;
+                };
+
+                match op {
+                    Op::SubmitAttachmentTo { session_id, path, text } => {
+                        let home=core.app_paths.app_dir.clone();
+                        let prepared=tokio::task::spawn_blocking(move || {
+                            if cfg!(target_os = "android") && !path.canonicalize()?.starts_with(home.canonicalize()?) { anyhow::bail!("Attachment is outside app storage"); }
+                            prepare_attachment(&path,&text)
+                        }).await.context("attachment worker failed")?;
+                        let result=match prepared {
+                            Ok(text) => device_request(&mut core,&uuid::Uuid::new_v4().to_string(),&uuid::Uuid::nil().to_string(),"submit",serde_json::json!({"session_id":session_id,"text":text}),&mut active,&mut turns,&events).await.map(|_|()),
+                            Err(error) => Err(error)
+                        };
+                        if let Err(error)=result { session_recoverable_error(&events,&session_id,error).await; }
+                    }
+                    Op::DeviceRequest { request_id, peer_id, action, payload } => {
+                        let result = device_request(&mut core, &request_id, &peer_id, &action, payload, &mut active, &mut turns, &events).await;
+                        let result = match result { Ok(value) => serde_json::json!({"ok":true,"data":value}), Err(error) => serde_json::json!({"ok":false,"error":error.to_string()}) };
+                        let _ = events.send(Event::DeviceResponse { request_id, result }).await;
+                    }
+                    Op::Submit { text } => {
+                        submit_or_queue(&core.agent, text, &mut active, &mut turns, &events).await;
+                    }
+                    Op::SubmitAttachment { text, path } => {
+                        let session_id = core.agent.session_id.clone();
+                        let prepared = tokio::task::spawn_blocking(move || prepare_attachment(&path, &text))
+                            .await
+                            .context("attachment preparation task failed")?;
+                        match prepared {
+                            Ok(text) => submit_or_queue(&core.agent, text, &mut active, &mut turns, &events).await,
+                            Err(error) => session_recoverable_error(&events, &session_id, error).await,
+                        }
+                    }
+                    Op::Interrupt => {
+                        if let Some(turn) = active.get(&core.agent.session_id) {
+                            turn.cancel.cancel();
+                        } else {
+                            session_notice(&events, &core.agent.session_id, "nothing is running").await;
+                        }
+                    }
+                    Op::Approve { call_id, decision } => {
+                        let _ = core.approvals.send((call_id, decision)).await;
+                    }
+                    Op::ProvidePrivilegeCredential { request_id, credential, remember } => {
+                        let _ = core.privilege_replies.send(PrivilegeCredential {
+                            request_id,
+                            credential,
+                            remember,
+                        }).await;
+                    }
+                    Op::Shutdown => {
+                        cancel_all_turns(&active);
+                        break;
+                    }
+                    Op::DeleteSession { ref id } if active.contains_key(id) => {
+                        session_notice(&events, id, "stop this conversation before deleting it").await;
+                    }
+                    Op::Compact | Op::Rollback | Op::ShowDiff
+                        if active.contains_key(&core.agent.session_id) =>
+                    {
+                        session_notice(
+                            &events,
+                            &core.agent.session_id,
+                            "command is available after this conversation finishes",
+                        ).await;
+                    }
+                    other if !active.is_empty() && !can_run_during_turns(&other) => {
+                        deferred.push_back(other);
+                        notice(
+                            &events,
+                            "setting queued — it will be applied when all conversations are idle",
+                        ).await;
+                    }
+                    other => {
+                        match handle_idle_op(&mut core, other, &events).await? {
+                            IdleOutcome::Continue => {}
+                            IdleOutcome::StartTurn(text) => {
+                                submit_or_queue(&core.agent, text, &mut active, &mut turns, &events).await;
+                            }
+                            IdleOutcome::Shutdown => {
+                                cancel_all_turns(&active);
+                                break;
+                            }
+                        }
+                        if active.is_empty() {
+                            core.retired_mcp_runtimes.clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    core.dream.shutdown();
+    Ok(())
+}
+
+async fn handle_idle_op(
+    core: &mut Core,
+    op: Op,
+    events: &mpsc::Sender<Event>,
+) -> Result<IdleOutcome> {
+    match op {
+        Op::SubmitAttachmentTo { .. } | Op::DeviceRequest { .. } => {
+            anyhow::bail!("Device requests must be dispatched through the live loop");
+        }
+        Op::SetBrave { api_key, mode } => {
+            if !matches!(mode.as_str(), "web" | "context") {
+                anyhow::bail!("Invalid Brave search mode");
+            }
+            let mut config = core.config_state.write().await;
+            if let Some(key) = api_key {
+                config.brave_api_key = key.expose().to_owned();
+            }
+            config.brave_search_mode = mode;
+            config.save(&core.config_path)?;
+            notice(events, "Brave Search settings saved").await;
+        }
+        Op::Submit { text } => return Ok(IdleOutcome::StartTurn(text)),
+        Op::SubmitAttachment { text, path } => {
+            let prepared = tokio::task::spawn_blocking(move || prepare_attachment(&path, &text))
+                .await
+                .context("attachment preparation task failed")?;
+            match prepared {
+                Ok(text) => return Ok(IdleOutcome::StartTurn(text)),
+                Err(error) => recoverable_error(events, error).await,
+            }
+        }
+        Op::Interrupt => notice(events, "nothing is running").await,
+        Op::Approve { call_id, decision } => {
+            let _ = core.approvals.send((call_id, decision)).await;
+        }
+        Op::ProvidePrivilegeCredential {
+            request_id,
+            credential,
+            remember,
+        } => {
+            let _ = core
+                .privilege_replies
+                .send(PrivilegeCredential {
+                    request_id,
+                    credential,
+                    remember,
+                })
+                .await;
+        }
+        Op::Compact => match core.agent.force_compact().await {
+            Ok(true) => {}
+            Ok(false) => notice(events, "there is not enough history to compact").await,
+            Err(error) => recoverable_error(events, error).await,
+        },
+        Op::Rollback => {
+            if core.policy.mode == SandboxMode::ReadOnly {
+                notice(
+                    events,
+                    "rollback is disabled by the read-only sandbox policy",
+                )
+                .await;
+            } else {
+                match core
+                    .agent
+                    .store
+                    .rollback_session(&core.agent.session_id, &core.agent.workspace)
+                {
+                    Ok(paths) if paths.is_empty() => notice(events, "nothing to roll back").await,
+                    Ok(paths) => {
+                        notice(
+                            events,
+                            &format!("rolled back {} file change(s)", paths.len()),
+                        )
+                        .await
+                    }
+                    Err(error) => recoverable_error(events, error).await,
+                }
+            }
+        }
+        Op::ShowDiff => match core.agent.store.session_diff(&core.agent.session_id) {
+            Ok(diff) if diff.trim().is_empty() => notice(events, "no active patch diff").await,
+            Ok(diff) => {
+                let _ = events
+                    .send(Event::PatchApplied {
+                        files: Vec::new(),
+                        diff,
+                    })
+                    .await;
+            }
+            Err(error) => recoverable_error(events, error).await,
+        },
+        Op::NewSession => {
+            let session = core
+                .agent
+                .store
+                .create_session(&core.agent.workspace, &core.agent.model)?;
+            let config = core.config_state.read().await.clone();
+            initialize_session(
+                &core.agent.store,
+                &session.id,
+                &core.agent.workspace,
+                &config,
+                &core.memory,
+            )?;
+            core.agent.switch_session(session.id).await;
+            let _ = events.send(Event::SessionReset).await;
+            send_ready(
+                &core.agent,
+                &core.policy,
+                &core.config_state,
+                &core.workspace_history,
+                &core.models,
+            )
+            .await;
+        }
+        Op::SetWorkspace { path } => match set_workspace(core, path, events).await {
+            Ok(()) => {}
+            Err(error) => recoverable_error(events, error).await,
+        },
+        Op::SetModel { model } => {
+            set_model(core, model, events).await?;
+            core.models = llama::normalize_model_ids(core.models.clone(), &core.agent.model);
+            send_ready(
+                &core.agent,
+                &core.policy,
+                &core.config_state,
+                &core.workspace_history,
+                &core.models,
+            )
+            .await;
+        }
+        Op::SetReasoningEffort { effort } => {
+            set_reasoning_effort(core, effort, events).await?;
+            send_ready(
+                &core.agent,
+                &core.policy,
+                &core.config_state,
+                &core.workspace_history,
+                &core.models,
+            )
+            .await;
+        }
+        Op::SetProvider {
+            provider_id,
+            api_key,
+            base_url,
+        } => {
+            if let Err(error) = set_provider(
+                core,
+                provider_id,
+                api_key.map(|secret| secret.expose().to_string()),
+                base_url,
+                events,
+            )
+            .await
+            {
+                recoverable_error(events, error).await;
+            }
+        }
+        Op::SetSubagentDefaults {
+            enabled,
+            provider_id,
+            model,
+            reasoning_effort,
+        } => {
+            if let Err(error) =
+                set_subagent_defaults(core, enabled, provider_id, model, reasoning_effort, events)
+                    .await
+            {
+                recoverable_error(events, error).await;
+            }
+        }
+        Op::LoginProvider { provider_id } => {
+            if cfg!(target_os = "android") {
+                notice(
+                    events,
+                    "Configure this provider with an API key on this device.",
+                )
+                .await;
+                return Ok(IdleOutcome::Continue);
+            }
+            let login_result = match provider_id.as_str() {
+                "openai-account" => {
+                    let progress_events = events.clone();
+                    crate::codex_app_server::login_with_chatgpt_notifying(
+                        move |verification_url, user_code| {
+                            let _ = progress_events.try_send(Event::ProviderLoginDeviceCode {
+                                provider_id: "openai-account".into(),
+                                verification_url,
+                                user_code,
+                            });
+                        },
+                    )
+                    .await
+                }
+                "anthropic-account" => crate::provider::login_with_claude().await,
+                _ => Err(anyhow::anyhow!(
+                    "account login is not configured for `{provider_id}`"
+                )),
+            };
+            let (success, message) = match login_result {
+                Ok(()) => match set_provider(core, provider_id.clone(), None, None, events).await {
+                    Ok(()) => (true, "Authentication completed.".to_string()),
+                    Err(error) => (false, error.to_string()),
+                },
+                Err(error) => (false, error.to_string()),
+            };
+            let _ = events
+                .send(Event::ProviderLoginFinished {
+                    provider_id,
+                    success,
+                    message,
+                })
+                .await;
+        }
+        Op::SetWebSearch { enabled } => {
+            set_web_search(core, enabled, events).await?;
+        }
+        Op::SetMcpServers { servers } => {
+            set_mcp_servers(core, servers, events).await?;
+        }
+        Op::SetSandbox { mode } => {
+            set_sandbox(core, &mode, events).await?;
+        }
+        Op::SetWhatsApp {
+            enabled,
+            assistant_name,
+            has_own_number,
+            allowed_jids,
+        } => {
+            let (assistant_name, allowed_jids) = {
+                let mut config = core.config_state.write().await;
+                config.whatsapp_enabled = enabled;
+                config.whatsapp_assistant_name = assistant_name;
+                config.whatsapp_has_own_number = has_own_number;
+                config.whatsapp_allowed_jids = allowed_jids;
+                config.normalize();
+                config.save(&core.config_path)?;
+                (
+                    config.whatsapp_assistant_name.clone(),
+                    config.whatsapp_allowed_jids.clone(),
+                )
+            };
+            let _ = events
+                .send(Event::WhatsAppConfigChanged {
+                    enabled,
+                    assistant_name,
+                    has_own_number,
+                    allowed_jids,
+                })
+                .await;
+            notice(events, "WhatsApp settings saved").await;
+        }
+        Op::SetNodeHub {
+            enabled,
+            bind,
+            port,
+        } => match bind.trim().parse::<std::net::IpAddr>() {
+            Err(_) => {
+                recoverable_error(
+                    events,
+                    anyhow::anyhow!("the Hub address must be a valid IP, for example 0.0.0.0"),
+                )
+                .await;
+            }
+            Ok(_) if port == 0 => {
+                recoverable_error(events, anyhow::anyhow!("the Hub port cannot be 0")).await;
+            }
+            Ok(_) => {
+                let (bind, port) = {
+                    let mut config = core.config_state.write().await;
+                    config.node_hub_enabled = enabled;
+                    config.node_hub_bind = bind;
+                    config.node_hub_port = port;
+                    config.normalize();
+                    config.save(&core.config_path)?;
+                    (config.node_hub_bind.clone(), config.node_hub_port)
+                };
+                let _ = events
+                    .send(Event::NodeHubConfigChanged {
+                        enabled,
+                        bind,
+                        port,
+                    })
+                    .await;
+                notice(
+                    events,
+                    "Node Hub settings saved; restart GnomeAI to apply the listener",
+                )
+                .await;
+            }
+        },
+        Op::ListSessions => {
+            send_session_list(core, events).await;
+        }
+        Op::ResumeSession { id } => {
+            if let Err(error) = resume_session(core, &id, events).await {
+                recoverable_error(events, error).await;
+            }
+        }
+        Op::ForkSession => {
+            if let Err(error) = fork_session(core, events).await {
+                recoverable_error(events, error).await;
+            }
+        }
+        Op::RenameSession { id, title } => {
+            match core.agent.store.rename_session(&id, &title) {
+                Ok(()) => notice(events, "session renamed").await,
+                Err(error) => recoverable_error(events, error).await,
+            }
+            send_session_list(core, events).await;
+        }
+        Op::DeleteSession { id } => {
+            if let Err(error) = delete_session(core, &id, events).await {
+                recoverable_error(events, error).await;
+            }
+            send_session_list(core, events).await;
+        }
+        Op::MemoryShow => {
+            show_memory(core, events).await;
+        }
+        Op::MemoryStatus => {
+            let config = core.config_state.read().await.clone();
+            match core.memory.status(&config) {
+                Ok(status) => notice(events, &status.render_text()).await,
+                Err(error) => recoverable_error(events, error).await,
+            }
+        }
+        Op::MemoryClear => match core.memory.clear() {
+            Ok(()) => notice(events, "shared memory cleared").await,
+            Err(error) => recoverable_error(events, error).await,
+        },
+        Op::MemoryDream { dry_run } => {
+            // Dreaming can run for up to memory_dream_max_seconds; keep the
+            // op loop responsive and report when the cycle finishes.
+            let dream = core.dream.clone();
+            let events = events.clone();
+            notice(
+                &events,
+                if dry_run {
+                    "dream dry-run started — the report will follow"
+                } else {
+                    "dream cycle started — the report will follow"
+                },
+            )
+            .await;
+            tokio::spawn(async move {
+                match dream.run(dry_run).await {
+                    Ok(report) => notice(&events, &report.render_text()).await,
+                    Err(error) => recoverable_error(&events, error).await,
+                }
+            });
+        }
+        Op::MemoryReindex => {
+            let engine = core.memory.clone();
+            let config_state = core.config_state.clone();
+            let events = events.clone();
+            notice(&events, "reindexing memory embeddings…").await;
+            tokio::spawn(async move {
+                let config = config_state.read().await.clone();
+                match engine.reindex(&config).await {
+                    Ok(report) => notice(&events, &report.render_text()).await,
+                    Err(error) => recoverable_error(&events, error).await,
+                }
+            });
+        }
+        Op::MemoryForget { id } => match core.memory.forget(&id) {
+            Ok(true) => notice(events, &format!("fact {id} marked as forgotten")).await,
+            Ok(false) => notice(events, &format!("no fact with id {id}")).await,
+            Err(error) => recoverable_error(events, error).await,
+        },
+        Op::MemorySet { enabled } => {
+            {
+                let mut config = core.config_state.write().await;
+                config.memory_enabled = enabled;
+                config.save(&core.config_path)?;
+            }
+            notice(
+                events,
+                if enabled {
+                    "shared memory enabled — facts are injected into new sessions and \
+                     extracted after each turn"
+                } else {
+                    "shared memory disabled — nothing is read or written until re-enabled"
+                },
+            )
+            .await;
+        }
+        Op::SkillsList => {
+            notice(events, &skills::render_catalog(&core.agent.workspace)).await;
+        }
+        Op::SkillInspect { name } => match skills::inspect(&core.agent.workspace, &name) {
+            Ok(report) => notice(events, &report).await,
+            Err(error) => recoverable_error(events, error).await,
+        },
+        Op::SkillActivate { name } => match skills::load(&core.agent.workspace, &name) {
+            Ok(skill) => {
+                let block = skills::render_for_model(&skill);
+                core.agent.store.append_turn(
+                    &core.agent.session_id,
+                    "system",
+                    &block,
+                    (block.len() / 4) as i64,
+                    true,
+                )?;
+                notice(
+                    events,
+                    &format!(
+                        "skill `{}` activated for this session; its requested tools do not \
+                         bypass the current execution mode",
+                        skill.summary.name
+                    ),
+                )
+                .await;
+            }
+            Err(error) => recoverable_error(events, error).await,
+        },
+        Op::SkillInstall { source } => {
+            notice(events, "installing and validating skill…").await;
+            let workspace = core.agent.workspace.clone();
+            match tokio::task::spawn_blocking(move || skills::install(&source, &workspace)).await {
+                Ok(Ok(skill)) => {
+                    append_skill_catalog_update(core)?;
+                    notice(
+                        events,
+                        &format!(
+                            "installed `{}` from a validated SKILL.md package",
+                            skill.name
+                        ),
+                    )
+                    .await;
+                }
+                Ok(Err(error)) => recoverable_error(events, error).await,
+                Err(error) => recoverable_error(events, error).await,
+            }
+        }
+        Op::SkillUpdate { name } => {
+            notice(events, "updating and re-validating skill…").await;
+            let workspace = core.agent.workspace.clone();
+            match tokio::task::spawn_blocking(move || skills::update(&name, &workspace)).await {
+                Ok(Ok(skill)) => {
+                    append_skill_catalog_update(core)?;
+                    notice(events, &format!("updated `{}`", skill.name)).await;
+                }
+                Ok(Err(error)) => recoverable_error(events, error).await,
+                Err(error) => recoverable_error(events, error).await,
+            }
+        }
+        Op::SkillVerify { name } => match skills::verify(&core.agent.workspace, &name) {
+            Ok(report) => notice(events, &report).await,
+            Err(error) => recoverable_error(events, error).await,
+        },
+        Op::SkillRemove { name } => match skills::remove(&name) {
+            Ok(()) => {
+                append_skill_catalog_update(core)?;
+                notice(events, &format!("removed managed skill `{name}`")).await;
+            }
+            Err(error) => recoverable_error(events, error).await,
+        },
+        Op::Doctor => {
+            let report = run_doctor(core).await;
+            notice(events, &report).await;
+        }
+        Op::Shutdown => return Ok(IdleOutcome::Shutdown),
+    }
+    Ok(IdleOutcome::Continue)
+}
+
+fn append_skill_catalog_update(core: &Core) -> Result<()> {
+    let catalog = skills::catalog_prompt(&core.agent.workspace);
+    let content = if catalog.is_empty() {
+        "[Agent Skills catalog update]\nNo Agent Skills are currently installed.".to_string()
+    } else {
+        format!("[Agent Skills catalog update]{catalog}")
+    };
+    core.agent.store.append_turn(
+        &core.agent.session_id,
+        "system",
+        &content,
+        (content.len() / 4) as i64,
+        true,
+    )?;
+    Ok(())
+}
+
+fn prepare_attachment(path: &Path, prompt: &str) -> Result<String> {
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("cannot inspect {}", path.display()))?;
+    if metadata.len() as usize > MAX_ATTACHMENT_BYTES {
+        bail!(
+            "attachment is too large (limit {} MiB)",
+            MAX_ATTACHMENT_BYTES / (1024 * 1024)
+        );
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment");
+    if uploads::file_type_from_name(name) == "image" {
+        let bytes =
+            std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+        let media_type = mime_guess::from_path(path)
+            .first_raw()
+            .unwrap_or("application/octet-stream");
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let prompt = if prompt.trim().is_empty() {
+            format!("Analyze the attached image “{name}”.")
+        } else {
+            prompt.trim().to_string()
+        };
+        return Ok(serde_json::to_string(&serde_json::json!([
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": format!("data:{media_type};base64,{data}")}}
+        ]))?);
+    }
+
+    let extracted =
+        uploads::extract_text_attachment(path).with_context(|| format!("cannot read {name}"))?;
+    if extracted.trim().is_empty() {
+        bail!("no readable text was found in {name}");
+    }
+    let prompt = if prompt.trim().is_empty() {
+        format!("Analyze the attached file “{name}”.")
+    } else {
+        prompt.trim().to_string()
+    };
+    Ok(format!(
+        "{prompt}\n\n<attached_file name=\"{name}\">\n{extracted}\n</attached_file>"
+    ))
+}
+
+fn start_turn(agent: &Agent, text: String) -> (CancellationToken, TurnFuture) {
+    let agent = agent.clone();
+    let session_id = agent.session_id.clone();
+    let cancel = CancellationToken::new();
+    let turn_cancel = cancel.clone();
+    let future: TurnFuture = Box::pin(async move {
+        let result = AssertUnwindSafe(agent.run_turn(text, turn_cancel))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("agent turn task panicked")));
+        (session_id, result)
+    });
+    (cancel, future)
+}
+
+fn launch_turn(
+    agent: &Agent,
+    text: String,
+    active: &mut HashMap<String, ActiveTurn>,
+    turns: &mut FuturesUnordered<TurnFuture>,
+) {
+    let session_id = agent.session_id.clone();
+    let (cancel, future) = start_turn(agent, text);
+    active.insert(
+        session_id,
+        ActiveTurn {
+            cancel,
+            agent: agent.clone(),
+            queued: VecDeque::new(),
+        },
+    );
+    turns.push(future);
+}
+
+async fn submit_or_queue(
+    agent: &Agent,
+    text: String,
+    active: &mut HashMap<String, ActiveTurn>,
+    turns: &mut FuturesUnordered<TurnFuture>,
+    events: &mpsc::Sender<Event>,
+) {
+    if let Err(error) = agent.store.assert_session_writable(&agent.session_id) {
+        session_recoverable_error(events, &agent.session_id, error).await;
+        return;
+    }
+    if let Some(turn) = active.get_mut(&agent.session_id) {
+        turn.queued.push_back(text);
+        session_notice(
+            events,
+            &agent.session_id,
+            "message queued in this conversation",
+        )
+        .await;
+    } else {
+        launch_turn(agent, text, active, turns);
+    }
+}
+
+fn cancel_all_turns(active: &HashMap<String, ActiveTurn>) {
+    for turn in active.values() {
+        turn.cancel.cancel();
+    }
+}
+
+/// Navigation is session-local and safe while another Agent clone owns an
+/// active turn. Provider/sandbox/MCP and other global mutations stay deferred.
+fn can_run_during_turns(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::NewSession
+            | Op::SetWorkspace { .. }
+            | Op::ListSessions
+            | Op::ResumeSession { .. }
+            | Op::RenameSession { .. }
+            | Op::DeleteSession { .. }
+    )
+}
+
+async fn session_event(events: &mpsc::Sender<Event>, session_id: &str, payload: Event) {
+    let _ = events
+        .send(Event::SessionEvent {
+            session_id: session_id.to_string(),
+            payload: Box::new(payload),
+        })
+        .await;
+}
+
+async fn session_notice(events: &mpsc::Sender<Event>, session_id: &str, message: &str) {
+    session_event(
+        events,
+        session_id,
+        Event::Notice {
+            message: message.to_string(),
+        },
+    )
+    .await;
+}
+
+async fn session_recoverable_error(
+    events: &mpsc::Sender<Event>,
+    session_id: &str,
+    error: anyhow::Error,
+) {
+    session_event(
+        events,
+        session_id,
+        Event::Error {
+            message: format!("{error:#}"),
+            fatal: false,
+        },
+    )
+    .await;
+}
+
+async fn report_turn_result(events: &mpsc::Sender<Event>, session_id: &str, result: Result<()>) {
+    match result {
+        Ok(()) => {}
+        Err(error) => session_recoverable_error(events, session_id, error).await,
+    }
+}
+
+async fn set_model(core: &mut Core, model: String, events: &mpsc::Sender<Event>) -> Result<()> {
+    let model = model.trim();
+    if model.is_empty() {
+        notice(events, "model name cannot be empty").await;
+        return Ok(());
+    }
+    if core.provider_selection.provider_id == "openai-account"
+        && !core.models.iter().any(|available| available == model)
+    {
+        notice(
+            events,
+            "the model is not available for the connected OpenAI account; reload the provider and choose a model from the list",
+        )
+        .await;
+        return Ok(());
+    }
+    core.agent.model = model.to_string();
+    core.agent.store.set_model(&core.agent.session_id, model)?;
+    core.provider_selection.model = model.to_string();
+    core.provider_settings.save(&core.provider_selection)?;
+    {
+        let mut config = core.config_state.write().await;
+        config.default_model = model.to_string();
+        config.save(&core.config_path)?;
+    }
+    notice(events, &format!("model set to {model}")).await;
+    Ok(())
+}
+
+async fn set_reasoning_effort(
+    core: &mut Core,
+    effort: String,
+    events: &mpsc::Sender<Event>,
+) -> Result<()> {
+    let effort = normalize_reasoning_effort(&effort);
+    core.agent.reasoning_effort = effort.clone();
+    {
+        let mut config = core.config_state.write().await;
+        config.reasoning_effort = effort.clone();
+        config.normalize();
+        config.save(&core.config_path)?;
+    }
+    notice(events, &format!("reasoning effort set to {effort}")).await;
+    Ok(())
+}
+
+async fn set_provider(
+    core: &mut Core,
+    provider_id: String,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    events: &mpsc::Sender<Event>,
+) -> Result<()> {
+    core.agent
+        .store
+        .assert_session_writable(&core.agent.session_id)?;
+    let api_key = core
+        .config_state
+        .read()
+        .await
+        .resolve_provider_api_key(&provider_id, api_key);
+    let selection = ProviderSelection::from_choice(provider_id, api_key, base_url)?;
+    let provider = build_provider(&selection, &core.agent.workspace, core.policy.mode)?;
+    core.provider_settings.save(&selection)?;
+    core.agent
+        .store
+        .set_model(&core.agent.session_id, &selection.model)?;
+    {
+        let mut config = core.config_state.write().await;
+        apply_selection_to_config(&selection, &mut config);
+        config.save(&core.config_path)?;
+    }
+
+    core.agent.provider = provider;
+    core.agent.model = selection.model.clone();
+    core.agent.reasoning_effort = core.config_state.read().await.reasoning_effort.clone();
+    core.provider_selection = selection;
+
+    // Fetch once, outside the configuration lock. The helper falls back to
+    // the maintained provider catalog and always keeps the active model.
+    core.models = fetch_model_ids(&core.config_state, &core.agent.model).await;
+
+    let _ = events
+        .send(Event::ProviderChanged {
+            provider: core.agent.provider.name().to_string(),
+            model: core.agent.model.clone(),
+            models: core.models.clone(),
+        })
+        .await;
+    send_ready(
+        &core.agent,
+        &core.policy,
+        &core.config_state,
+        &core.workspace_history,
+        &core.models,
+    )
+    .await;
+
+    if matches!(
+        preset(&core.provider_selection.provider_id).map(|provider| provider.protocol),
+        Some(provider_catalog::WireProtocol::CodexAppServer)
+            | Some(provider_catalog::WireProtocol::ClaudeCli)
+    ) {
+        notice(
+            events,
+            "account mode delegates each turn to the vendor runtime and uses its saved login",
+        )
+        .await;
+    } else {
+        notice(
+            events,
+            &format!("provider set to {}", core.agent.provider.name()),
+        )
+        .await;
+    }
+    Ok(())
+}
+
+async fn build_registry(
+    core: &Core,
+    workspace: &Path,
+    policy: SandboxPolicy,
+) -> (Registry, mcp_client::McpRuntime) {
+    let mut registry = Registry::default();
+    tools::register_all(
+        &mut registry,
+        workspace,
+        &core.app_paths.generated_dir,
+        policy,
+        core.config_state.clone(),
+        core.agent.output_store.clone(),
+        core.privilege_broker.clone(),
+        core.native_api_base.clone(),
+        core.native_api_token.clone(),
+    );
+    let config = core.config_state.read().await.clone();
+    let mcp_runtime = mcp_client::register_configured(&mut registry, &config).await;
+    (registry, mcp_runtime)
+}
+
+fn replace_mcp_runtime(core: &mut Core, runtime: mcp_client::McpRuntime) {
+    let previous = std::mem::replace(&mut core.mcp_runtime, runtime);
+    core.retired_mcp_runtimes.push(previous);
+}
+
+async fn report_mcp_runtime(runtime: &mcp_client::McpRuntime, events: &mpsc::Sender<Event>) {
+    for message in runtime.notices() {
+        notice(events, message).await;
+    }
+}
+
+async fn set_sandbox(core: &mut Core, mode: &str, events: &mpsc::Sender<Event>) -> Result<()> {
+    let mode = match parse_sandbox(mode) {
+        Ok(mode) => mode,
+        Err(error) => {
+            recoverable_error(events, error).await;
+            return Ok(());
+        }
+    };
+    let policy = policy_for(mode, &core.agent.workspace);
+    let (registry, mcp_runtime) = build_registry(core, &core.agent.workspace, policy.clone()).await;
+    core.agent.registry = Arc::new(registry);
+    replace_mcp_runtime(core, mcp_runtime);
+    core.agent.verify_policy = policy.clone();
+    core.agent.approval = approval_for(mode);
+    // Account-backed CLIs receive the current sandbox mode as command-line
+    // policy, so rebuild the adapter whenever it changes.
+    core.agent.provider =
+        build_provider(&core.provider_selection, &core.agent.workspace, policy.mode)?;
+    core.policy = policy;
+    {
+        let mut config = core.config_state.write().await;
+        config.web_sandbox_mode = sandbox_name(mode).to_string();
+        config.save(&core.config_path)?;
+    }
+    send_ready(
+        &core.agent,
+        &core.policy,
+        &core.config_state,
+        &core.workspace_history,
+        &core.models,
+    )
+    .await;
+    report_mcp_runtime(&core.mcp_runtime, events).await;
+    notice(
+        events,
+        match mode {
+            SandboxMode::ReadOnly => {
+                "read-only enabled — commands stay isolated and cannot modify the workspace"
+            }
+            SandboxMode::Normal => {
+                "normal enabled — commands have normal OS access only after your approval"
+            }
+            SandboxMode::FullAccess => {
+                "WARNING: full-access enabled — commands run with normal OS access and no approvals"
+            }
+            SandboxMode::IsolatedWorkspaceWrite => {
+                "internal isolated-workspace-write policy enabled"
+            }
+        },
+    )
+    .await;
+    Ok(())
+}
+
+async fn set_workspace(
+    core: &mut Core,
+    requested: PathBuf,
+    events: &mpsc::Sender<Event>,
+) -> Result<()> {
+    let workspace = resolve_workspace_request(&core.agent.workspace, &requested)?;
+    if workspace == core.agent.workspace {
+        // A no-op navigation still completes the frontend's pending transition.
+        send_ready(
+            &core.agent,
+            &core.policy,
+            &core.config_state,
+            &core.workspace_history,
+            &core.models,
+        )
+        .await;
+        notice(
+            events,
+            &format!("workspace is already {}", workspace.display()),
+        )
+        .await;
+        return Ok(());
+    }
+
+    // Build every path-bound component before mutating the live agent. A
+    // provider/configuration error therefore leaves the current workspace
+    // fully usable.
+    let policy = policy_for(core.policy.mode, &workspace);
+    let provider = build_provider(&core.provider_selection, &workspace, policy.mode)?;
+    let (registry, mcp_runtime) = build_registry(core, &workspace, policy.clone()).await;
+    let session = core
+        .agent
+        .store
+        .create_session(&workspace, &core.agent.model)?;
+    let config = core.config_state.read().await.clone();
+    initialize_session(
+        &core.agent.store,
+        &session.id,
+        &workspace,
+        &config,
+        &core.memory,
+    )?;
+
+    core.agent.workspace = workspace.clone();
+    core.agent.verify_policy = policy.clone();
+    core.agent.registry = Arc::new(registry);
+    replace_mcp_runtime(core, mcp_runtime);
+    core.agent.provider = provider;
+    core.agent.switch_session(session.id).await;
+    core.policy = policy;
+    core.workspace_history.record(&workspace);
+
+    let _ = events.send(Event::SessionReset).await;
+    send_ready(
+        &core.agent,
+        &core.policy,
+        &core.config_state,
+        &core.workspace_history,
+        &core.models,
+    )
+    .await;
+    notice(
+        events,
+        &format!("workspace changed to {}", workspace.display()),
+    )
+    .await;
+    Ok(())
+}
+
+async fn set_web_search(core: &Core, enabled: bool, events: &mpsc::Sender<Event>) -> Result<()> {
+    {
+        let mut config = core.config_state.write().await;
+        config.web_search_enabled = enabled;
+        config.save(&core.config_path)?;
+    }
+    let _ = events.send(Event::WebSearchChanged { enabled }).await;
+    notice(
+        events,
+        if enabled {
+            "web search enabled; local Firecrawl starts on the first web request"
+        } else {
+            "web search disabled"
+        },
+    )
+    .await;
+    send_ready(
+        &core.agent,
+        &core.policy,
+        &core.config_state,
+        &core.workspace_history,
+        &core.models,
+    )
+    .await;
+    Ok(())
+}
+
+async fn set_mcp_servers(
+    core: &mut Core,
+    servers: Vec<config::McpServerConfig>,
+    events: &mpsc::Sender<Event>,
+) -> Result<()> {
+    let normalized = {
+        let mut config = core.config_state.write().await;
+        config.mcp_servers = servers;
+        config.normalize();
+        config.save(&core.config_path)?;
+        config.mcp_servers.clone()
+    };
+    let (registry, runtime) =
+        build_registry(core, &core.agent.workspace, core.policy.clone()).await;
+    core.agent.registry = Arc::new(registry);
+    core.agent.mcp_servers = normalized.clone();
+    replace_mcp_runtime(core, runtime);
+    let _ = events
+        .send(Event::McpConfigChanged {
+            servers: normalized,
+        })
+        .await;
+    report_mcp_runtime(&core.mcp_runtime, events).await;
+    send_ready(
+        &core.agent,
+        &core.policy,
+        &core.config_state,
+        &core.workspace_history,
+        &core.models,
+    )
+    .await;
+    Ok(())
+}
+
+async fn set_subagent_defaults(
+    core: &mut Core,
+    enabled: bool,
+    provider_id: String,
+    model: String,
+    reasoning_effort: String,
+    events: &mpsc::Sender<Event>,
+) -> Result<()> {
+    let provider_id = provider_id.trim().to_lowercase();
+    let provider_id = if provider_id.is_empty() {
+        "inherit".to_string()
+    } else {
+        provider_id
+    };
+    let model = model.trim();
+    let model = if model.is_empty() { "inherit" } else { model };
+    let reasoning_effort = normalize_reasoning_effort(&reasoning_effort);
+
+    if enabled && provider_id != "inherit" {
+        let provider = preset(&provider_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown delegated-worker provider `{provider_id}`"))?;
+        if provider.auth == provider_catalog::AuthKind::Account {
+            bail!(
+                "account-backed providers cannot be delegated workers; choose an API provider or inherit"
+            );
+        }
+    }
+
+    let (provider_id, model, reasoning_effort) = {
+        let mut config = core.config_state.write().await;
+        config.subagent_use_separate_model = enabled;
+        config.subagent_provider_id = provider_id;
+        config.subagent_model = model.to_string();
+        config.subagent_reasoning_effort = reasoning_effort;
+        config.normalize();
+        config.save(&core.config_path)?;
+        (
+            config.subagent_provider_id.clone(),
+            config.subagent_model.clone(),
+            config.subagent_reasoning_effort.clone(),
+        )
+    };
+    let _ = events
+        .send(Event::SubagentDefaultsChanged {
+            enabled,
+            provider_id,
+            model,
+            reasoning_effort,
+        })
+        .await;
+    notice(events, "delegated-worker defaults saved").await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Session management
+// ---------------------------------------------------------------------------
+
+async fn send_session_list(core: &Core, events: &mpsc::Sender<Event>) {
+    let sessions = match core.agent.store.recent_sessions(20) {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            recoverable_error(events, error).await;
+            return;
+        }
+    };
+    let summaries = sessions
+        .into_iter()
+        .map(|session| {
+            // Backfill older untitled sessions from their first real user
+            // message so the sidebar is useful immediately after upgrading.
+            let title = session.title.or_else(|| {
+                let first = core
+                    .agent
+                    .store
+                    .live_turns(&session.id)
+                    .ok()?
+                    .into_iter()
+                    .find(|turn| turn.role == "user" && !turn.is_summary)?;
+                let visible = provider::user_content_for_display(&first.content);
+                let title = agent::automatic_session_title(&visible);
+                core.agent.store.rename_session(&session.id, &title).ok()?;
+                Some(title)
+            });
+            SessionSummary {
+                turns: core.agent.store.count_turns(&session.id).unwrap_or(0),
+                is_current: session.id == core.agent.session_id,
+                id: session.id,
+                title,
+                workspace: session.workspace,
+                model: session.model,
+                updated_at: session.updated_at,
+            }
+        })
+        .collect();
+    let _ = events
+        .send(Event::SessionList {
+            sessions: summaries,
+        })
+        .await;
+}
+
+async fn resume_session(core: &mut Core, id: &str, events: &mpsc::Sender<Event>) -> Result<()> {
+    let session = core
+        .agent
+        .store
+        .get_session(id)?
+        .with_context(|| format!("session `{id}` does not exist"))?;
+    let workspace = canonical_workspace(&session.workspace)?;
+
+    if workspace != core.agent.workspace {
+        let policy = policy_for(core.policy.mode, &workspace);
+        let provider = build_provider(&core.provider_selection, &workspace, policy.mode)?;
+        let (registry, mcp_runtime) = build_registry(core, &workspace, policy.clone()).await;
+        core.agent.workspace = workspace.clone();
+        core.agent.verify_policy = policy.clone();
+        core.agent.registry = Arc::new(registry);
+        replace_mcp_runtime(core, mcp_runtime);
+        core.agent.provider = provider;
+        core.policy = policy;
+        core.workspace_history.record(&workspace);
+    }
+
+    if let Some((provider, reasoning)) = core.agent.store.session_execution(id)? {
+        if provider != core.provider_selection.provider_id {
+            let config = core.config_state.read().await.clone();
+            let mut selection = ProviderSelection::from_choice(
+                provider.clone(),
+                config.provider_api_keys.get(&provider).cloned(),
+                None,
+            )?;
+            selection.model = session.model.clone();
+            core.agent.provider = build_provider(&selection, &workspace, core.policy.mode)?;
+            core.provider_selection = selection;
+            let mut config = core.config_state.write().await;
+            apply_selection_to_config(&core.provider_selection, &mut config);
+        }
+        core.agent.reasoning_effort = reasoning.clone();
+        core.config_state.write().await.reasoning_effort = reasoning;
+    }
+    core.agent.model = session.model.clone();
+    core.agent.switch_session(session.id.clone()).await;
+
+    let _ = events.send(Event::SessionReset).await;
+    let turns = session_history_turns(&core.agent)?;
+    if !turns.is_empty() {
+        let _ = events.send(Event::HistoryReplay { turns }).await;
+    }
+    send_ready(
+        &core.agent,
+        &core.policy,
+        &core.config_state,
+        &core.workspace_history,
+        &core.models,
+    )
+    .await;
+    Ok(())
+}
+
+async fn fork_session(core: &mut Core, events: &mpsc::Sender<Event>) -> Result<()> {
+    let tip = core.agent.store.latest_seq(&core.agent.session_id)?;
+    let fork = core.agent.store.fork(&core.agent.session_id, tip)?;
+    core.agent.switch_session(fork.id.clone()).await;
+
+    let _ = events.send(Event::SessionReset).await;
+    let turns = session_history_turns(&core.agent)?;
+    if !turns.is_empty() {
+        let _ = events.send(Event::HistoryReplay { turns }).await;
+    }
+    send_ready(
+        &core.agent,
+        &core.policy,
+        &core.config_state,
+        &core.workspace_history,
+        &core.models,
+    )
+    .await;
+    notice(
+        events,
+        &format!(
+            "forked into session {} — the original is untouched",
+            &fork.id[..8.min(fork.id.len())]
+        ),
+    )
+    .await;
+    Ok(())
+}
+
+async fn delete_session(core: &mut Core, id: &str, events: &mpsc::Sender<Event>) -> Result<()> {
+    let deleting_current = id == core.agent.session_id;
+    core.agent.store.delete_session(id)?;
+    if deleting_current {
+        let session = core
+            .agent
+            .store
+            .create_session(&core.agent.workspace, &core.agent.model)?;
+        let config = core.config_state.read().await.clone();
+        initialize_session(
+            &core.agent.store,
+            &session.id,
+            &core.agent.workspace,
+            &config,
+            &core.memory,
+        )?;
+        core.agent.switch_session(session.id).await;
+        let _ = events.send(Event::SessionReset).await;
+        send_ready(
+            &core.agent,
+            &core.policy,
+            &core.config_state,
+            &core.workspace_history,
+            &core.models,
+        )
+        .await;
+        notice(events, "deleted the active session and started a new one").await;
+    } else {
+        notice(events, "session deleted").await;
+    }
+    Ok(())
+}
+
+/// The user-visible turns of the active session, oldest first.
+fn session_history_turns(agent: &Agent) -> Result<Vec<HistoryTurn>> {
+    let mut out = Vec::new();
+    for turn in agent.store.live_turns(&agent.session_id)? {
+        match turn.role.as_str() {
+            _ if turn.is_summary => out.push(HistoryTurn {
+                role: "note".into(),
+                text: format!("[compacted context]\n{}", turn.content),
+            }),
+            "user" => {
+                if turn.content.starts_with("[automatic verification]") {
+                    continue;
+                }
+                out.push(HistoryTurn {
+                    role: "user".into(),
+                    text: provider::user_content_for_display(&turn.content),
+                });
+            }
+            "assistant" => {
+                if let Ok(provider::Message::Assistant { content, .. }) =
+                    serde_json::from_str(&turn.content)
+                    && !content.trim().is_empty()
+                {
+                    out.push(HistoryTurn {
+                        role: "assistant".into(),
+                        text: content,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Shared cross-conversation memory
+// ---------------------------------------------------------------------------
+
+async fn show_memory(core: &Core, events: &mpsc::Sender<Event>) {
+    let config = core.config_state.read().await.clone();
+    let facts = match core.memory.list_facts(50, false) {
+        Ok(facts) => facts,
+        Err(error) => {
+            recoverable_error(events, error).await;
+            return;
+        }
+    };
+    let active_count = core
+        .memory
+        .status(&config)
+        .map(|status| status.active_facts)
+        .unwrap_or(facts.len() as i64);
+    let mut lines = vec![format!(
+        "shared memory ({}) — {} active fact(s), age filter: {}",
+        if config.memory_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        active_count,
+        if config.memory_max_age_days == 0 {
+            "none".to_string()
+        } else {
+            format!("{} days", config.memory_max_age_days)
+        },
+    )];
+    for fact in &facts {
+        lines.push(format!(
+            "  [{} | {} | {:.2} | {}] {}",
+            fact.id,
+            fact.category.as_str(),
+            fact.confidence,
+            fact.source_channel,
+            fact.text
+        ));
+    }
+    if active_count > facts.len() as i64 {
+        lines.push(format!(
+            "  … and {} more",
+            active_count - facts.len() as i64
+        ));
+    }
+    lines.push(
+        "commands: /memory status · dream [--dry-run] · reindex · forget ID · clear · on · off"
+            .into(),
+    );
+    notice(events, &lines.join("\n")).await;
+}
+
+/// After every finished turn, extract durable facts into the shared SQLite
+/// store — the same `store/memory.db` WebTool and WhatsApp use.
+fn spawn_agent_memory_refresh(completed_agent: &Agent, core: &Core) {
+    let agent = completed_agent.clone();
+    let config_state = core.config_state.clone();
+    let engine = core.memory.clone();
+    tokio::spawn(async move {
+        let config = config_state.read().await.clone();
+        if !config.memory_enabled {
+            return;
+        }
+        // Account-backed CLI providers have no reusable HTTP endpoint here.
+        if !matches!(config.provider_protocol.as_str(), "openai" | "anthropic") {
+            return;
+        }
+        let chat = match agent_session_as_chat(&agent) {
+            Ok(Some(chat)) => chat,
+            _ => return,
+        };
+        let client = llama::LlamaClient::new();
+        if let Err(error) = engine
+            .extract_from_chat(&client, &config, &agent.model, &chat, "tui")
+            .await
+        {
+            tracing::warn!("agent memory refresh failed: {error}");
+        }
+    });
+}
+
+/// Project the SQLite transcript into the WebTool `Chat` shape the memory
+/// extractor understands. Tool output stays out: it is workspace detail, not
+/// durable knowledge about the user.
+fn agent_session_as_chat(agent: &Agent) -> Result<Option<storage::Chat>> {
+    let mut messages = Vec::new();
+    for turn in agent.store.live_turns(&agent.session_id)? {
+        match turn.role.as_str() {
+            "user" if !turn.is_summary && !turn.content.starts_with("[automatic verification]") => {
+                messages.push(agent_chat_message("user", &turn.content));
+            }
+            "assistant" => {
+                if let Ok(provider::Message::Assistant { content, .. }) =
+                    serde_json::from_str(&turn.content)
+                    && !content.trim().is_empty()
+                {
+                    messages.push(agent_chat_message("assistant", &content));
+                }
+            }
+            _ => {}
+        }
+    }
+    if messages.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(storage::Chat {
+        id: format!("agent_{}", agent.session_id),
+        title: format!("Agent session in {}", agent.workspace.display()),
+        created: chrono::Utc::now(),
+        messages,
+        extra: serde_json::Map::new(),
+    }))
+}
+
+fn agent_chat_message(role: &str, text: &str) -> storage::ChatMessage {
+    storage::ChatMessage {
+        role: role.to_string(),
+        content: serde_json::Value::String(text.to_string()),
+        timestamp: chrono::Utc::now(),
+        extra: serde_json::Map::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /doctor
+// ---------------------------------------------------------------------------
+
+async fn run_doctor(core: &Core) -> String {
+    let config = core.config_state.read().await.clone();
+    let mut lines = vec![format!(
+        "doctor report — gnomef-rs v{}",
+        env!("CARGO_PKG_VERSION")
+    )];
+    fn check(lines: &mut Vec<String>, ok: bool, label: String) {
+        lines.push(format!("{} {label}", if ok { "✓" } else { "✗" }));
+    }
+
+    // State directory and permissions.
+    let app_dir = &core.app_paths.app_dir;
+    let probe = app_dir.join(".doctor-probe");
+    let writable = std::fs::write(&probe, b"ok").is_ok();
+    std::fs::remove_file(&probe).ok();
+    check(
+        &mut lines,
+        writable,
+        format!("state directory writable: {}", app_dir.display()),
+    );
+    check(
+        &mut lines,
+        file_is_private(&core.config_path),
+        format!("config permissions 0600: {}", core.config_path.display()),
+    );
+    let providers_file = core.app_paths.store_dir.join("providers.json");
+    check(
+        &mut lines,
+        file_is_private(&providers_file),
+        format!(
+            "provider store permissions 0600: {}",
+            providers_file.display()
+        ),
+    );
+
+    // Database.
+    match core.agent.store.health() {
+        Ok(verdict) if verdict == "ok" => {
+            check(&mut lines, true, "agent database integrity: ok".into())
+        }
+        Ok(verdict) => check(
+            &mut lines,
+            false,
+            format!("agent database integrity: {verdict}"),
+        ),
+        Err(error) => check(
+            &mut lines,
+            false,
+            format!("agent database check failed: {error}"),
+        ),
+    }
+
+    // Workspace.
+    let workspace = &core.agent.workspace;
+    check(
+        &mut lines,
+        workspace.is_dir(),
+        format!("workspace exists: {}", workspace.display()),
+    );
+    let ws_probe = workspace.join(".gnomef-doctor-probe");
+    let ws_writable = std::fs::write(&ws_probe, b"ok").is_ok();
+    std::fs::remove_file(&ws_probe).ok();
+    check(&mut lines, ws_writable, "workspace writable".into());
+    check(
+        &mut lines,
+        workspace.join(".git").exists(),
+        "workspace is a git repository (rollback safety net)".into(),
+    );
+
+    // Optional privilege support. sudo is required for the native root tool;
+    // secret-tool only adds encrypted desktop-keyring persistence.
+    check(
+        &mut lines,
+        firecrawl::command_in_path("sudo"),
+        "sudo executable available for privileged tools".into(),
+    );
+    lines.push(if firecrawl::command_in_path("secret-tool") {
+        "✓ desktop keyring available for optional sudo credential storage".into()
+    } else {
+        "· desktop keyring helper absent — sudo passwords remain session-only".into()
+    });
+
+    // Provider.
+    let selection = &core.provider_selection;
+    lines.push(format!(
+        "· provider: {} · model: {} · protocol: {}",
+        selection.provider_id,
+        selection.model,
+        selection.protocol_name()
+    ));
+    match selection.protocol_name() {
+        "openai" | "anthropic" => {
+            let base = selection
+                .resolved_base_url()
+                .unwrap_or(&config.llama_base_url)
+                .to_string();
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(8))
+                .build();
+            match client {
+                Ok(client) => {
+                    let url = format!("{}/models", base.trim_end_matches('/'));
+                    let mut request = client.get(&url);
+                    if selection.protocol_name() == "anthropic" {
+                        request = request
+                            .header("x-api-key", selection.api_key().unwrap_or_default())
+                            .header("anthropic-version", "2023-06-01");
+                    } else if let Some(key) = selection.api_key() {
+                        request = request.bearer_auth(key);
+                    }
+                    match request.send().await {
+                        Ok(response) => {
+                            let status = response.status();
+                            check(
+                                &mut lines,
+                                status.is_success(),
+                                format!("provider endpoint {url} answered {status}"),
+                            );
+                        }
+                        Err(error) => check(
+                            &mut lines,
+                            false,
+                            format!("provider endpoint {url} unreachable: {error}"),
+                        ),
+                    }
+                }
+                Err(error) => check(
+                    &mut lines,
+                    false,
+                    format!("cannot build HTTP client: {error}"),
+                ),
+            }
+        }
+        "codex" => check(
+            &mut lines,
+            codex_app_server::codex_executable().exists() || firecrawl::command_in_path("codex"),
+            "codex sidecar executable present".into(),
+        ),
+        "claude-cli" => check(
+            &mut lines,
+            firecrawl::command_in_path("claude"),
+            "`claude` CLI present in PATH".into(),
+        ),
+        other => lines.push(format!(
+            "· unknown protocol `{other}` — skipped connectivity"
+        )),
+    }
+
+    // Web search / Firecrawl.
+    if config.web_search_enabled {
+        check(&mut lines, true, "web search: enabled".into());
+        let local = config.firecrawl_api_url.starts_with("http://127.0.0.1")
+            || config.firecrawl_api_url.contains("localhost");
+        if local {
+            check(
+                &mut lines,
+                firecrawl::command_in_path("podman"),
+                "podman available for the local Firecrawl deployment".into(),
+            );
+        }
+        let reachable = reqwest::Client::new()
+            .get(&config.firecrawl_api_url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .is_ok();
+        check(
+            &mut lines,
+            reachable,
+            format!(
+                "Firecrawl reachable at {} {}",
+                config.firecrawl_api_url,
+                if reachable {
+                    ""
+                } else {
+                    "(it starts lazily on the first search)"
+                }
+            ),
+        );
+    } else {
+        lines.push("· web search: disabled — Firecrawl will not be started".into());
+    }
+
+    // Shared memory.
+    match core.memory.status(&config) {
+        Ok(status) => check(
+            &mut lines,
+            true,
+            format!(
+                "shared memory readable ({} active facts, enabled: {}, embeddings: {})",
+                status.active_facts,
+                config.memory_enabled,
+                status
+                    .embedding_provider
+                    .as_deref()
+                    .unwrap_or("lexical only")
+            ),
+        ),
+        Err(error) => check(
+            &mut lines,
+            false,
+            format!("shared memory unreadable: {error}"),
+        ),
+    }
+
+    // Sandbox support.
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    lines.push(format!(
+        "· kernel {kernel} — Landlock needs ≥ 5.13; sandbox mode: {}",
+        sandbox_name(core.policy.mode)
+    ));
+
+    lines.join("\n")
+}
+
+fn file_is_private(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(metadata) => metadata.permissions().mode() & 0o077 == 0,
+        // A missing file leaks nothing.
+        Err(_) => true,
+    }
+}
+
+fn apply_selection_to_config(selection: &ProviderSelection, config: &mut AppConfig) {
+    config.provider_id = selection.provider_id.clone();
+    config.provider_protocol = selection.protocol_name().to_string();
+    config.default_model = selection.model.clone();
+    config.remember_provider_api_key(&selection.provider_id, selection.api_key());
+    config.llama_api_key = selection.api_key().unwrap_or_default().to_string();
+    if let Some(base_url) = selection.resolved_base_url() {
+        config.llama_base_url = base_url.to_string();
+    }
+}
+
+async fn send_ready(
+    agent: &Agent,
+    policy: &SandboxPolicy,
+    config_state: &Arc<RwLock<AppConfig>>,
+    workspace_history: &WorkspaceHistory,
+    models: &[String],
+) {
+    let config = config_state.read().await;
+    if agent.store.assert_active_status(&agent.session_id).is_ok() {
+        let _ = agent.store.remember_execution(
+            &agent.session_id,
+            &config.provider_id,
+            &agent.reasoning_effort,
+        );
+    }
+    let web_search_enabled = config.web_search_enabled;
+    let reasoning_effort = config.reasoning_effort.clone();
+    let mcp_servers = config.mcp_servers.clone();
+    let subagent_use_separate_model = config.subagent_use_separate_model;
+    let subagent_provider_id = config.subagent_provider_id.clone();
+    let subagent_model = config.subagent_model.clone();
+    let subagent_reasoning_effort = config.subagent_reasoning_effort.clone();
+    let models = if config.provider_id == "openai-account" {
+        let metadata = models
+            .iter()
+            .map(|id| llama::ModelInfo {
+                id: id.clone(),
+                capabilities: Vec::new(),
+            })
+            .collect();
+        llama::codex_account_model_ids(metadata, &agent.model)
+    } else {
+        llama::normalize_model_ids(models.to_vec(), &agent.model)
+    };
+    drop(config);
+    let _ = agent
+        .event_sender()
+        .send(Event::Ready {
+            session_id: agent.session_id.clone(),
+            provider: agent.provider.name().to_string(),
+            model: agent.model.clone(),
+            reasoning_effort,
+            workspace: agent.workspace.clone(),
+            sandbox: sandbox_name(policy.mode).to_string(),
+            web_search_enabled,
+            git_branch: git_branch(&agent.workspace),
+            recent_workspaces: workspace_history
+                .recent()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            models,
+            mcp_servers,
+            subagent_use_separate_model,
+            subagent_provider_id,
+            subagent_model,
+            subagent_reasoning_effort,
+        })
+        .await;
+}
+
+async fn fetch_model_ids(config_state: &Arc<RwLock<AppConfig>>, active_model: &str) -> Vec<String> {
+    let cfg = config_state.read().await.clone();
+    let models = llama::LlamaClient::new()
+        .list_models(&cfg)
+        .await
+        .unwrap_or_else(|_| llama::known_models(&cfg.provider_id));
+    if cfg.provider_id == "openai-account" {
+        llama::codex_account_model_ids(models, active_model)
+    } else {
+        llama::model_ids(models, active_model)
+    }
+}
+
+fn initialize_session(
+    store: &Store,
+    session_id: &str,
+    workspace: &Path,
+    config: &AppConfig,
+    engine: &MemoryEngine,
+) -> Result<()> {
+    if store.live_turns(session_id)?.is_empty() {
+        let mut prompt = tools::build_system_prompt(workspace);
+        // Shared cross-conversation memory, same database WebTool maintains.
+        if config.memory_enabled {
+            let block = engine.agent_memory_block(config);
+            if !block.is_empty() {
+                prompt = memory::append_memory_block(&prompt, Some(&block));
+            }
+        }
+        store.append_turn(
+            session_id,
+            "system",
+            &prompt,
+            (prompt.len() / 4) as i64,
+            true,
+        )?;
+    }
+    Ok(())
+}
+
+fn policy_for(mode: SandboxMode, workspace: &Path) -> SandboxPolicy {
+    match mode {
+        SandboxMode::ReadOnly => SandboxPolicy::read_only(workspace),
+        SandboxMode::Normal => SandboxPolicy::normal(workspace),
+        SandboxMode::FullAccess => SandboxPolicy::full_access(workspace),
+        SandboxMode::IsolatedWorkspaceWrite => SandboxPolicy::isolated_workspace_write(workspace),
+    }
+}
+
+fn approval_for(mode: SandboxMode) -> ApprovalPolicy {
+    if mode == SandboxMode::FullAccess {
+        ApprovalPolicy::Never
+    } else {
+        ApprovalPolicy::Ask
+    }
+}
+
+fn canonical_workspace(path: &Path) -> Result<PathBuf> {
+    if !path.is_dir() {
+        bail!("workspace is not a directory: {}", path.display());
+    }
+    path.canonicalize()
+        .with_context(|| format!("cannot resolve workspace {}", path.display()))
+}
+
+fn resolve_workspace_request(current: &Path, requested: &Path) -> Result<PathBuf> {
+    let display = requested.to_string_lossy();
+    let expanded = if display == "~" {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("cannot expand `~`: HOME is not set")?
+    } else if let Some(rest) = display.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("cannot expand `~`: HOME is not set")?
+            .join(rest)
+    } else if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        current.join(requested)
+    };
+    canonical_workspace(&expanded)
+}
+
+fn git_branch(workspace: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(workspace.join(".git/HEAD")).ok()?;
+    head.trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(str::to_string)
+        .or_else(|| Some(head.trim().chars().take(12).collect()))
+}
+
+async fn notice(events: &mpsc::Sender<Event>, message: &str) {
+    let _ = events
+        .send(Event::Notice {
+            message: message.to_string(),
+        })
+        .await;
+}
+
+async fn recoverable_error(events: &mpsc::Sender<Event>, error: impl std::fmt::Display) {
+    let _ = events
+        .send(Event::Error {
+            message: error.to_string(),
+            fatal: false,
+        })
+        .await;
+}
+
+fn parse_cli() -> Result<Cli> {
+    let mut cli = Cli {
+        workspace: None,
+        session: None,
+        model: None,
+        base_url: None,
+        sandbox: SandboxMode::Normal,
+    };
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "-w" | "--workspace" => {
+                cli.workspace = Some(PathBuf::from(next_value(&mut args, &arg)?))
+            }
+            "--session" => cli.session = Some(next_value(&mut args, &arg)?),
+            "-m" | "--model" => cli.model = Some(next_value(&mut args, &arg)?),
+            "--base-url" => cli.base_url = Some(next_value(&mut args, &arg)?),
+            "--approval" => {
+                let legacy = next_value(&mut args, &arg)?;
+                cli.sandbox = match legacy.as_str() {
+                    "never" => SandboxMode::FullAccess,
+                    "untrusted" | "on-failure" | "on-request" => SandboxMode::Normal,
+                    _ => bail!(
+                        "legacy approval must be untrusted|on-failure|on-request|never; \
+                         prefer --sandbox normal|full-access"
+                    ),
+                };
+            }
+            "--sandbox" => {
+                cli.sandbox = parse_sandbox(&next_value(&mut args, &arg)?)?;
+            }
+            value if value.starts_with('-') => bail!("unknown option `{value}`"),
+            value if cli.workspace.is_none() => cli.workspace = Some(PathBuf::from(value)),
+            value => bail!("unexpected argument `{value}`"),
+        }
+    }
+
+    Ok(cli)
+}
+
+fn next_value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String> {
+    args.next()
+        .with_context(|| format!("option `{option}` requires a value"))
+}
+
+fn parse_sandbox(value: &str) -> Result<SandboxMode> {
+    match value {
+        "read-only" => Ok(SandboxMode::ReadOnly),
+        "normal" | "workspace-write" => Ok(SandboxMode::Normal),
+        "full-access" | "danger-full-access" => Ok(SandboxMode::FullAccess),
+        _ => bail!("mode must be read-only|normal|full-access"),
+    }
+}
+
+fn sandbox_name(mode: SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::ReadOnly => "read-only",
+        SandboxMode::Normal => "normal",
+        SandboxMode::FullAccess => "full-access",
+        SandboxMode::IsolatedWorkspaceWrite => "isolated-workspace-write",
+    }
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn device_request(
+    core: &mut Core,
+    request_id: &str,
+    peer: &str,
+    action: &str,
+    payload: serde_json::Value,
+    active: &mut HashMap<String, ActiveTurn>,
+    turns: &mut FuturesUnordered<TurnFuture>,
+    events: &mpsc::Sender<Event>,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+    uuid::Uuid::parse_str(request_id)?;
+    uuid::Uuid::parse_str(peer)?;
+    let id = payload["session_id"].as_str().unwrap_or("");
+    if !id.is_empty() {
+        uuid::Uuid::parse_str(id)?;
+    }
+    let text = |key: &str| -> Result<&str> {
+        payload[key]
+            .as_str()
+            .with_context(|| format!("Missing {key}"))
+    };
+    let store = core.agent.store.clone();
+    let command_key = format!("{peer}:{request_id}");
+    if let Some(response) = store.device_response(&command_key)? {
+        return Ok(response);
+    }
+    let response = match action {
+        "mesh_start" | "mesh_status" | "mesh_revoke" => return core.mesh.request(action,&payload),
+        "capabilities" => return Ok(json!({"protocol":2,"platform":std::env::consts::OS,"web":true,"vision":true,"files":true,"subagents":true,"shell":!cfg!(target_os="android"),"desktop_control":cfg!(target_os="linux"),"tor":true})),
+        "workspace_location" => {
+            let session=store.get_session(id)?.context("No local replica of this session. Move it once before enabling workspace sync.")?;
+            let workspace_id=store.workspace_identity(&session.workspace)?;
+            return Ok(json!({"root":session.workspace,"workspace_id":workspace_id,"busy":active.values().any(|turn|turn.agent.workspace==session.workspace),"status":session.status}));
+        },
+        "workspace_lock" | "workspace_unlock" => {
+            let session=store.get_session(id)?.context("Session not found")?;
+            if action=="workspace_lock" && active.values().any(|turn|turn.agent.workspace==session.workspace) {bail!("Workspace is in use by an agent");}
+            store.lock_workspace(&session.workspace,text("token")?,action=="workspace_unlock")?;
+            return Ok(json!({}));
+        },
+        "list" => {
+            let sessions=store.recent_sessions(500)?.into_iter().map(|s|json!({
+                "id":s.id,"title":s.title,"model":s.model,"status":s.status,"updated_at":s.updated_at,
+                "busy":active.contains_key(&s.id)
+            })).collect::<Vec<_>>();
+            return Ok(json!({"sessions":sessions}));
+        }
+        "settings" => {
+            let cfg = core.config_state.read().await;
+            return Ok(
+                json!({"provider_id":cfg.provider_id,"model":cfg.default_model,"base_url":cfg.llama_base_url,
+                "reasoning":cfg.reasoning_effort,"memory":cfg.memory_enabled,"web":cfg.web_search_enabled,
+                "workers":cfg.subagent_use_separate_model,"worker_provider":cfg.subagent_provider_id,
+                "worker_model":cfg.subagent_model,"worker_reasoning":cfg.subagent_reasoning_effort}),
+            );
+        }
+        "memory_export" => {
+            return Ok(json!({"facts":core.memory.list_facts(1000,false)?}));
+        }
+        "memory_merge" => {
+            let incoming = payload["facts"]
+                .as_array()
+                .context("Memory facts are required")?;
+            if incoming.len() > 1000 {
+                bail!("At most 1000 facts can be merged per request");
+            }
+            let mut known = core
+                .memory
+                .list_facts(100000, true)?
+                .into_iter()
+                .map(|f| memory::fact_dedupe_key(&f.text))
+                .collect::<std::collections::HashSet<_>>();
+            let mut ops = Vec::new();
+            for fact in incoming {
+                let value = fact["text"].as_str().context("Invalid memory text")?.trim();
+                if value.is_empty() || value.len() > 8192 || memory::looks_like_secret(value) {
+                    continue;
+                }
+                if !known.insert(memory::fact_dedupe_key(value)) {
+                    continue;
+                }
+                ops.push(memory_engine::MemOp::Add(memory_engine::NewFact {
+                    text: value.into(),
+                    category: serde_json::from_value(fact["category"].clone())?,
+                    confidence: fact["confidence"].as_f64().unwrap_or(0.5).clamp(0.0, 1.0) as f32,
+                    importance: fact["importance"].as_f64().unwrap_or(0.5).clamp(0.0, 1.0) as f32,
+                    source_chat_id: String::new(),
+                    source_channel: "paired-device".into(),
+                    sources: vec![format!("device:{peer}")],
+                }));
+            }
+            let count = ops.len();
+            core.memory.apply_ops(&ops)?;
+            json!({"added":count})
+        }
+        "handoff_info" => {
+            if active.contains_key(id) {
+                bail!("Wait for the current turn to finish before moving this session");
+            }
+            let session = store.get_session(id)?.context("Session not found")?;
+            let (provider, reasoning) = store.session_execution(id)?.unwrap_or((
+                core.provider_selection.provider_id.clone(),
+                core.agent.reasoning_effort.clone(),
+            ));
+            return Ok(
+                json!({"provider_id":provider,"model":session.model,"reasoning_effort":reasoning}),
+            );
+        }
+        "can_stage" => {
+            if text("provider_id")? != core.provider_selection.provider_id {
+                bail!(
+                    "Select provider {} on the destination before moving this session",
+                    text("provider_id")?
+                );
+            }
+            return Ok(json!({"ready":true}));
+        }
+        "snapshot" => {
+            let session = store.get_session(id)?.context("Session not found")?;
+            let mut agent = core.agent.clone();
+            agent.switch_session(id.into()).await;
+            return Ok(
+                json!({"session":session,"turns":session_history_turns(&agent)?,"busy":active.contains_key(id)}),
+            );
+        }
+        "new" => {
+            let session = store.create_session(&core.agent.workspace, &core.agent.model)?;
+            store.remember_execution(
+                &session.id,
+                &core.provider_selection.provider_id,
+                &core.agent.reasoning_effort,
+            )?;
+            let config = core.config_state.read().await.clone();
+            initialize_session(
+                &store,
+                &session.id,
+                &core.agent.workspace,
+                &config,
+                &core.memory,
+            )?;
+            json!({"session_id":session.id})
+        }
+        "submit" => {
+            store.assert_session_writable(id)?;
+            let message = text("text")?;
+            if message.trim().is_empty() || message.len() > 32 * 1024 * 1024 {
+                bail!("Message must contain 1 byte to 32 MiB");
+            }
+            let session = store.get_session(id)?.context("Session not found")?;
+            let mut agent = if let Some(turn) = active.get(id) {
+                turn.agent.clone()
+            } else {
+                let mut agent = core.agent.clone();
+                let workspace = canonical_workspace(&session.workspace)?;
+                let policy = policy_for(core.policy.mode, &workspace);
+                let (registry, runtime) = build_registry(core, &workspace, policy.clone()).await;
+                core.retired_mcp_runtimes.push(runtime);
+                let config = core.config_state.read().await.clone();
+                let (provider_id, reasoning) = store.session_execution(id)?.unwrap_or((
+                    core.provider_selection.provider_id.clone(),
+                    core.agent.reasoning_effort.clone(),
+                ));
+                let mut selection = if provider_id == core.provider_selection.provider_id {
+                    core.provider_selection.clone()
+                } else {
+                    ProviderSelection::from_choice(
+                        provider_id.clone(),
+                        config.provider_api_keys.get(&provider_id).cloned(),
+                        None,
+                    )?
+                };
+                selection.model = session.model.clone();
+                agent.provider = build_provider(&selection, &workspace, policy.mode)?;
+                agent.reasoning_effort = reasoning;
+                agent.workspace = workspace;
+                agent.verify_policy = policy;
+                agent.registry = Arc::new(registry);
+                agent.model = session.model;
+                agent
+            };
+            agent.switch_session(id.into()).await;
+            // Claim before scheduling: reconnect never silently submits twice.
+            let accepted = json!({"session_id":id,"accepted":true});
+            store.save_device_response(&command_key, &accepted)?;
+            submit_or_queue(&agent, message.into(), active, turns, events).await;
+            accepted
+        }
+        "interrupt" => {
+            if let Some(turn) = active.get(id) {
+                turn.cancel.cancel();
+            }
+            json!({})
+        }
+        "approve" => {
+            if !active.contains_key(id) {
+                bail!("Session is not running");
+            }
+            let decision = match text("decision")? {
+                "allow" => Decision::Allow,
+                "deny" => Decision::Deny,
+                _ => bail!("Invalid approval decision"),
+            };
+            core.approvals
+                .send((text("call_id")?.into(), decision))
+                .await?;
+            json!({})
+        }
+        "rename" => {
+            store.assert_session_writable(id)?;
+            store.rename_session(id, text("title")?)?;
+            json!({})
+        }
+        "delete" => {
+            if active.contains_key(id) {
+                bail!("Interrupt and finish the current turn before deleting");
+            }
+            store.assert_session_writable(id)?;
+            delete_session(core, id, events).await?;
+            json!({})
+        }
+        "prepare_handoff" => {
+            if active.contains_key(id) {
+                bail!("Wait for the current turn to finish before moving this session");
+            }
+            let transfer = text("transfer_id")?;
+            uuid::Uuid::parse_str(transfer)?;
+            let (provider, reasoning) = store.session_execution(id)?.unwrap_or((
+                core.provider_selection.provider_id.clone(),
+                core.agent.reasoning_effort.clone(),
+            ));
+            store.prepare_handoff(
+                id,
+                transfer,
+                peer,
+                &provider,
+                &reasoning,
+                &core.app_paths.store_dir.join("tool_outputs"),
+            )?
+        }
+        "stage_handoff" => {
+            let snapshot: crate::device_store::SessionSnapshot =
+                serde_json::from_value(payload["snapshot"].clone())?;
+            if snapshot.provider_id != core.provider_selection.provider_id {
+                bail!(
+                    "Select provider {} on this device before moving the session",
+                    snapshot.provider_id
+                );
+            }
+            if active.contains_key(&snapshot.session.id) {
+                bail!("Destination session is running");
+            }
+            let workspace_id=if snapshot.workspace_id.is_empty(){&snapshot.session.id}else{&snapshot.workspace_id};
+            uuid::Uuid::parse_str(workspace_id)?;
+            let workspace = if let Some(existing)=store.get_session(&snapshot.session.id)? {
+                existing.workspace
+            } else {core.app_paths.app_dir.join("workspaces").join(workspace_id)};
+            std::fs::create_dir_all(&workspace)?;
+            store.stage_handoff(
+                &snapshot,
+                peer,
+                &workspace,
+                &core.app_paths.store_dir.join("tool_outputs"),
+            )?;
+            json!({"session_id":snapshot.session.id,"persisted":true})
+        }
+        "commit_handoff" | "activate_handoff" => {
+            let transfer = text("transfer_id")?;
+            let id = store.finish_handoff(transfer, peer, action == "activate_handoff")?;
+            json!({"session_id":id})
+        }
+        _ => bail!("Device operation is not permitted"),
+    };
+    store.save_device_response(&command_key, &response)?;
+    send_session_list(core, events).await;
+    Ok(response)
+}
+
+fn print_help() {
+    println!(
+        "gnomef-rs [WORKSPACE] [OPTIONS]\n\
+         \n\
+         Options:\n\
+           -w, --workspace PATH       Repository to work in\n\
+               --session ID          Resume an existing agent session\n\
+           -m, --model MODEL          Override the configured model\n\
+               --base-url URL        Override the OpenAI-compatible base URL\n\
+               --sandbox MODE        read-only|normal|full-access\n\
+           -h, --help                 Show this help\n\
+         \n\
+         Environment overrides: GNOMEF_MODEL, GNOMEF_BASE_URL, GNOMEF_API_KEY,\n\
+         GNOMEF_CODEX_BIN, and GNOMEF_RS_HOME."
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_request_resolves_relative_directory_from_current_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "gnomef-workspace-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let child = root.join("project");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let resolved = resolve_workspace_request(&root, Path::new("project")).unwrap();
+        assert_eq!(resolved, child.canonicalize().unwrap());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_request_rejects_missing_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "gnomef-workspace-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let error = resolve_workspace_request(&root, Path::new("missing"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("workspace is not a directory"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

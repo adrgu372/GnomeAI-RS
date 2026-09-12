@@ -6,6 +6,8 @@ using Avalonia.Media;
 using Avalonia.Styling;
 using Avalonia.Threading;
 
+using GnomeAI.Client;
+
 namespace GnomeAI.UI;
 
 /// <summary>
@@ -30,10 +32,52 @@ public sealed class MarkdownView : UserControl
     private readonly DispatcherTimer _renderTimer = new() { Interval = TimeSpan.FromMilliseconds(50) };
     private string _renderedMarkdown = "";
     private bool _renderedDark;
+    private readonly StackPanel _root=new() {Spacing=8};
+    private readonly Button _copyResponse=new() {Content="Copy response"};
+    private readonly Button _selectText=new() {Content="Select text"};
+    private readonly Button _copySelection=new() {Content="Copy selection",IsVisible=false};
+    private readonly TextBox _selection=new() {IsReadOnly=true,AcceptsReturn=true,TextWrapping=TextWrapping.Wrap,MinLines=1,MaxLines=16,IsVisible=false};
+    private bool _selectingText;
+    public bool IsSelectingText=>_selectingText;
+    public event EventHandler? SelectionModeChanged;
 
     public MarkdownView()
     {
-        Content = _content;
+        var actions=new WrapPanel {Orientation=Orientation.Horizontal};
+        foreach(var button in new[]{_copyResponse,_selectText,_copySelection}) {
+            button.Padding=new Thickness(10,6);button.MinHeight=OperatingSystem.IsAndroid()?44:30;
+            button.Margin=new Thickness(0,0,6,0);actions.Children.Add(button);
+        }
+        ToolTip.SetTip(_copyResponse,"Copy the original response, preserving Markdown and line breaks");
+        _copyResponse.Click+=async(_,_)=>await CopyExactAsync(_copyResponse,_selectingText?_selection.Text??"":Markdown??"");
+        _copySelection.Click+=async(_,_)=> {
+            var text=_selection.Text??"";
+            var start=Math.Clamp(Math.Min(_selection.SelectionStart,_selection.SelectionEnd),0,text.Length);
+            var end=Math.Clamp(Math.Max(_selection.SelectionStart,_selection.SelectionEnd),start,text.Length);
+            if(end>start)await CopyExactAsync(_copySelection,text[start..end]);
+            else {_copySelection.Content="Select some text first";}
+        };
+        _selectText.Click+=(_,_)=> {
+            _selectingText=!_selectingText;
+            _selectText.Content=_selectingText?"Back to response":"Select text";
+            _copySelection.IsVisible=_selection.IsVisible=_selectingText;
+            _content.IsVisible=!_selectingText;
+            if(_selectingText) {
+                // A fixed snapshot avoids losing touch selection as tokens arrive.
+                _selection.Text=Markdown??"";_selection.SelectionStart=_selection.SelectionEnd=0;
+                _selection.Focus();
+            }else RebuildNow();
+            SelectionModeChanged?.Invoke(this,EventArgs.Empty);
+        };
+        var copyMenu=new MenuItem {Header="Copy response"};
+        var selectMenu=new MenuItem {Header="Select text"};
+        var selectionMenu=new MenuItem {Header="Copy selection"};
+        copyMenu.Click+=(_,_)=>_copyResponse.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        selectMenu.Click+=(_,_)=>{_selectText.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));selectMenu.Header=_selectText.Content;};
+        selectionMenu.Click+=(_,_)=>_copySelection.RaiseEvent(new Avalonia.Interactivity.RoutedEventArgs(Button.ClickEvent));
+        ContextMenu=new ContextMenu {ItemsSource=new[]{copyMenu,selectMenu,selectionMenu}};
+        _root.Children.Add(_selection);_root.Children.Add(_content);Content=_root;
+        _root.IsVisible=false;
         _renderTimer.Tick += (_, _) =>
         {
             _renderTimer.Stop();
@@ -55,14 +99,23 @@ public sealed class MarkdownView : UserControl
             QueueRebuild();
     }
 
+    public void EndSelection() {
+        if(!_selectingText)return;
+        _selectingText=false;_selection.IsVisible=_copySelection.IsVisible=false;
+        _content.IsVisible=true;_selectText.Content="Select text";_selection.Text="";
+        RebuildNow();SelectionModeChanged?.Invoke(this,EventArgs.Empty);
+    }
+
     private void QueueRebuild()
     {
-        if (!_renderTimer.IsEnabled) _renderTimer.Start();
+        if (!_selectingText && !_renderTimer.IsEnabled) _renderTimer.Start();
     }
 
     private void RebuildNow()
     {
+        if(_selectingText)return;
         var text = Markdown ?? "";
+        _root.IsVisible=text.Length>0;
         var dark = IsDark;
         if (text == _renderedMarkdown && dark == _renderedDark) return;
         _renderedMarkdown = text;
@@ -86,16 +139,15 @@ public sealed class MarkdownView : UserControl
         {
             var line = lines[index];
             var trimmed = line.Trim();
-            if (trimmed.StartsWith("```", StringComparison.Ordinal))
+            if (TryOpenFence(trimmed,out var fenceMarker,out var fenceLength,out var language))
             {
                 FlushParagraph();
-                var language = trimmed.Length > 3 ? trimmed[3..].Trim() : "code";
                 var code = new StringBuilder();
                 index++;
-                while (index < lines.Length && !lines[index].TrimStart().StartsWith("```", StringComparison.Ordinal))
+                while (index < lines.Length && !IsClosingFence(lines[index],fenceMarker,fenceLength))
                 {
-                    if (code.Length > 0) code.Append('\n');
                     code.Append(lines[index]);
+                    if(index<lines.Length-1)code.Append('\n');
                     index++;
                 }
                 AddCode(language.Length == 0 ? "code" : language, code.ToString());
@@ -106,7 +158,7 @@ public sealed class MarkdownView : UserControl
             if (TryHeading(trimmed, out var level, out var heading))
             {
                 FlushParagraph();
-                _content.Children.Add(new TextBlock
+                _content.Children.Add(new SelectableTextBlock
                 {
                     Text = CleanInline(heading),
                     FontSize = level switch { 1 => 23, 2 => 19, 3 => 16, _ => 14 },
@@ -144,7 +196,7 @@ public sealed class MarkdownView : UserControl
             {
                 FlushParagraph();
                 var quote = trimmed.TrimStart('>', ' ');
-                var body = new TextBlock
+                var body = new SelectableTextBlock
                 {
                     Text = CleanInline(quote),
                     TextWrapping = TextWrapping.Wrap,
@@ -166,7 +218,7 @@ public sealed class MarkdownView : UserControl
                 FlushParagraph();
                 var row = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*"), ColumnSpacing = 8 };
                 row.Children.Add(new TextBlock { Text = marker, Foreground = MutedBrush });
-                var itemText = new TextBlock { Text = CleanInline(item), TextWrapping = TextWrapping.Wrap };
+                var itemText = new SelectableTextBlock { Text = CleanInline(item), TextWrapping = TextWrapping.Wrap };
                 Grid.SetColumn(itemText, 1);
                 row.Children.Add(itemText);
                 _content.Children.Add(row);
@@ -189,6 +241,20 @@ public sealed class MarkdownView : UserControl
         FlushParagraph();
     }
 
+    private async Task CopyExactAsync(Button button,string text) {
+        var label=ReferenceEquals(button,_copySelection)?"Copy selection":ReferenceEquals(button,_copyResponse)?"Copy response":"Copy code";
+        button.IsEnabled=false;
+        try {
+            var clipboard=TopLevel.GetTopLevel(this)?.Clipboard;
+            if(clipboard is null){button.Content="Clipboard unavailable";return;}
+            await clipboard.SetTextAsync(text);
+            button.Content="Copied";
+            await Task.Delay(1200);
+            button.Content=label;
+        }catch(Exception){button.Content="Copy failed · retry";}
+        finally{button.IsEnabled=true;}
+    }
+
     private void AddSelectable(string text, bool wrap)
     {
         var block = new SelectableTextBlock
@@ -203,12 +269,8 @@ public sealed class MarkdownView : UserControl
 
     private void AddCode(string language, string code)
     {
-        var copy = new Button { Content = "Copy", Padding = new Thickness(9, 3), MinHeight = 26 };
-        copy.Click += async (_, _) =>
-        {
-            var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
-            if (clipboard is not null) await clipboard.SetTextAsync(code);
-        };
+        var copy = new Button { Content = "Copy code", Padding = new Thickness(9, 5), MinHeight = OperatingSystem.IsAndroid()?44:30 };
+        copy.Click += async (_, _) => await CopyExactAsync(copy,code);
         var header = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto"), Margin = new Thickness(0, 0, 0, 5) };
         header.Children.Add(new TextBlock
         {
@@ -268,7 +330,7 @@ public sealed class MarkdownView : UserControl
                     BorderBrush = MarkdownBorderBrush,
                     BorderThickness = new Thickness(0.5),
                     Padding = new Thickness(8, 6),
-                    Child = new TextBlock
+                    Child = new SelectableTextBlock
                     {
                         Text = cell,
                         TextWrapping = TextWrapping.Wrap,
@@ -285,6 +347,19 @@ public sealed class MarkdownView : UserControl
             HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
             Content = grid,
         });
+    }
+
+    private static bool TryOpenFence(string line,out char marker,out int length,out string language) {
+        marker=line.Length>0?line[0]:' ';length=0;language="";
+        if(marker is not ('`' or '~'))return false;
+        while(length<line.Length && line[length]==marker)length++;
+        if(length<3)return false;
+        language=line[length..].Trim();return true;
+    }
+    private static bool IsClosingFence(string line,char marker,int minimum) {
+        var text=line.Trim();var count=0;
+        while(count<text.Length && text[count]==marker)count++;
+        return count>=minimum && text[count..].Trim().Length==0;
     }
 
     private static bool TryHeading(string line, out int level, out string text)
@@ -337,8 +412,19 @@ public sealed class MarkdownView : UserControl
     private static string[] TableCells(string line) =>
         line.Trim().Trim('|').Split('|').Select(cell => cell.Trim()).ToArray();
 
-    private static string CleanInline(string text) => text
-        .Replace("**", "", StringComparison.Ordinal)
-        .Replace("__", "", StringComparison.Ordinal)
-        .Replace("`", "", StringComparison.Ordinal);
+    private static string CleanInline(string text)
+    {
+        // Keep inline code literal: __name__, ** and backslashes are data there.
+        var output=new StringBuilder();var cursor=0;
+        foreach(System.Text.RegularExpressions.Match match in System.Text.RegularExpressions.Regex.Matches(
+            text,@"(?<!`)(`+)(?!`)(.*?)\1(?!`)",System.Text.RegularExpressions.RegexOptions.Singleline)) {
+            output.Append(CleanEmphasis(text[cursor..match.Index]));
+            output.Append(match.Groups[2].Value);cursor=match.Index+match.Length;
+        }
+        output.Append(CleanEmphasis(text[cursor..]));return output.ToString();
+    }
+    private static string CleanEmphasis(string text) {
+        text=System.Text.RegularExpressions.Regex.Replace(text,@"(?<!\*)\*\*(?=\S)(.+?)(?<=\S)\*\*(?!\*)","$1");
+        return System.Text.RegularExpressions.Regex.Replace(text,@"(?<![\w\\])__(?=\S)(.+?)(?<=\S)__(?!\w)","$1");
+    }
 }

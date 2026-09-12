@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.CAMERA" />
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+  <application android:label="GnomeAI" android:allowBackup="false" android:usesCleartextTraffic="false" android:supportsRtl="true">
+    <provider android:name="io.github.adrgu372.gnomeai.CameraFileProvider" android:authorities="io.github.adrgu372.gnomeai.camera" android:exported="false" android:grantUriPermissions="true">
+      <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/camera_paths" />
+    </provider>
+    <service android:name="io.github.adrgu372.gnomeai.DeviceService" android:exported="false" android:foregroundServiceType="specialUse">
+      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User-started AI agent execution and encrypted peer-device session availability" />
+    </service>
+  </application>
+</manifest>

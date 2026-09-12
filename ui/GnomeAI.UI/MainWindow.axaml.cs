@@ -144,6 +144,7 @@ public sealed partial class MainWindow : Window
 
         if (Environment.GetCommandLineArgs().Contains("--ipc"))
         {
+            InitializeDevices();
             _bridge.EventReceived += OnBridgeEvent;
             _bridge.Disconnected += OnBridgeDisconnected;
             _bridge.Start();
@@ -166,17 +167,35 @@ public sealed partial class MainWindow : Window
         _scrollSettleTimer.Stop();
         _bridge.EventReceived -= OnBridgeEvent;
         _bridge.Disconnected -= OnBridgeDisconnected;
-        _ = _bridge.DisposeAsync();
+        _ = DisposeDeviceServicesAsync();
         _windowRecovery.Dispose();
         _http.Dispose();
         base.OnClosed(e);
     }
 
-    private Task OnBridgeEvent(JsonElement node) => RunUiAsync(() => HandleEventAsync(node));
+    private async Task DisposeDeviceServicesAsync()
+    {
+        System.Net.NetworkInformation.NetworkChange.NetworkAddressChanged-=DeviceNetworkChanged;
+        _networkDebounce?.Dispose();_networkDebounce=null;
+        _invitationBitmap?.Dispose();
+        if(_remoteSource is not null)await _remoteSource.DisposeAsync();
+        if (_devices is not null) {_devices.Changed-=DevicesChanged;await _devices.DisposeAsync();}
+        await _bridge.DisposeAsync();
+    }
+
+    private Task OnBridgeEvent(JsonElement node) => RunUiAsync(async()=> {
+        var kind=String(node,"event");
+        if(kind=="ready"){_physicalConnected=true;_lastLocalSession=String(node,"session_id");}
+        if(_selectedPeer is not null && kind!="ui_config"){if(kind=="session_event")CacheLocalEvent(node);return;}
+        await HandleEventAsync(node);
+
+    });
 
     private void OnBridgeDisconnected(string reason)
     {
         if (_closed) return;
+        _physicalConnected = false;
+        if(_selectedPeer is not null)return;
         _coreConnected = false;
         _sessionTransitioning = false;
         _busy = false;
@@ -559,7 +578,7 @@ public sealed partial class MainWindow : Window
 
     private SessionRuntime RuntimeFor(string sessionId)
     {
-        var key = sessionId.Length == 0 ? "__pending__" : sessionId;
+        var key = RuntimeKey(sessionId);
         if (!_sessionRuntimes.TryGetValue(key, out var runtime))
         {
             runtime = new SessionRuntime();
@@ -625,14 +644,16 @@ public sealed partial class MainWindow : Window
 
     private void AddApprovalCard(JsonElement node)
     {
+        var approvalPeer=_selectedPeer;
+        var approvalSession=_currentSessionId;
         var callId = String(node, "call_id");
         var command = String(node, "command");
         var reason = String(node, "reason");
         var card = AppendMessage("tool", "Approval required", $"{command}\n\nReason: {reason}", ToolBrush);
-        AddApprovalAction(card, "Allow once", callId, "allow", "Allowed once");
-        if (Bool(node, "allow_always"))
-            AddApprovalAction(card, "Always allow", callId, "always_allow", "Always allowed");
-        AddApprovalAction(card, "Deny", callId, "deny", "Denied");
+        AddApprovalAction(card, "Allow once", callId, "allow", "Allowed once", approvalPeer, approvalSession);
+        if (_selectedPeer is null && Bool(node, "allow_always"))
+            AddApprovalAction(card, "Always allow", callId, "always_allow", "Always allowed", approvalPeer, approvalSession);
+        AddApprovalAction(card, "Deny", callId, "deny", "Denied", approvalPeer, approvalSession);
         ScrollDown();
     }
 
@@ -641,7 +662,9 @@ public sealed partial class MainWindow : Window
         string label,
         string callId,
         string decision,
-        string completedStatus)
+        string completedStatus,
+        GnomeAI.Client.PeerLink? approvalPeer,
+        string? approvalSession)
     {
         card.Actions.Add(new MessageAction
         {
@@ -654,7 +677,8 @@ public sealed partial class MainWindow : Window
                 card.Status = completedStatus;
                 try
                 {
-                    await DecideAsync(callId, decision);
+                    if(approvalPeer is null)await _bridge.SendAsync(new Dictionary<string, object?>() { ["op"]="approve",["call_id"]=callId,["decision"]=decision });
+                    else await _devices!.RequestAsync(approvalPeer,"approve",new {session_id=approvalSession,call_id=callId,decision});
                 }
                 catch (Exception error)
                 {
@@ -940,6 +964,7 @@ public sealed partial class MainWindow : Window
         ModelLabel.Text = string.IsNullOrWhiteSpace(_model) ? "Model" : _model;
         SearchButton.Content = _webSearchEnabled ? "Web search ✓" : "Web search";
         ProviderButton.Content = string.IsNullOrEmpty(_providerName) ? "Provider" : _providerName;
+        RefreshSourceControls();
     }
 
     private void RefreshConnectionState(string text, IBrush brush)
@@ -962,10 +987,13 @@ public sealed partial class MainWindow : Window
         ResumeQueueButton.IsEnabled = _coreConnected && !_sessionTransitioning && !_busy && !_dispatching;
         ClearQueueButton.IsVisible = queue.Count > 0;
         ClearQueueButton.IsEnabled = !_dispatching;
+        RefreshSourceControls();
     }
 
     private async Task SendAsync(Dictionary<string, object?> operation)
     {
+        if(operation.GetValueOrDefault("op") is "new_session" or "resume_session")ShowConversationPage();
+        if(_selectedPeer is not null){await SendRemoteAsync(operation);return;}
         if (!_coreConnected) throw new InvalidOperationException("The Rust core is disconnected. Reopen GnomeAI to reconnect.");
         operation.TryGetValue("op", out var op);
         // Forks wait in the core until all turns are idle. Keep Stop and the
@@ -1013,6 +1041,7 @@ public sealed partial class MainWindow : Window
     private async Task DispatchComposerAsync()
     {
         if (_dispatching || _sessionTransitioning) return;
+        var originGeneration=_sourceGeneration;
         var originalText = Composer.Text ?? "";
         var text = originalText.Trim();
         var attachment = _attachments.FirstOrDefault();
@@ -1026,7 +1055,7 @@ public sealed partial class MainWindow : Window
             // Keep the editor intact until the action succeeds. Navigation
             // commands remain available while a different turn is running.
             var handled = attachment is null && text.StartsWith('/') && await HandleSlashCommandAsync(text);
-            if (!handled && attachment is null && WorkspacePathFromMessage(text) is { Length: > 0 } workspacePath)
+            if (!handled && _selectedPeer is null && attachment is null && WorkspacePathFromMessage(text) is { Length: > 0 } workspacePath)
             {
                 await SendAsync(new() { ["op"] = "set_workspace", ["path"] = workspacePath });
                 handled = true;
@@ -1041,6 +1070,7 @@ public sealed partial class MainWindow : Window
                 }
                 else await SubmitMessageAsync(text, attachment);
             }
+            if(originGeneration!=_sourceGeneration)return;
             CompleteComposerSubmission(sessionId, originalText, attachment);
             if (text.Length > 0)
             {
@@ -1050,14 +1080,14 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
-            _dispatching = false;
-            RefreshComposer();
+            if(originGeneration==_sourceGeneration){_dispatching = false;RefreshComposer();}
         }
         await SendNextQueuedAsync();
     }
 
     private async Task SubmitMessageAsync(string text, AttachedFile? attachment)
     {
+        var originGeneration=_sourceGeneration;
         if (attachment is not null && !File.Exists(attachment.Path))
             throw new FileNotFoundException("The attachment is no longer available. Remove it or select the file again.", attachment.Path);
         var sessionId = _currentSessionId;
@@ -1074,14 +1104,14 @@ public sealed partial class MainWindow : Window
         catch
         {
             runtime.Busy = false;
-            if (_currentSessionId == sessionId) _busy = false;
+            if (originGeneration==_sourceGeneration && _currentSessionId == sessionId) _busy = false;
             RefreshComposer();
             throw;
         }
         var display = text;
         if (attachment is not null)
             display += (display.Length == 0 ? "" : "\n") + $"📎 {attachment.Name}";
-        if (_currentSessionId == sessionId)
+        if (originGeneration==_sourceGeneration && _currentSessionId == sessionId)
         {
             AppendMessage("user", "You", display, UserBrush, HorizontalAlignment.Right);
             ScrollDown();
@@ -1090,6 +1120,7 @@ public sealed partial class MainWindow : Window
 
     private async Task SendNextQueuedAsync()
     {
+        var originGeneration=_sourceGeneration;
         var sessionId = _currentSessionId;
         var runtime = RuntimeFor(sessionId);
         var queue = runtime.Queue;
@@ -1101,6 +1132,7 @@ public sealed partial class MainWindow : Window
         {
             await SubmitMessageAsync(next.Text, next.Attachment);
             queue.Dequeue();
+            if(originGeneration!=_sourceGeneration)return;
             MarkDraftChanged(sessionId);
             SaveComposerDrafts();
         }
@@ -1111,8 +1143,7 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
-            _dispatching = false;
-            RefreshComposer();
+            if(originGeneration==_sourceGeneration){_dispatching = false;RefreshComposer();}
         }
     }
 
@@ -1309,6 +1340,7 @@ public sealed partial class MainWindow : Window
 
     private async Task CopyLastAssistantReplyAsync()
     {
+        FlushStreamingText();
         var text = _allMessages.LastOrDefault(message => message.Kind == "assistant" && message.Text.Length > 0)?.Text;
         if (text is null) ShowNotice("There is no assistant reply to copy yet.");
         else
@@ -1814,6 +1846,7 @@ public sealed partial class MainWindow : Window
 
     private async Task ShowSettingsAsync(bool focusSearch = false)
     {
+        if(_selectedPeer is not null){ShowNotice("Select This PC to change local AI settings.");return;}
         var dialog = CreateDialog("Settings", 760, 720);
         var content = new StackPanel { Spacing = 9, Margin = new Thickness(22) };
         content.Children.Add(DialogHeading("Settings", "Providers, MCP servers, execution, interface, memory, and tools."));
@@ -1824,7 +1857,7 @@ public sealed partial class MainWindow : Window
             ActionButton($"Provider · {_providerName}", async () => await ShowProviderAsync()),
             ActionButton($"Model · {_model}", async () => await ShowModelAsync()),
             ActionButton("WhatsApp", async () => await ShowWhatsAppSettingsAsync()),
-            ActionButton("Devices", async () => await ShowNodesAsync()),
+            ActionButton("Devices", () => {dialog.Close();ShowDevicesPage();return Task.CompletedTask;}),
         })
         {
             button.Margin = new Thickness(3);
@@ -2494,70 +2527,7 @@ public sealed partial class MainWindow : Window
         await dialog.ShowDialog(this);
     }
 
-    private async Task ShowNodesAsync()
-    {
-        if (_whatsapp is null)
-        {
-            ShowNotice("Node Hub configuration is not available.");
-            return;
-        }
-        var dialog = CreateDialog("Devices", 760, 680);
-        var body = new StackPanel { Spacing = 9, Margin = new Thickness(22) };
-        body.Children.Add(DialogHeading("Devices", "Pair lightweight Linux nodes and control local root permission per device."));
-        var status = MutedText(_whatsapp.NodeEnabled
-            ? $"Hub · {_whatsapp.NodeBind}:{_whatsapp.NodePort}"
-            : "The Hub is disabled. Enable it in Settings and restart the application.");
-        var normalCommand = $"gnomeai-node enroll --server http://PC-IP:{_whatsapp.NodePort} --token {_whatsapp.NodeEnrollmentToken} --name NAME";
-        var rootCommand = normalCommand + " --allow-root";
-        var refresh = new Button { Content = "Refresh" };
-        var copyNormal = new Button { Content = "Copy normal command" };
-        var copyRoot = new Button { Content = "Copy with local root" };
-        var close = new Button { Content = "Close" };
-        var nodesHost = new StackPanel { Spacing = 8 };
-
-        async Task RefreshNodesAsync()
-        {
-            nodesHost.Children.Clear();
-            if (!_whatsapp.NodeEnabled)
-            {
-                nodesHost.Children.Add(MutedText("No listener is active."));
-                return;
-            }
-            try
-            {
-                var payload = await NodeRequestAsync(HttpMethod.Get, "/v1/nodes");
-                var nodes = payload is not null && payload.Value.TryGetProperty("nodes", out var list) && list.ValueKind == JsonValueKind.Array
-                    ? list.EnumerateArray().Select(NodeInfo.FromJson).ToList()
-                    : new List<NodeInfo>();
-                if (nodes.Count == 0) nodesHost.Children.Add(MutedText("No devices are paired yet."));
-                foreach (var node in nodes) nodesHost.Children.Add(CreateNodeCard(node));
-            }
-            catch (Exception error) { nodesHost.Children.Add(MutedText($"Cannot load devices: {error.Message}")); }
-        }
-
-        refresh.Click += async (_, _) => await RunUiAsync(async () => await RefreshNodesAsync());
-        copyNormal.Click += async (_, _) => await RunUiAsync(async () => await CopyTextAsync(normalCommand));
-        copyRoot.Click += async (_, _) => await RunUiAsync(async () => await CopyTextAsync(rootCommand));
-        close.Click += (_, _) => dialog.Close();
-        body.Children.Add(status);
-        body.Children.Add(ButtonRow(refresh, close));
-        body.Children.Add(Section("CONNECT A CLIENT"));
-        body.Children.Add(MutedText("Install the minimal package on the device, replace PC-IP and NAME, then run one of these commands."));
-        body.Children.Add(ButtonRow(copyNormal, copyRoot));
-        body.Children.Add(new TextBox
-        {
-            Text = "#!/bin/sh\nexec /usr/bin/gnomeai-node run",
-            IsReadOnly = true,
-            AcceptsReturn = true,
-            FontFamily = new FontFamily("monospace"),
-        });
-        body.Children.Add(MutedText("Use a trusted network or VPN such as Tailscale. Do not expose the Hub HTTP port directly to the internet."));
-        body.Children.Add(Section("PAIRED DEVICES"));
-        body.Children.Add(nodesHost);
-        dialog.Content = new ScrollViewer { Content = body, VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto };
-        dialog.Opened += async (_, _) => await RunUiAsync(async () => await RefreshNodesAsync());
-        await dialog.ShowDialog(this);
-    }
+    private Task ShowNodesAsync() {ShowDevicesPage();return Task.CompletedTask;}
 
     private Control CreateNodeCard(NodeInfo node)
     {
@@ -2883,7 +2853,10 @@ public sealed partial class MainWindow : Window
     private Button ActionButton(string text, Func<Task> action)
     {
         var button = new Button { Content = text };
-        button.Click += async (_, _) => await RunUiAsync(async () => await action());
+        button.Click += async (_, _) => {
+            button.IsEnabled=false;
+            try {await RunUiAsync(action);}finally{button.IsEnabled=true;}
+        };
         return button;
     }
 

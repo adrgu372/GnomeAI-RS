@@ -690,6 +690,9 @@ impl Tool for WebSearchTool {
                 "web search is disabled; the user can enable it with /websearch",
             ));
         }
+        if !config.brave_api_key.trim().is_empty() {
+            return crate::brave::BraveTool { config:self.config.clone() }.call(args, cancel).await;
+        }
         let bundle = firecrawl_search(&config, query).await;
         let ok = !bundle.text.starts_with("[Firecrawl");
         Ok(ToolOutcome {
