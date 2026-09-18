@@ -40,6 +40,7 @@ impl Store {
         self.conn.lock().unwrap().execute_batch("CREATE TABLE IF NOT EXISTS device_transfers (
             transfer_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, peer TEXT NOT NULL,
             direction TEXT NOT NULL, phase TEXT NOT NULL, snapshot TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS device_transfer_aborts (transfer_id TEXT PRIMARY KEY, peer TEXT NOT NULL, session_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS device_commands (request_id TEXT PRIMARY KEY, response TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS device_session_settings (session_id TEXT PRIMARY KEY, provider TEXT NOT NULL, reasoning TEXT NOT NULL);")?;
         self.conn.lock().unwrap().execute_batch("CREATE TABLE IF NOT EXISTS device_workspaces (path TEXT PRIMARY KEY, id TEXT NOT NULL UNIQUE);")?;
@@ -108,6 +109,46 @@ impl Store {
         else {conn.execute("INSERT INTO device_workspace_locks(path,token) VALUES (?1,?2)",params![path.display().to_string(),token])?;}
         Ok(())
     }
+    pub fn assert_handoff_not_aborted(&self, transfer: &str) -> Result<()> {
+        let conn=self.conn.lock().unwrap();
+        let count:i64=conn.query_row("SELECT COUNT(*) FROM device_transfer_aborts WHERE transfer_id=?1",[transfer],|r|r.get(0))?;
+        if count!=0 {bail!("This session transfer was discarded; create a new transfer");}
+        Ok(())
+    }
+    pub fn abort_handoff(&self, transfer: &str, peer: &str, session: &str) -> Result<()> {
+        uuid::Uuid::parse_str(transfer)?;
+        uuid::Uuid::parse_str(session)?;
+        let mut conn=self.conn.lock().unwrap();
+        let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let aborted:Option<(String,String)>=tx.query_row("SELECT peer,session_id FROM device_transfer_aborts WHERE transfer_id=?1",[transfer],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((owner,id))=aborted {
+            if owner!=peer || id!=session {bail!("Discarded transfer belongs to a different peer or session");}
+            return Ok(());
+        }
+        let row:Option<(String,String,String,String)>=tx.query_row("SELECT peer,session_id,direction,phase FROM device_transfers WHERE transfer_id=?1",[transfer],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        if let Some((owner,id,direction,phase))=row {
+            if owner!=peer || id!=session {bail!("Transfer belongs to a different peer or session");}
+            let (before,after)=match (direction.as_str(),phase.as_str()) {
+                ("out","prepared")=>("transferring","active"),
+                ("in","staged")=>("staged","remote"),
+                (_,"complete")=>bail!("Transfer has already committed or activated; local discard cannot safely change execution ownership. Resume the transfer or recover it with the other device."),
+                _=>bail!("Inconsistent transfer direction or phase; no state was changed"),
+            };
+            let others:i64=tx.query_row("SELECT COUNT(*) FROM device_transfers WHERE session_id=?1 AND transfer_id<>?2 AND phase<>'complete'",params![id,transfer],|r|r.get(0))?;
+            if others!=0 {bail!("Another incomplete transfer references this session");}
+            if tx.execute("UPDATE sessions SET status=?1 WHERE id=?2 AND status=?3",params![after,id,before])?!=1 {bail!("Session state does not match the incomplete transfer; no ownership was changed");}
+            tx.execute("DELETE FROM device_transfers WHERE transfer_id=?1 AND peer=?2",params![transfer,peer])?;
+        } else {
+            // A checkpoint may have been persisted before the first local DB step.
+            let status:Option<String>=tx.query_row("SELECT status FROM sessions WHERE id=?1",[session],|r|r.get(0)).optional()?;
+            if status.as_deref().is_some_and(|s|s!="active" && s!="remote") {bail!("Missing transfer record for a non-final session state; cannot safely discard");}
+            let others:i64=tx.query_row("SELECT COUNT(*) FROM device_transfers WHERE session_id=?1 AND phase<>'complete'",[session],|r|r.get(0))?;
+            if others!=0 {bail!("Session has another incomplete transfer");}
+        }
+        tx.execute("INSERT INTO device_transfer_aborts VALUES (?1,?2,?3)",params![transfer,peer,session])?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn prepare_handoff(
         &self,
         id: &str,
@@ -119,6 +160,8 @@ impl Store {
     ) -> Result<serde_json::Value> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let cancelled:i64=tx.query_row("SELECT COUNT(*) FROM device_transfer_aborts WHERE transfer_id=?1",[transfer],|r|r.get(0))?;
+        if cancelled!=0 {bail!("This session transfer was discarded");}
         let old:Option<String> = tx.query_row("SELECT snapshot FROM device_transfers WHERE transfer_id=?1 AND session_id=?2 AND peer=?3 AND direction='out'",
             params![transfer,id,peer],|r|r.get(0)).optional()?;
         if let Some(old) = old {
@@ -206,6 +249,8 @@ impl Store {
         uuid::Uuid::parse_str(&snapshot.transfer_id)?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let cancelled:i64=tx.query_row("SELECT COUNT(*) FROM device_transfer_aborts WHERE transfer_id=?1",[&snapshot.transfer_id],|r|r.get(0))?;
+        if cancelled!=0 {bail!("This session transfer was discarded");}
         let existing:Option<String> = tx.query_row("SELECT phase FROM device_transfers WHERE transfer_id=?1 AND peer=?2 AND direction='in'",
             params![snapshot.transfer_id,peer],|r|r.get(0)).optional()?;
         if existing.is_some() {
@@ -298,6 +343,8 @@ impl Store {
     pub fn finish_handoff(&self, transfer: &str, peer: &str, incoming: bool) -> Result<String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let cancelled:i64=tx.query_row("SELECT COUNT(*) FROM device_transfer_aborts WHERE transfer_id=?1",[transfer],|r|r.get(0))?;
+        if cancelled!=0 {bail!("This session transfer was discarded");}
         let direction = if incoming { "in" } else { "out" };
         let (id,phase):(String,String)=tx.query_row("SELECT session_id,phase FROM device_transfers WHERE transfer_id=?1 AND peer=?2 AND direction=?3",
             params![transfer,peer,direction],|r|Ok((r.get(0)?,r.get(1)?)))?;
@@ -405,6 +452,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn abort_outgoing_restores_owner_and_prevents_replay() {
+        let f=Fixture::new();let id=f.session();let transfer=uuid::Uuid::new_v4().to_string();f.prepare(&id,&transfer,"peer");
+        assert_eq!(f.store.get_session(&id).unwrap().unwrap().status,"transferring");
+        f.store.abort_handoff(&transfer,"peer",&id).unwrap();f.store.abort_handoff(&transfer,"peer",&id).unwrap();
+        assert_eq!(f.store.get_session(&id).unwrap().unwrap().status,"active");
+        let count:i64=f.store.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM device_transfers WHERE transfer_id=?1",[&transfer],|r|r.get(0)).unwrap();assert_eq!(count,0);
+        assert!(f.store.prepare_handoff(&id,&transfer,"peer","custom","high",&f.root.join("outputs")).is_err());assert!(f.store.finish_handoff(&transfer,"peer",false).is_err());
+    }
+    #[test]
+    fn abort_incoming_never_activates_and_prevents_late_stage() {
+        let source=Fixture::new();let f=Fixture::new();let id=source.session();let transfer=uuid::Uuid::new_v4().to_string();
+        let snapshot=source.prepare(&id,&transfer,"peer");f.stage(&snapshot,"peer").unwrap();f.store.abort_handoff(&transfer,"peer",&id).unwrap();
+        assert_eq!(f.store.get_session(&id).unwrap().unwrap().status,"remote");
+        let count:i64=f.store.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM device_transfers WHERE transfer_id=?1",[&transfer],|r|r.get(0)).unwrap();assert_eq!(count,0);
+        assert!(f.stage(&snapshot,"peer").is_err());assert!(f.store.finish_handoff(&transfer,"peer",true).is_err());
+    }
+    #[test]
+    fn abort_completed_transfers_preserves_ownership() {
+        let source=Fixture::new();let target=Fixture::new();let id=source.session();let transfer=uuid::Uuid::new_v4().to_string();
+        let snapshot=source.prepare(&id,&transfer,"peer");target.stage(&snapshot,"peer").unwrap();
+        assert!(source.store.abort_handoff(&transfer,"wrong-peer",&id).is_err());
+        source.store.finish_handoff(&transfer,"peer",false).unwrap();target.store.finish_handoff(&transfer,"peer",true).unwrap();
+        assert!(source.store.abort_handoff(&transfer,"peer",&id).is_err());assert!(target.store.abort_handoff(&transfer,"peer",&id).is_err());
+        assert_eq!(source.store.get_session(&id).unwrap().unwrap().status,"remote");assert_eq!(target.store.get_session(&id).unwrap().unwrap().status,"active");
+    }
+    #[test]
+    fn abort_inconsistent_status_rolls_back_all_changes() {
+        let f=Fixture::new();let id=f.session();let transfer=uuid::Uuid::new_v4().to_string();f.prepare(&id,&transfer,"peer");
+        f.store.conn.lock().unwrap().execute("UPDATE sessions SET status='remote' WHERE id=?1",[&id]).unwrap();
+        assert!(f.store.abort_handoff(&transfer,"peer",&id).is_err());let conn=f.store.conn.lock().unwrap();
+        let row:String=conn.query_row("SELECT phase FROM device_transfers WHERE transfer_id=?1",[&transfer],|r|r.get(0)).unwrap();assert_eq!(row,"prepared");
+        let count:i64=conn.query_row("SELECT COUNT(*) FROM device_transfer_aborts WHERE transfer_id=?1",[&transfer],|r|r.get(0)).unwrap();assert_eq!(count,0);
+    }
+    #[test]
+    fn abort_unknown_checkpoint_is_idempotent_but_rejects_unexplained_frozen_session() {
+        let f=Fixture::new();let id=f.session();let transfer=uuid::Uuid::new_v4().to_string();
+        f.store.abort_handoff(&transfer,"peer",&id).unwrap();f.store.abort_handoff(&transfer,"peer",&id).unwrap();assert_eq!(f.store.get_session(&id).unwrap().unwrap().status,"active");
+        f.store.abort_handoff(&uuid::Uuid::new_v4().to_string(),"peer",&uuid::Uuid::new_v4().to_string()).unwrap();
+        f.store.conn.lock().unwrap().execute("UPDATE sessions SET status='transferring' WHERE id=?1",[&id]).unwrap();
+        assert!(f.store.abort_handoff(&uuid::Uuid::new_v4().to_string(),"peer",&id).is_err());
+    }
     #[test]
     fn workspace_lock_blocks_session_start_and_handoff_until_owner_unlocks() {
         let fixture=Fixture::new();let id=fixture.session();

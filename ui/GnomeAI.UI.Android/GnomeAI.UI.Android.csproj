@@ -7,14 +7,16 @@
     <SupportedOSPlatformVersion>26</SupportedOSPlatformVersion>
     <ApplicationId>io.github.adrgu372.gnomeai</ApplicationId>
     <ApplicationTitle>GnomeAI</ApplicationTitle>
-    <ApplicationVersion>9</ApplicationVersion>
-    <ApplicationDisplayVersion>3.0.0</ApplicationDisplayVersion>
+    <ApplicationVersion>16</ApplicationVersion>
+    <ApplicationDisplayVersion>3.1.0</ApplicationDisplayVersion>
     <RuntimeIdentifier>android-arm64</RuntimeIdentifier>
     <AndroidPackageFormats>apk</AndroidPackageFormats>
     <AndroidEnableProfiledAot>false</AndroidEnableProfiledAot>
     <PublishTrimmed>true</PublishTrimmed>
   </PropertyGroup>
   <ItemGroup>
+    <AvaloniaResource Include="Assets/Fonts/**" />
+    <Compile Include="../GnomeAI.UI/ConversationPhoto.cs" Link="UI/ConversationPhoto.cs" />
     <TrimmerRootAssembly Include="GnomeAI.Client" RootMode="All" />
     <ProjectReference Include="../GnomeAI.Client/GnomeAI.Client.csproj" />
     <PackageReference Include="QRCoder" Version="1.6.0" />

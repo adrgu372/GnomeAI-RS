@@ -34,57 +34,42 @@ public sealed class MarkdownView : UserControl
     private readonly DispatcherTimer _renderTimer = new() { Interval = TimeSpan.FromMilliseconds(50) };
     private string _renderedMarkdown = "";
     private bool _streaming;
-    private readonly SelectableTextBlock _streamText=new(){TextWrapping=TextWrapping.Wrap};
+    private readonly StackPanel _streamPanel=new(){Spacing=0};
+    private TextBlock _streamTail=new(){TextWrapping=TextWrapping.Wrap};
+    private string _streamRendered="";
+    private int _streamCommitted;
     public bool IsStreaming {
         get=>_streaming;
         set{if(_streaming==value)return;_streaming=value;_renderedMarkdown="\0";QueueRebuild();}
     }
     private bool _renderedDark;
     private readonly StackPanel _root=new() {Spacing=8};
-    private readonly Button _copyResponse=new() {Content="Copy response"};
-    private readonly Button _selectText=new() {Content="Select text"};
-    private readonly Button _copySelection=new() {Content="Copy selection",IsVisible=false};
-    private readonly TextBox _selection=new() {IsReadOnly=true,AcceptsReturn=true,TextWrapping=TextWrapping.Wrap,MinLines=1,MaxLines=16,IsVisible=false};
     private bool _selectingText;
+    private Action? _closeSelection;
     public bool IsSelectingText=>_selectingText;
     public event EventHandler? SelectionModeChanged;
+    public event EventHandler? ContentUpdated;
 
     public MarkdownView()
     {
-        var actions=new WrapPanel {Orientation=Orientation.Horizontal};
-        foreach(var button in new[]{_copyResponse,_selectText,_copySelection}) {
-            button.Padding=new Thickness(10,6);button.MinHeight=OperatingSystem.IsAndroid()?44:30;
-            button.Margin=new Thickness(0,0,6,0);actions.Children.Add(button);
-        }
-        ToolTip.SetTip(_copyResponse,"Copy the original response, preserving Markdown and line breaks");
-        _copyResponse.Click+=async(_,_)=>await CopyExactAsync(_copyResponse,_selectingText?_selection.Text??"":Markdown??"");
-        _copySelection.Click+=async(_,_)=> {
-            var text=_selection.Text??"";
-            var start=Math.Clamp(Math.Min(_selection.SelectionStart,_selection.SelectionEnd),0,text.Length);
-            var end=Math.Clamp(Math.Max(_selection.SelectionStart,_selection.SelectionEnd),start,text.Length);
-            if(end>start)await CopyExactAsync(_copySelection,text[start..end]);
-            else {_copySelection.Content="Select some text first";}
-        };
-        _selectText.Click+=(_,_)=> {
-            _selectingText=!_selectingText;
-            _selectText.Content=_selectingText?"Back to response":"Select text";
-            _copySelection.IsVisible=_selection.IsVisible=_selectingText;
-            _content.IsVisible=!_selectingText;
-            if(_selectingText) {
-                // A fixed snapshot avoids losing touch selection as tokens arrive.
-                _selection.Text=Markdown??"";_selection.SelectionStart=_selection.SelectionEnd=0;
-                _selection.Focus();
-            }else RebuildNow();
-            SelectionModeChanged?.Invoke(this,EventArgs.Empty);
-        };
-        _root.Children.Add(_selection);_root.Children.Add(_content);_root.Children.Add(actions);Content=_root;
-        _root.IsVisible=false;
-        _renderTimer.Tick += (_, _) =>
-        {
-            _renderTimer.Stop();
-            RebuildNow();
-        };
-        ActualThemeVariantChanged += (_, _) => QueueRebuild();
+        _root.Children.Add(_content);Content=_root;_root.IsVisible=false;
+        Avalonia.Input.Gestures.SetIsHoldingEnabled(this,true);
+        AddHandler(Avalonia.Input.Gestures.HoldingEvent,(_,args)=>{
+            if(args.HoldingState!=Avalonia.Input.HoldingState.Started || string.IsNullOrEmpty(Markdown))return;
+            args.Handled=true;BeginSelection(Markdown);
+        },Avalonia.Interactivity.RoutingStrategies.Bubble,true);
+        _renderTimer.Tick+=(_,_)=>{_renderTimer.Stop();RebuildNow();};
+        ActualThemeVariantChanged+=(_,_)=>QueueRebuild();
+    }
+    private void BeginSelection(string text)
+    {
+        if(_selectingText)return;
+        _selectingText=true;SelectionModeChanged?.Invoke(this,EventArgs.Empty);
+        // The Android selection view owns its frozen text until dismissed.
+        _closeSelection=NativeTextSelection.Show(text,IsDark,()=>{
+            _closeSelection=null;_selectingText=false;RebuildNow();SelectionModeChanged?.Invoke(this,EventArgs.Empty);
+        });
+        if(_closeSelection is null){_selectingText=false;SelectionModeChanged?.Invoke(this,EventArgs.Empty);}
     }
 
     public string Markdown
@@ -100,16 +85,28 @@ public sealed class MarkdownView : UserControl
             QueueRebuild();
     }
 
-    public void EndSelection() {
-        if(!_selectingText)return;
-        _selectingText=false;_selection.IsVisible=_copySelection.IsVisible=false;
-        _content.IsVisible=true;_selectText.Content="Select text";_selection.Text="";
-        RebuildNow();SelectionModeChanged?.Invoke(this,EventArgs.Empty);
-    }
+    public void EndSelection()=>_closeSelection?.Invoke();
 
     private void QueueRebuild()
     {
-        if (!_selectingText && !_renderTimer.IsEnabled) _renderTimer.Start();
+        if(_selectingText)return;
+        if(_streaming)RebuildNow();
+        else if(!_renderTimer.IsEnabled)_renderTimer.Start();
+    }
+
+    private void UpdateStream(string text)
+    {
+        if(_content.Children.Count!=1 || _content.Children[0]!=_streamPanel || !text.StartsWith(_streamRendered,StringComparison.Ordinal)) {
+            _content.Children.Clear();_streamPanel.Children.Clear();_content.Children.Add(_streamPanel);
+            _streamTail=new TextBlock {TextWrapping=TextWrapping.Wrap};_streamPanel.Children.Add(_streamTail);_streamCommitted=0;
+        }
+        // Completed paragraphs remain untouched while only the trailing paragraph grows.
+        int split;
+        while((split=text.IndexOf("\n\n",_streamCommitted,StringComparison.Ordinal))>=0) {
+            _streamTail.Text=text[_streamCommitted..split];_streamTail.Margin=new Thickness(0,0,0,12);
+            _streamCommitted=split+2;_streamTail=new TextBlock {TextWrapping=TextWrapping.Wrap};_streamPanel.Children.Add(_streamTail);
+        }
+        _streamTail.Text=text[_streamCommitted..];_streamRendered=text;
     }
 
     private void RebuildNow()
@@ -122,10 +119,10 @@ public sealed class MarkdownView : UserControl
         _renderedMarkdown = text;
         _renderedDark = dark;
         if(_streaming) {
-            if(_content.Children.Count!=1 || _content.Children[0]!=_streamText){_content.Children.Clear();_content.Children.Add(_streamText);}
-            _streamText.Text=text;return;
+            UpdateStream(text);ContentUpdated?.Invoke(this,EventArgs.Empty);return;
         }
         _content.Children.Clear();
+        ContentUpdated?.Invoke(this,EventArgs.Empty);
         if (text.Length == 0)
             return;
 
@@ -163,7 +160,7 @@ public sealed class MarkdownView : UserControl
             if (TryHeading(trimmed, out var level, out var heading))
             {
                 FlushParagraph();
-                _content.Children.Add(new SelectableTextBlock
+                _content.Children.Add(new TextBlock
                 {
                     Text = CleanInline(heading),
                     FontSize = level switch { 1 => 23, 2 => 19, 3 => 16, _ => 14 },
@@ -201,7 +198,7 @@ public sealed class MarkdownView : UserControl
             {
                 FlushParagraph();
                 var quote = trimmed.TrimStart('>', ' ');
-                var body = new SelectableTextBlock
+                var body = new TextBlock
                 {
                     Text = CleanInline(quote),
                     TextWrapping = TextWrapping.Wrap,
@@ -223,7 +220,7 @@ public sealed class MarkdownView : UserControl
                 FlushParagraph();
                 var row = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*"), ColumnSpacing = 8 };
                 row.Children.Add(new TextBlock { Text = marker, Foreground = MutedBrush });
-                var itemText = new SelectableTextBlock { Text = CleanInline(item), TextWrapping = TextWrapping.Wrap };
+                var itemText = new TextBlock { Text = CleanInline(item), TextWrapping = TextWrapping.Wrap };
                 Grid.SetColumn(itemText, 1);
                 row.Children.Add(itemText);
                 _content.Children.Add(row);
@@ -246,23 +243,9 @@ public sealed class MarkdownView : UserControl
         FlushParagraph();
     }
 
-    private async Task CopyExactAsync(Button button,string text) {
-        var label=ReferenceEquals(button,_copySelection)?"Copy selection":ReferenceEquals(button,_copyResponse)?"Copy response":"Copy code";
-        button.IsEnabled=false;
-        try {
-            var clipboard=TopLevel.GetTopLevel(this)?.Clipboard;
-            if(clipboard is null){button.Content="Clipboard unavailable";return;}
-            await clipboard.SetTextAsync(text);
-            button.Content="Copied";
-            await Task.Delay(1200);
-            button.Content=label;
-        }catch(Exception){button.Content="Copy failed · retry";}
-        finally{button.IsEnabled=true;}
-    }
-
     private void AddSelectable(string text, bool wrap)
     {
-        var block = new SelectableTextBlock
+        var block = new TextBlock
         {
             Text = CleanInline(text),
             TextWrapping = wrap ? TextWrapping.Wrap : TextWrapping.NoWrap,
@@ -274,8 +257,6 @@ public sealed class MarkdownView : UserControl
 
     private void AddCode(string language, string code)
     {
-        var copy = new Button { Content = "Copy code", Padding = new Thickness(9, 5), MinHeight = OperatingSystem.IsAndroid()?44:30 };
-        copy.Click += async (_, _) => await CopyExactAsync(copy,code);
         var header = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto"), Margin = new Thickness(0, 0, 0, 5) };
         header.Children.Add(new TextBlock
         {
@@ -285,10 +266,9 @@ public sealed class MarkdownView : UserControl
             Foreground = MutedBrush,
             VerticalAlignment = VerticalAlignment.Center,
         });
-        Grid.SetColumn(copy, 1);
-        header.Children.Add(copy);
 
-        var codeBlock = new SelectableTextBlock
+
+        var codeBlock = new TextBlock
         {
             Text = code,
             TextWrapping = TextWrapping.NoWrap,
@@ -335,7 +315,7 @@ public sealed class MarkdownView : UserControl
                     BorderBrush = MarkdownBorderBrush,
                     BorderThickness = new Thickness(0.5),
                     Padding = new Thickness(8, 6),
-                    Child = new SelectableTextBlock
+                    Child = new TextBlock
                     {
                         Text = cell,
                         TextWrapping = TextWrapping.Wrap,

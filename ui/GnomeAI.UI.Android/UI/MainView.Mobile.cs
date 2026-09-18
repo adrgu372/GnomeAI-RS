@@ -22,7 +22,7 @@ public sealed partial class MainView
         if(_bottomNavigation is not null)_bottomNavigation.IsVisible=!keyboard;
     });
     private readonly Dictionary<string,Button> _tabs=[];
-    private static IBrush Ink(string hex)=>Brush.Parse(hex);
+    private static IBrush Ink(string hex)=>MobilePalette.Ink(hex);
     private static Control Symbol(string name,IBrush? color=null)
     {
         var geometry=name switch {
@@ -36,6 +36,7 @@ public sealed partial class MainView
             "close"=>"M6 6L18 18 M18 6L6 18",
             "send"=>"M12 20V4 M5 11L12 4L19 11",
             "stop"=>"M6 6H18V18H6Z",
+            "sync"=>"M20 7A9 9 0 0 0 5 5L2 8 M2 3V8H7 M4 17A9 9 0 0 0 19 19L22 16 M17 16H22V21",
             "more"=>"M5 12H5.1 M12 12H12.1 M19 12H19.1",
             _=>"M4 12L10 18L20 6"
         };
@@ -49,6 +50,7 @@ public sealed partial class MainView
     }
     private Grid BuildMobileLayout()
     {
+        Background=Ink("#10191E");
         var root=new Grid {RowDefinitions=new RowDefinitions("Auto,Auto,*,Auto,Auto"),Background=Ink("#10191E")};
         var header=new Grid {ColumnDefinitions=new ColumnDefinitions("Auto,*,Auto,Auto"),Margin=new Thickness(20,12,12,4)};
         header.Children.Add(new Border {Width=38,Height=38,CornerRadius=new CornerRadius(13),Background=Ink("#A5E3C5"),
@@ -56,7 +58,7 @@ public sealed partial class MainView
         var brand=new TextBlock {Text="GnomeAI",FontSize=23,FontWeight=FontWeight.SemiBold,Margin=new Thickness(10,0),VerticalAlignment=VerticalAlignment.Center};
         Grid.SetColumn(brand,1);header.Children.Add(brand);
         var add=IconButton("plus","New conversation",NewAsync);Grid.SetColumn(add,2);header.Children.Add(add);
-        var more=IconButton("more","Conversation options",ShowConversationMenuAsync);Grid.SetColumn(more,3);header.Children.Add(more);root.Children.Add(header);
+        var more=IconButton("sync","Conversation sync and options",ShowConversationMenuAsync);Grid.SetColumn(more,3);header.Children.Add(more);root.Children.Add(header);
         var context=new Grid {ColumnDefinitions=new ColumnDefinitions("Auto,*"),Margin=new Thickness(20,0,20,10),ColumnSpacing=12};
         _source.MinWidth=120;_source.MaxWidth=190;_source.FontSize=12;context.Children.Add(_source);
         _status.FontSize=11;_status.Foreground=Ink("#94ABA0");_status.TextWrapping=TextWrapping.NoWrap;_status.TextTrimming=TextTrimming.CharacterEllipsis;

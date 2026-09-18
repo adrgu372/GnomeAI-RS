@@ -19,6 +19,7 @@ public sealed class PeerLink : IAsyncDisposable
     internal PeerLink(DeviceIdentity identity,PeerRecord peer,PeerTransport transport) {this.identity=identity;this.peer=peer;this.transport=transport;transport.Register(peer,Reconnect);}
     public PeerRecord Peer => peer;
     public bool Online { get; private set; }
+    public string LastConnectionError {get;private set;}="";
     public PeerConnectionState ConnectionState {get;private set;}=PeerConnectionState.Connecting;
     public string ConnectionLabel=>Expired?"Invitation expired":AwaitingConfirmation?
         (peer.LocalConfirmed?"Awaiting peer confirmation":"Confirm matching digits"):
@@ -95,6 +96,7 @@ public sealed class PeerLink : IAsyncDisposable
                 if(!peer.Trusted)attempt.CancelAfter(TimeSpan.FromSeconds(Math.Max(1,peer.Expires-DateTimeOffset.UtcNow.ToUnixTimeSeconds())));
                 socket=await transport.ConnectAsync(peer,attempt.Token);
                 lock(_connectionGate){attempt.Token.ThrowIfCancellationRequested();_socket = socket;}
+                LastConnectionError="";
                 _challenge = DeviceIdentity.Random(); _remoteChallenge = "";
                 _sent = _received = 0; _lastHello = Environment.TickCount64;
                 var heartbeat = HeartbeatAsync(attempt);
@@ -110,9 +112,12 @@ public sealed class PeerLink : IAsyncDisposable
                 }
                 finally { attempt.Cancel(); try { await heartbeat; } catch (OperationCanceledException) { } }
             }
-            catch (OperationCanceledException) when (_stop.IsCancellationRequested) { break; }
-            catch (Exception) when (!_stop.IsCancellationRequested)
-            { /* Reconnect without logging content, pairing secrets or keys. */ }
+            catch (Exception error) when (_stop.IsCancellationRequested && (error is OperationCanceledException or ObjectDisposedException or IOException or WebSocketException)) { break; }
+            catch (Exception error) when (!_stop.IsCancellationRequested)
+            {
+                LastConnectionError=error is OperationCanceledException?"Connection or handshake timed out. Keep both apps open and verify they use the same build.":error.Message;
+                Changed?.Invoke();
+            }
             finally
             {
                 lock(_connectionGate){_attempt=null;_socket = null;} socket?.Dispose(); SetOnline(false);

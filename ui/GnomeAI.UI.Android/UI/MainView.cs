@@ -50,7 +50,7 @@ public sealed partial class MainView : UserControl, IDisposable
     {
         _hub=hub; _home=home;_reasoning.Content=_thinking;_capturePhoto=capturePhoto;BuildAttachmentCard();
         _live.SelectionModeChanged+=SelectionModeChanged;
-        _scanQr=scanQr;Content=BuildMobileLayout();
+        _scanQr=scanQr;Content=BuildMobileLayout();InitializeTranscript();
         TopLevel.SetAutoSafeAreaPadding(this,false);
         MobileHost.InsetsChanged+=ApplyWindowInsets;ApplyWindowInsets(MobileHost.Insets,MobileHost.KeyboardVisible);
         _source.SelectionChanged+=async (_,_)=>
@@ -106,10 +106,11 @@ public sealed partial class MainView : UserControl, IDisposable
     {
         // Transcript/transport traffic is handled by the batched session path.
         var coreKind=message.GetProperty("event").GetString();
-        if(coreKind is not ("ui_config" or "ready" or "error" or "notice"))return Task.CompletedTask;
+        if(coreKind is not ("ui_config" or "ready" or "provider_changed" or "error" or "notice"))return Task.CompletedTask;
         if(!Dispatcher.UIThread.CheckAccess()){Dispatcher.UIThread.Post(()=>{if(!_disposed)_=OnCore(message);});return Task.CompletedTask;}
         var kind=message.GetProperty("event").GetString();
         if(kind=="ui_config") _config=message.Clone();
+        if(kind is "ready" or "provider_changed")AcceptModelUpdate(message);
         if(kind=="ready" && Selected is null && _session.Length==0)
         { _session=message.GetProperty("session_id").GetString()!;_refreshTimer.Start(); }
         if(kind is "error" or "notice") _status.Text=message.GetProperty("message").GetString();
@@ -136,7 +137,7 @@ public sealed partial class MainView : UserControl, IDisposable
     {
         try {
             while(!_eventStop.IsCancellationRequested) {
-                await Task.Delay(150,_eventStop.Token).ConfigureAwait(false);
+                await Task.Delay(40,_eventStop.Token).ConfigureAwait(false);
                 var batch=new List<(PeerLink? Source,JsonElement Message,int Generation)>();
                 lock(_eventGate)while(batch.Count<256 && _eventQueue.TryDequeue(out var item))batch.Add(item);
                 await Dispatcher.UIThread.InvokeAsync(()=>{
@@ -159,7 +160,7 @@ public sealed partial class MainView : UserControl, IDisposable
         var changed=_batchText.Length>0 || _batchReasoning.Length>0;
         if(_batchText.Length>0){_live.Markdown+=_batchText.ToString();_batchText.Clear();}
         if(_batchReasoning.Length>0){_thinking.Text+=_batchReasoning.ToString();_batchReasoning.Clear();_reasoning.IsVisible=true;}
-        if(changed && !SelectingResponse())_scroll.ScrollToEnd();
+        if(changed)QueueTranscriptScroll();
     }
     private void ProcessSessionEvent(PeerLink? source,JsonElement message)
     {
@@ -182,8 +183,8 @@ public sealed partial class MainView : UserControl, IDisposable
             }
             else if(eventKind is "turn_started" or "turn_completed" or "interrupted" or "error" or "tool_call_ended") {
                 FlushStreamBatch();
-                if(eventKind=="turn_started")_live.IsStreaming=true;
-                else if(eventKind!="tool_call_ended")_live.IsStreaming=false;
+                if(eventKind=="turn_started"){_thinkingStartIndex=_historyRows.Count;_live.IsStreaming=true;_thinking.Text="";_reasoning.IsVisible=false;}
+                else if(eventKind!="tool_call_ended"){RememberCompletedThinking();_live.IsStreaming=false;}
                 _refreshTimer.Start();
             }
             else if(eventKind=="tool_call_started") _status.Text="Using "+e.GetProperty("name").GetString();
@@ -203,10 +204,10 @@ public sealed partial class MainView : UserControl, IDisposable
         }
         card.Children.Add(Button("Allow this action",()=>Decide("allow")));
         card.Children.Add(Button("Deny",()=>Decide("deny")));
-        _messages.Children.Add(card);
+        _approvalPanel.Children.Add(card);
     }
-    private void ShowPanel() { if(_composeSurface is not null)_composeSurface.IsVisible=false; _devicesVisible=false;_chatsVisible=false;_panel.Children.Clear();_panelScroll.IsVisible=true;_scroll.IsVisible=false; }
-    private void ShowTranscript() { if(_composeSurface is not null)_composeSurface.IsVisible=true;SelectTab("Chat"); _devicesVisible=false;_chatsVisible=false;_panelScroll.IsVisible=false;_scroll.IsVisible=true; }
+    private void ShowPanel() { _settingsGeneration++; if(_composeSurface is not null)_composeSurface.IsVisible=false; _devicesVisible=false;_chatsVisible=false;_panel.Children.Clear();_panelScroll.IsVisible=true;_scroll.IsVisible=false; }
+    private void ShowTranscript() { _settingsGeneration++; if(_composeSurface is not null)_composeSurface.IsVisible=true;SelectTab("Chat"); _devicesVisible=false;_chatsVisible=false;_panelScroll.IsVisible=false;_scroll.IsVisible=true; }
     private async Task ShowChatsAsync()
     {
         var link=Selected;var generation=_viewGeneration;
@@ -241,7 +242,7 @@ public sealed partial class MainView : UserControl, IDisposable
     }
     private async Task OpenAsync(string id) {
         EndResponseSelection();
-        if(_session!=id)ClearAttachment();_session=id;_viewGeneration++;ShowTranscript();
+        if(_session!=id)ClearAttachment();_session=id;_viewGeneration++;_followEnd=true;ShowTranscript();
         if (Selected is null) await _hub.Bridge.SendAsync(new Dictionary<string,object?> { ["op"]="resume_session",["id"]=id });
         await RefreshCurrentAsync();
     }
@@ -250,10 +251,10 @@ public sealed partial class MainView : UserControl, IDisposable
         foreach(var view in _messages.GetVisualDescendants().OfType<MarkdownView>().ToArray())view.EndSelection();
         _live.EndSelection();
     }
-    private bool SelectingResponse()=>_messages.GetVisualDescendants().OfType<MarkdownView>().Any(view=>view.IsSelectingText);
+    private bool SelectingResponse()=>NativeTextSelection.IsOpen || _messages.GetVisualDescendants().OfType<MarkdownView>().Any(view=>view.IsSelectingText);
     private void SelectionModeChanged(object? sender,EventArgs args) {if(_refreshAgain && !SelectingResponse())_refreshTimer.Start();}
     private MarkdownView ReplyView(string text) {
-        var view=new MarkdownView {Markdown=text};view.SelectionModeChanged+=SelectionModeChanged;return view;
+        var view=new MarkdownView {Markdown=text};view.SelectionModeChanged+=SelectionModeChanged;view.ContentUpdated+=(_,_)=>QueueTranscriptScroll();return view;
     }
     private async Task RefreshCurrentAsync()
     {
@@ -267,32 +268,14 @@ public sealed partial class MainView : UserControl, IDisposable
             var data=await _hub.RequestAsync(link,"snapshot",new { session_id=_session });
             if(generation!=_viewGeneration || _disposed) return;
             if(SelectingResponse()){_refreshAgain=true;return;}
+            CaptureSnapshotThinking(data);
             if(data.TryGetProperty("revision",out var snapshotRevision)) {
                 _revision=snapshotRevision.GetInt64();_epoch=data.GetProperty("epoch").GetString()!;
             }
-            _messages.Children.Clear();
-            if(Mobile && data.GetProperty("turns").GetArrayLength()==0)_messages.Children.Add(Welcome());
-            foreach(var turn in data.GetProperty("turns").EnumerateArray())
-            {
-                var role=turn.GetProperty("role").GetString();
-                var text=turn.GetProperty("text").GetString()??"";
-                Control body=role=="assistant"?ReplyView(text):new SelectableTextBlock {Text=DisplayUserText(text),TextWrapping=TextWrapping.Wrap};
-                var bubble=new StackPanel {Spacing=6};
-                bubble.Children.Add(new TextBlock {Text=role=="user"?"You":"GnomeAI",FontSize=11,Opacity=.6});bubble.Children.Add(body);
-                _messages.Children.Add(new Border {Child=bubble,Padding=new Thickness(14),CornerRadius=new CornerRadius(14),
-                    Background=role=="user"?(Mobile?Ink("#254037"):new SolidColorBrush(Color.FromArgb(24,90,130,210))):Brushes.Transparent,
-                    HorizontalAlignment=role=="user"?HorizontalAlignment.Right:HorizontalAlignment.Stretch,MaxWidth=960});
-            }
-            _batchText.Clear();_batchReasoning.Clear();_live.IsStreaming=data.GetProperty("busy").GetBoolean();
-            _live.Markdown="";_thinking.Text="";
-            if(data.TryGetProperty("live",out var live) && live.ValueKind==JsonValueKind.Object)
-            { _live.Markdown=live.GetProperty("text").GetString();_thinking.Text=live.GetProperty("reasoning").GetString(); }
-            _reasoning.IsVisible=!string.IsNullOrEmpty(_thinking.Text);_messages.Children.Add(_reasoning);_messages.Children.Add(_live);
-            _running=data.GetProperty("busy").GetBoolean();UpdateSendAppearance();
-            if(data.TryGetProperty("approvals",out var approvals))
-                foreach(var approval in approvals.EnumerateArray()) ShowApproval(approval,_session,link);
+            await RenderSnapshotAsync(data,generation);
+            if(generation!=_viewGeneration || _disposed)return;
             _status.Text=(link is null?"":link.ConnectionLabel+(link.Online?" · ":" · cached · "))+(link?.Peer.Name??"Local")+(data.GetProperty("busy").GetBoolean()?" · Running":" · Ready");
-            _scroll.ScrollToEnd();
+            QueueTranscriptScroll();
         }
         finally {
             _refreshing=false;var buffered=_bufferedEvents.ToArray();_bufferedEvents.Clear();
@@ -313,10 +296,10 @@ public sealed partial class MainView : UserControl, IDisposable
         try
         {
             if(_session.Length==0) await NewAsync();
-            if(_attachmentPath is not null) {if(Selected is not null)throw new IOException("Attachments require a local conversation.");await SubmitAttachmentAsync(_session,text);}
+            if(_attachmentPath is not null) {await SubmitAttachmentAsync(_session,text);}
             else await _hub.RequestAsync(Selected,"submit",new { session_id=_session,text });
             if(_composer.Text==text) _composer.Text="";
-            ShowTranscript();await RefreshCurrentAsync();
+            ShowTranscript();QueueTranscriptScroll(true);await RefreshCurrentAsync();
         }
         finally {_send.IsEnabled=true;}
     }
@@ -351,7 +334,7 @@ public sealed partial class MainView : UserControl, IDisposable
     }
     private Task ShowConversationMenuAsync() {
         ShowPanel();_panel.Children.Add(new TextBlock {Text="Conversation",FontSize=22});
-        _panel.Children.Add(Button("Return to conversation",async()=>{ShowTranscript();await RefreshCurrentAsync();}));
+        _panel.Children.Add(Button("Return to conversation",async()=>{ShowTranscript();QueueTranscriptScroll(true);await RefreshCurrentAsync();}));
         _panel.Children.Add(Button("Move execution and files…",MoveAsync));
         _panel.Children.Add(new TextBlock {Text="After a move, workspace files sync automatically while both agents are idle. Conflicts keep both versions.",TextWrapping=TextWrapping.Wrap});
         foreach(var link in _hub.Links.Where(l=>l.Peer.Trusted)) {
@@ -398,8 +381,24 @@ public sealed partial class MainView : UserControl, IDisposable
         _panel.Children.Add(create);
         _panel.Children.Add(Button("Copy invitation",async()=>{if(TopLevel.GetTopLevel(this)?.Clipboard is {} clipboard) await clipboard.SetTextAsync(code.Text); }));
         _panel.Children.Add(Button("Connect using invitation",()=>{_hub.Pair(code.Text??"");_status.Text="Connecting… Keep both devices open for confirmation.";return Task.CompletedTask;}));
-        if(_hub.HasPendingTransfer) _panel.Children.Add(Button("Resume pending transfer",()=>_hub.ResumeMoveAsync()));
+        if(_hub.HasPendingTransfer) _panel.Children.Add(Button("Pending session transfer · Resume or discard",()=>{ShowTransferRecovery();return Task.CompletedTask;}));
         _panel.Children.Add(_peerCards);RefreshPeerCards();
+    }
+    private void ShowTransferRecovery(PeerLink? link=null) {
+        ShowPanel();_panel.Children.Add(new TextBlock {Text="Pending session transfer",FontSize=24});
+        _panel.Children.Add(new TextBlock {Text="A session transfer is still pending. You can resume it, or discard the incomplete transfer and forget its device. A committed or activated transfer cannot be discarded safely.",TextWrapping=TextWrapping.Wrap});
+        var error=new TextBlock {TextWrapping=TextWrapping.Wrap};_panel.Children.Add(error);
+        var canResume=false;
+        try {var pending=_hub.Links.FirstOrDefault(p=>p.Peer.Id==_hub.PendingTransferPeerId);canResume=pending is not null;
+            _panel.Children.Add(new TextBlock {Text=pending is null?"The transfer's device no longer exists locally. Use discard to recover this checkpoint.":"Transfer with "+pending.Peer.Name,TextWrapping=TextWrapping.Wrap});
+        }catch(Exception e){error.Text=e.Message;}
+        var resume=Button("Resume transfer",async()=>{try{await _hub.ResumeMoveAsync();ShowDevices();}catch(Exception e){error.Text=e.Message;}});resume.IsEnabled=canResume;_panel.Children.Add(resume);
+        var confirmation=new StackPanel {Spacing=8,IsVisible=false};
+        confirmation.Children.Add(new TextBlock {Text="Confirm discarding the incomplete transfer and forgetting its device?",TextWrapping=TextWrapping.Wrap});
+        confirmation.Children.Add(Button("Confirm discard and forget",async()=>{try{await _hub.DiscardTransferAndForgetAsync(link);ShowDevices();}catch(Exception e){error.Text=e.Message;}}));
+        _panel.Children.Add(Button("Discard transfer and forget device",()=>{confirmation.IsVisible=true;return Task.CompletedTask;}));
+        _panel.Children.Add(confirmation);
+        _panel.Children.Add(Button("Cancel",()=>{ShowDevices();return Task.CompletedTask;}));
     }
     private void RefreshPeerCards() {
         _peerCards.Children.Clear();
@@ -408,6 +407,7 @@ public sealed partial class MainView : UserControl, IDisposable
             var expired=!link.Peer.Trusted && link.Peer.Expires<DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             card.Children.Add(new TextBlock {Text=link.Peer.Name+" · "+link.ConnectionLabel,FontWeight=FontWeight.SemiBold,TextWrapping=TextWrapping.Wrap});
             card.Children.Add(new TextBlock {Text=link.Peer.Relay.StartsWith("tor://",StringComparison.Ordinal)?"Tor · encrypted device connection":"WSS · encrypted device connection",FontSize=12,Opacity=.65});
+            if(link.LastConnectionError.Length>0)card.Children.Add(new TextBlock {Text=link.LastConnectionError,TextWrapping=TextWrapping.Wrap});
             if(link.AwaitingConfirmation) {
                 card.Children.Add(new TextBlock {Text=link.SecurityCode,FontSize=32,FontWeight=FontWeight.SemiBold});
                 card.Children.Add(new TextBlock {Text="Compare these digits directly on your other device before confirming.",TextWrapping=TextWrapping.Wrap});
@@ -419,6 +419,7 @@ public sealed partial class MainView : UserControl, IDisposable
                 card.Children.Add(Button("Merge memories",async()=>{await _hub.MergeMemoriesAsync(link);_status.Text="Memories merged in both directions.";}));
             }
             card.Children.Add(Button(link.Peer.Trusted?"Forget device":"Cancel invitation",()=>{
+                if(_hub.HasPendingTransfer){ShowTransferRecovery(link);return Task.CompletedTask;}
                 card.Children.Clear();
                 card.Children.Add(new TextBlock {Text=$"Forget {link.Peer.Name}? The other device will be notified if connected.",TextWrapping=TextWrapping.Wrap});
                 card.Children.Add(Button("Confirm forget",async()=>{await _hub.ForgetAsync(link);RefreshPeerCards();_status.Text=_hub.SyncStatus;}));
@@ -427,45 +428,6 @@ public sealed partial class MainView : UserControl, IDisposable
             }));
             _peerCards.Children.Add(new Border {Child=card,Padding=new Thickness(14),CornerRadius=new CornerRadius(12),BorderThickness=new Thickness(1),BorderBrush=new SolidColorBrush(Color.FromArgb(65,128,128,128))});
         }
-    }
-    private async Task ShowSettingsAsync()
-    {
-        var settings=await _hub.RequestAsync(null,"settings",new {});
-        string Setting(string name)=>settings.GetProperty(name).GetString()??"";
-        ShowPanel();SelectTab("Settings");_panel.Children.Add(new TextBlock { Text="Local AI settings",FontSize=22,FontWeight=FontWeight.SemiBold });
-        var config=_config.ValueKind==JsonValueKind.Object?_config:_hub.Config;
-        var providers=config.ValueKind==JsonValueKind.Object && config.TryGetProperty("providers",out var list)
-            ?list.EnumerateArray().Select(p=>p.GetProperty("id").GetString()!).ToArray():new[]{"openai","anthropic","custom"};
-        var provider=new ComboBox { ItemsSource=providers,SelectedIndex=Math.Max(0,Array.IndexOf(providers,Setting("provider_id"))),HorizontalAlignment=HorizontalAlignment.Stretch };
-        var model=new TextBox { Watermark="Model ID",Text=Setting("model") };var key=new TextBox { Watermark="API key (blank keeps saved key)",PasswordChar='●' };
-        var url=new TextBox { Watermark="Custom API base URL (optional)",Text=Setting("provider_id")=="custom"?Setting("base_url"):"" };
-        var reasoning=new ComboBox { ItemsSource=new[]{"default","low","medium","high","xhigh"},SelectedItem=Setting("reasoning") };
-        var web=new CheckBox { Content="Enable web search",IsChecked=settings.GetProperty("web").GetBoolean() };
-        var brave=new TextBox { Watermark="Brave API key (blank keeps saved key)",PasswordChar='●' };
-        var memory=new CheckBox { Content="Enable memory",IsChecked=settings.GetProperty("memory").GetBoolean() };
-        var workers=new CheckBox { Content="Use a separate provider/model for subagents",IsChecked=settings.GetProperty("workers").GetBoolean() };
-        var workerProvider=new ComboBox { ItemsSource=providers,SelectedIndex=Math.Max(0,Array.IndexOf(providers,Setting("worker_provider"))) };
-        var workerModel=new TextBox { Watermark="Subagent model ID",Text=Setting("worker_model") };
-        var workerReasoning=new ComboBox { ItemsSource=new[]{"default","low","medium","high","xhigh"},SelectedItem=Setting("worker_reasoning") };
-        if(Mobile) {
-            AddSettingsGroup("Model & provider",SettingField("Provider",provider),key,url,SettingField("Model",model),SettingField("Reasoning",reasoning));
-            AddSettingsGroup("Web & memory",web,brave,memory);
-            AddSettingsGroup("Subagents",workers,SettingField("Provider",workerProvider),workerModel,SettingField("Reasoning",workerReasoning));
-        } else foreach(var control in new Control[]{provider,key,url,model,reasoning,web,brave,memory,workers,workerProvider,workerModel,workerReasoning}) _panel.Children.Add(control);
-        _panel.Children.Add(Button("Save",async()=>
-        {
-            async Task Op(string op,params (string Key,object? Value)[] pairs)
-            {var payload=new Dictionary<string,object?> { ["op"]=op };foreach(var pair in pairs) payload[pair.Key]=pair.Value;await _hub.Bridge.SendAsync(payload);}
-            await Op("set_provider",("provider_id",provider.SelectedItem), ("api_key",string.IsNullOrWhiteSpace(key.Text)?null:key.Text), ("base_url",string.IsNullOrWhiteSpace(url.Text)?null:url.Text));
-            if(!string.IsNullOrWhiteSpace(model.Text)) await Op("set_model",("model",model.Text));
-            await Op("set_reasoning_effort",("effort",reasoning.SelectedItem));
-            await Op("set_brave",("api_key",string.IsNullOrWhiteSpace(brave.Text)?null:brave.Text),("mode","context"));
-            await Op("set_web_search",("enabled",web.IsChecked==true));
-            await Op("memory_set",("enabled",memory.IsChecked==true));
-            await Op("set_subagent_defaults",("enabled",workers.IsChecked==true),("provider_id",workerProvider.SelectedItem),
-                ("model",string.IsNullOrWhiteSpace(workerModel.Text)?"inherit":workerModel.Text),("reasoning_effort",workerReasoning.SelectedItem));
-            key.Text="";brave.Text="";_status.Text="Settings submitted to the local core.";
-        }));
     }
     public void Dispose()
     {

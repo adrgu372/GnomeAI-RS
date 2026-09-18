@@ -45,15 +45,14 @@ internal static class PairingScanner
 public sealed class PairingScannerActivity : Activity, ISurfaceHolderCallback, Camera.IAutoFocusCallback
 {
     private SurfaceView? _preview;
-    private TextView? _status, _details;
-    private Button? _capture;
+    private TextView? _status;
     private Camera? _camera;
     private PreviewFrames? _frames;
     private PictureFrame? _picture;
-    private bool _surfaceReady, _resumed, _done, _canFocus;
+    private bool _surfaceReady, _resumed, _done, _canFocus, _periodicFocus;
     private bool _awaitingFrame, _captureRequested, _takingPicture, _awaitingPicture;
     private int _width, _height, _decoding, _generation, _previewRotation, _frameCount, _checks, _points;
-    private long _requestedAt, _nextScanAt, _pictureStartedAt, _statusUntil;
+    private long _requestedAt, _nextScanAt, _pictureStartedAt, _statusUntil, _nextCaptureAt, _nextFocusAt, _nextDiagnosticsAt;
     private string _lastError="none", _lastInput="none";
     private System.Threading.Timer? _watchdog;
 
@@ -85,16 +84,9 @@ public sealed class PairingScannerActivity : Activity, ISurfaceHolderCallback, C
         var frame=new FrameLayout(this);_preview=new SurfaceView(this);
         frame.AddView(_preview,new FrameLayout.LayoutParams(-1,-1,GravityFlags.Center));
         root.AddView(frame,new LinearLayout.LayoutParams(-1,0,1));
-        _preview.Click+=(_,_)=>FocusCamera();
-        var actions=new LinearLayout(this){Orientation=Orientation.Horizontal};
-        var focus=new Button(this){Text="Focus"};focus.Click+=(_,_)=>FocusCamera();
-        _capture=new Button(this){Text="Scan sharp capture"};_capture.Click+=(_,_)=>RequestCapture();
-        actions.AddView(focus,new LinearLayout.LayoutParams(0,-2,1));actions.AddView(_capture,new LinearLayout.LayoutParams(0,-2,2));root.AddView(actions);
-        var diagnostics=new Button(this){Text="Scanner details · preview7"};
-        _details=new TextView(this){TextSize=12,Visibility=ViewStates.Gone};_details.SetTextColor(Color.White);_details.SetPadding(16,0,16,8);
-        diagnostics.Click+=(_,_)=>{_details.Visibility=_details.Visibility==ViewStates.Visible?ViewStates.Gone:ViewStates.Visible;UpdateDetails();};
-        root.AddView(diagnostics);root.AddView(_details);
-        var cancel=new Button(this){Text="Cancel · paste a pairing code instead"};cancel.Click+=(_,_)=>Finish();root.AddView(cancel);
+        var cancel=new Button(this){Text="Cancel"};
+        cancel.Click+=(_,_)=>{_done=true;SetResult(global::Android.App.Result.Canceled);Finish();};
+        root.AddView(cancel);
         root.SetFitsSystemWindows(true);SetContentView(root);_preview.Holder!.AddCallback(this);
         // CAMERA is requested only after the user explicitly opens Scan QR.
         if(CheckSelfPermission(global::Android.Manifest.Permission.Camera)!=Permission.Granted)
@@ -128,8 +120,11 @@ public sealed class PairingScannerActivity : Activity, ISurfaceHolderCallback, C
     }
     private void UpdateDetails()
     {
-        if(_details is null || _details.Visibility!=ViewStates.Visible)return;
-        _details.Text=$"preview7 · {_width}×{_height} · rotation {_previewRotation}°\nFrames: {_frameCount} · checks: {_checks} · finder points: {_points}\nInput: {_lastInput} · last error: {_lastError}";
+        // Automatic diagnostics, no user-facing controls and no invitation contents.
+        if(Environment.TickCount64<_nextDiagnosticsAt)return;
+        _nextDiagnosticsAt=Environment.TickCount64+5000;
+        global::Android.Util.Log.Debug("GnomeAI.Scanner",
+            $"{_width}x{_height}, rotation {_previewRotation}, frames {_frameCount}, checks {_checks}, points {_points}, input {_lastInput}, error {_lastError}");
     }
     private void OpenCamera()
     {
@@ -160,7 +155,9 @@ public sealed class PairingScannerActivity : Activity, ISurfaceHolderCallback, C
             _previewRotation=(info.Orientation-degrees+360)%360;_camera.SetDisplayOrientation(_previewRotation);
             _generation++;_frames=new PreviewFrames(this,_generation);
             _camera.SetPreviewDisplay(_preview!.Holder);_camera.StartPreview();FitPreview();
-            _capture!.Enabled=true;_nextScanAt=0;Status("Waiting for the first camera image…");ArmFrame();
+            _periodicFocus=actual.FocusMode==Camera.Parameters.FocusModeAuto;
+            _nextCaptureAt=Environment.TickCount64+6000;_nextFocusAt=Environment.TickCount64+3000;
+            _nextScanAt=0;Status("Waiting for the first camera image…");ArmFrame();
             if(actual.FocusMode==Camera.Parameters.FocusModeAuto)FocusCamera();
             _watchdog=new System.Threading.Timer(_=>{try{RunOnUiThread(CheckCamera);}catch(ObjectDisposedException){}},null,250,250);
         }
@@ -184,7 +181,7 @@ public sealed class PairingScannerActivity : Activity, ISurfaceHolderCallback, C
             // The next frame is requested only after the current decoder releases its input.
             _camera!.SetOneShotPreviewCallback(_frames);
         }
-        catch(Exception error){_awaitingFrame=false;Error(error,"request frame");Status("Camera image unavailable. Try Scan sharp capture.",3000);}
+        catch(Exception error){_awaitingFrame=false;Error(error,"request frame");Status("Camera image unavailable. A sharper capture will be tried automatically.",3000);}
     }
     private void PreviewFrame(byte[]? data,int generation)
     {
@@ -194,7 +191,7 @@ public sealed class PairingScannerActivity : Activity, ISurfaceHolderCallback, C
         var width=_width;var height=_height;var count=checked(width*height);
         if(data is null || count==0 || data.Length<count)
         {
-            _lastError="incomplete preview frame";Status("Camera returned an incomplete image. Try Scan sharp capture.",3000);UpdateDetails();return;
+            _lastError="incomplete preview frame";Status("Camera returned an incomplete image. A sharper capture will be tried automatically.",3000);UpdateDetails();return;
         }
         if(Interlocked.CompareExchange(ref _decoding,1,0)!=0)return;
         try
@@ -202,7 +199,7 @@ public sealed class PairingScannerActivity : Activity, ISurfaceHolderCallback, C
             var luma=data.AsSpan(0,count).ToArray();_lastInput="preview";_nextScanAt=Environment.TickCount64+250;
             _=DecodeAsync(()=>new RGBLuminanceSource(luma,width,height,RGBLuminanceSource.BitmapFormat.Gray8),generation,false);
         }
-        catch(Exception error){Interlocked.Exchange(ref _decoding,0);Error(error,"read frame");Status("Could not read the camera image. Try Scan sharp capture.",3000);}
+        catch(Exception error){Interlocked.Exchange(ref _decoding,0);Error(error,"read frame");Status("Could not read the camera image. A sharper capture will be tried automatically.",3000);}
     }
     private Task DecodeAsync(Func<LuminanceSource> createSource,int generation,bool picture)=>Task.Run(()=>
     {
@@ -239,11 +236,11 @@ public sealed class PairingScannerActivity : Activity, ISurfaceHolderCallback, C
                 if(rejection is not null)Status(rejection,6000);
                 else if(picture)Status("Capture checked: no readable QR. Enlarge the QR on the PC and keep its white border visible.",6000);
                 else if(Environment.TickCount64>=_statusUntil)Status(points>0
-                    ?"Scanning… Pattern found, but the QR is not readable yet. Try Scan sharp capture."
-                    :"Scanning camera images… Keep the complete QR visible, or try Scan sharp capture.");
+                    ?"Scanning… Pattern found, but the QR is not readable yet. A sharper capture will be tried automatically."
+                    :"Scanning camera images… Keep the complete QR and its white border visible.");
             });
         }
-        catch(Exception error){Post(generation,()=>{Error(error,"decode");Status("The QR reader could not process this image. Open Scanner details.",6000);});}
+        catch(Exception error){Post(generation,()=>{Error(error,"decode");Status("The QR reader could not process this image. Retrying automatically; keep the QR visible.",6000);});}
         finally
         {
             Interlocked.Exchange(ref _decoding,0);
@@ -253,7 +250,7 @@ public sealed class PairingScannerActivity : Activity, ISurfaceHolderCallback, C
     private void RequestCapture()
     {
         if(!IsCurrent(_generation) || _takingPicture || _captureRequested)return;
-        _captureRequested=true;_capture!.Enabled=false;Status("Hold steady — reading a sharp capture…",6000);CheckCamera();
+        _nextCaptureAt=Environment.TickCount64+8000;_captureRequested=true;Status("Hold steady — reading a sharp capture…",6000);CheckCamera();
     }
     private void TakeCapture()
     {
@@ -265,13 +262,13 @@ public sealed class PairingScannerActivity : Activity, ISurfaceHolderCallback, C
             // The JPEG path bypasses preview callbacks entirely; no file or external camera app.
             _camera.TakePicture(null,null,_picture);
         }
-        catch(Exception error){Error(error,"capture");Status("Could not capture the QR. Try again or paste the invitation.",5000);ResumePreview();}
+        catch(Exception error){Error(error,"capture");Status("Could not capture the QR. Retrying automatically. Keep the QR visible.",5000);ResumePreview();}
     }
     private void PictureTaken(byte[]? jpeg,int generation)
     {
         if(!IsCurrent(generation) || !_takingPicture)return;
         _awaitingPicture=false;
-        if(jpeg is null || jpeg.Length==0){Status("Camera returned an empty capture. Try again.",5000);ResumePreview();return;}
+        if(jpeg is null || jpeg.Length==0){Status("Camera returned an empty capture. Retrying automatically.",5000);ResumePreview();return;}
         if(Interlocked.CompareExchange(ref _decoding,1,0)!=0){ResumePreview();return;}
         _lastInput="JPEG capture";
         _=DecodeAsync(()=>
@@ -292,7 +289,7 @@ public sealed class PairingScannerActivity : Activity, ISurfaceHolderCallback, C
     {
         _takingPicture=false;_awaitingPicture=false;_captureRequested=false;_awaitingFrame=false;
         if(!IsCurrent(_generation))return;
-        try{_camera!.StartPreview();_capture!.Enabled=true;ArmFrame();}
+        try{_camera!.StartPreview();_nextCaptureAt=Environment.TickCount64+8000;ArmFrame();}
         catch(Exception error){Error(error,"resume");Fail("Camera preview could not resume. Reopen Scan QR.");}
     }
     private void CheckCamera()
@@ -302,7 +299,7 @@ public sealed class PairingScannerActivity : Activity, ISurfaceHolderCallback, C
         if(_awaitingPicture && Environment.TickCount64-_pictureStartedAt>12000)
         {
             // Release the entire capture session so a late JPEG cannot affect a new request.
-            CloseCamera();OpenCamera();Status("The capture timed out; camera reopened. Try again or paste the invitation.",6000);return;
+            CloseCamera();OpenCamera();Status("The capture timed out; camera reopened. Retrying automatically. Keep the QR visible.",6000);return;
         }
         if(_takingPicture)return;
         if(_captureRequested){if(Volatile.Read(ref _decoding)==0)TakeCapture();return;}
@@ -310,7 +307,12 @@ public sealed class PairingScannerActivity : Activity, ISurfaceHolderCallback, C
         {
             // A visible SurfaceView alone does not prove the decoder receives frames.
             _lastError="preview callback timeout";
-            CloseCamera();OpenCamera();Status("Camera images are not reaching the scanner. Try Scan sharp capture.",6000);return;
+            _awaitingFrame=false;RequestCapture();return;
+        }
+        var now=Environment.TickCount64;
+        if(now>=_nextCaptureAt) {RequestCapture();return;}
+        if(_periodicFocus && now>=_nextFocusAt) {
+            _nextFocusAt=now+3000;FocusCamera();
         }
         ArmFrame();
     }

@@ -191,6 +191,9 @@
                             <TextBlock Grid.Column="1" Text="{Binding Status}" FontSize="10"
                                        Foreground="{DynamicResource SuccessBrush}" />
                           </Grid>
+                          <ItemsControl ItemsSource="{Binding Images}">
+                            <ItemsControl.ItemTemplate><DataTemplate x:DataType="x:String"><local:ConversationPhoto DataUri="{Binding}" /></DataTemplate></ItemsControl.ItemTemplate>
+                          </ItemsControl>
                           <local:MarkdownView SelectionModeChanged="ResponseSelectionChanged" Markdown="{Binding Text}" IsVisible="{Binding IsNotCollapsible}" />
                           <ToggleButton Classes="details" IsVisible="{Binding IsCollapsible}"
                                         IsChecked="{Binding IsExpanded, Mode=TwoWay}">

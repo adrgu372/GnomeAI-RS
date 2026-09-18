@@ -1,22 +1,52 @@
 <Styles xmlns="https://github.com/avaloniaui" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Styles.Resources>
+    <ResourceDictionary>
+      <ResourceDictionary.ThemeDictionaries>
+        <ResourceDictionary x:Key="Dark">
+          <SolidColorBrush x:Key="MobilePage" Color="#10191E" />
+          <SolidColorBrush x:Key="MobileText" Color="#EEF4F0" />
+          <SolidColorBrush x:Key="MobileMuted" Color="#93A59F" />
+          <SolidColorBrush x:Key="MobileControl" Color="#202C32" />
+          <SolidColorBrush x:Key="MobileInput" Color="#182329" />
+          <SolidColorBrush x:Key="MobileBorder" Color="#35453F" />
+          <SolidColorBrush x:Key="MobileHover" Color="#2A3D40" />
+          <SolidColorBrush x:Key="MobilePressed" Color="#35534F" />
+          <SolidColorBrush x:Key="MobileActive" Color="#233B32" />
+          <SolidColorBrush x:Key="MobileActiveText" Color="#B4EFCF" />
+        </ResourceDictionary>
+        <ResourceDictionary x:Key="Light">
+          <SolidColorBrush x:Key="MobilePage" Color="#F5F8F6" />
+          <SolidColorBrush x:Key="MobileText" Color="#172B23" />
+          <SolidColorBrush x:Key="MobileMuted" Color="#536B5E" />
+          <SolidColorBrush x:Key="MobileControl" Color="#EAF0EC" />
+          <SolidColorBrush x:Key="MobileInput" Color="#FFFFFF" />
+          <SolidColorBrush x:Key="MobileBorder" Color="#CAD9D0" />
+          <SolidColorBrush x:Key="MobileHover" Color="#DDE9E2" />
+          <SolidColorBrush x:Key="MobilePressed" Color="#C9E0D2" />
+          <SolidColorBrush x:Key="MobileActive" Color="#D6EBDE" />
+          <SolidColorBrush x:Key="MobileActiveText" Color="#1C5B39" />
+        </ResourceDictionary>
+      </ResourceDictionary.ThemeDictionaries>
+    </ResourceDictionary>
+  </Styles.Resources>
   <Style Selector="UserControl">
-    <Setter Property="Foreground" Value="#EEF4F0" />
+    <Setter Property="Foreground" Value="{DynamicResource MobileText}" />
     <Setter Property="FontSize" Value="15" />
   </Style>
   <Style Selector="Button">
     <Setter Property="MinHeight" Value="48" />
     <Setter Property="CornerRadius" Value="14" />
     <Setter Property="Padding" Value="16,12" />
-    <Setter Property="Background" Value="#202C32" />
-    <Setter Property="Foreground" Value="#EEF4F0" />
+    <Setter Property="Background" Value="{DynamicResource MobileControl}" />
+    <Setter Property="Foreground" Value="{DynamicResource MobileText}" />
     <Setter Property="BorderThickness" Value="0" />
     <Setter Property="HorizontalContentAlignment" Value="Left" />
   </Style>
   <Style Selector="Button:pointerover /template/ ContentPresenter#PART_ContentPresenter">
-    <Setter Property="Background" Value="#2A3D40" />
+    <Setter Property="Background" Value="{DynamicResource MobileHover}" />
   </Style>
   <Style Selector="Button:pressed /template/ ContentPresenter#PART_ContentPresenter">
-    <Setter Property="Background" Value="#35534F" />
+    <Setter Property="Background" Value="{DynamicResource MobilePressed}" />
   </Style>
   <Style Selector="Button.icon">
     <Setter Property="Width" Value="48" />
@@ -37,19 +67,19 @@
   </Style>
   <Style Selector="Button.nav">
     <Setter Property="Background" Value="Transparent" />
-    <Setter Property="Foreground" Value="#93A59F" />
+    <Setter Property="Foreground" Value="{DynamicResource MobileMuted}" />
     <Setter Property="HorizontalContentAlignment" Value="Center" />
     <Setter Property="Padding" Value="6,8" />
     <Setter Property="CornerRadius" Value="16" />
   </Style>
   <Style Selector="Button.nav.active">
-    <Setter Property="Background" Value="#233B32" />
-    <Setter Property="Foreground" Value="#B4EFCF" />
+    <Setter Property="Background" Value="{DynamicResource MobileActive}" />
+    <Setter Property="Foreground" Value="{DynamicResource MobileActiveText}" />
   </Style>
   <Style Selector="TextBox">
-    <Setter Property="Background" Value="#182329" />
-    <Setter Property="Foreground" Value="#EEF4F0" />
-    <Setter Property="BorderBrush" Value="#35453F" />
+    <Setter Property="Background" Value="{DynamicResource MobileInput}" />
+    <Setter Property="Foreground" Value="{DynamicResource MobileText}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource MobileBorder}" />
     <Setter Property="CornerRadius" Value="12" />
     <Setter Property="Padding" Value="14,12" />
     <Setter Property="MinHeight" Value="48" />
@@ -65,8 +95,27 @@
   <Style Selector="ComboBox">
     <Setter Property="MinHeight" Value="44" />
     <Setter Property="CornerRadius" Value="14" />
-    <Setter Property="Background" Value="#202C32" />
+    <Setter Property="Background" Value="{DynamicResource MobileControl}" />
     <Setter Property="BorderThickness" Value="0" />
     <Setter Property="Padding" Value="12,8" />
+  </Style>
+  <!-- Fluent sets template background on focus; override it for both themes. -->
+  <Style Selector="TextBox:focus /template/ Border#PART_BorderElement">
+    <Setter Property="Background" Value="{DynamicResource MobileInput}" />
+  </Style>
+  <Style Selector="TextBox:focus">
+    <Setter Property="Foreground" Value="{DynamicResource MobileText}" />
+    <Setter Property="CaretBrush" Value="{DynamicResource MobileText}" />
+  </Style>
+  <Style Selector="TextBox.composer /template/ Border#PART_BorderElement">
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderThickness" Value="0" />
+  </Style>
+  <Style Selector="TextBox.composer:focus /template/ Border#PART_BorderElement">
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderThickness" Value="0" />
+  </Style>
+  <Style Selector="TextBox.composer:pointerover /template/ Border#PART_BorderElement">
+    <Setter Property="Background" Value="Transparent" />
   </Style>
 </Styles>

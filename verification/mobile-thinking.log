@@ -1,0 +1,4 @@
+PASS: reasoning survives reopening
+PASS: device/session isolation
+PASS: answer and turn identity
+PASS: concurrent saves leave complete JSON and no temporary files

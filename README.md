@@ -1,29 +1,41 @@
-> **Current release: 3.0 — Android & multi-device preview.** See
-> [RELEASE_NOTES_v3.0.md](RELEASE_NOTES_v3.0.md) for the native Android client,
-> QR pairing, the Tor/Arti mesh transport and the current known issues. The
-> notes below describe earlier versions.
+> **Current release: 3.1 — photos in messages, mobile thinking and on-device
+> skills.** The highlights are below; [CHANGELOG.md](CHANGELOG.md) has the
+> full history. For the Android and multi-device foundation introduced in
+> 3.0, see [RELEASE_NOTES_v3.0.md](RELEASE_NOTES_v3.0.md) and
+> [ANDROID_PORT.md](ANDROID_PORT.md).
 
 # GnomeAI-RS
-
-**Android / multi-device source preview:** see [ANDROID_PORT.md](ANDROID_PORT.md)
-for the new native Android client, pairing relay, remote sessions, execution
-handoff, build instructions and the current uncompiled-preview limitations.
 
 GnomeAI-RS is a native graphical coding agent written in Rust. The desktop
 application keeps the proven agent core and `Op`/`Event` protocol of the former
 terminal interface while replacing the TUI and browser page with one native
-window.
+window. A native Android ARM64 client (`.NET 10` + Avalonia) shares the same
+Rust core through `libgnomeai_core.so` and pairs with the desktop over a
+Tor/Arti mesh transport.
 
-Current Debian package version: **3.0-1** (Rust core: **3.0.0**). See [CHANGELOG.md](CHANGELOG.md) for the
+Current Debian package version: **3.1-1** (Rust core: **3.1.0**, Android app:
+**3.1.0**, versionCode **16**). See [CHANGELOG.md](CHANGELOG.md) for the
 historical release notes.
 
-## What changed in 3.0
+## What changed in 3.1
 
-Version 3.0 is the Android and multi-device preview release. It adds a native
-.NET 10 + Avalonia Android ARM64 client that shares the same Rust core
-(`libgnomeai_core.so`) as the desktop, QR-based pairing with a shared
-confirmation code and SAS verification, and a Tor/Arti Onion Service transport
-tested both on Wi-Fi and across 5G.
+Version 3.1 builds on the 3.0 Android preview and focuses on rich messages,
+reasoning visibility and phone-side management.
+
+| Area | Version 3.1 |
+| --- | --- |
+| Photos | Multi-part `image_url` content round-trips through the core; photo bubbles render on desktop and Android with a Save photo action; remote photo attachments share peer conversations in frames capped at 8 MiB |
+| Mobile thinking | Reasoning received by the phone is persisted by `MobileThinkingStore` (keyed by answer digest) and shown in expandable transcript blocks with copy actions |
+| On-device skills | Android Settings, Skills and Transcript panels list, inspect, install and activate SKILL.md packages through new core actions |
+| Model picker | Per-conversation model selection backed by the new `available_models` core action |
+| Handoff safety | Discarded session transfers record a tombstone and roll the session status back, so aborted transfers cannot be silently retried |
+| Notifications | WhatsApp reply notifications are owned by the Android foreground service and survive backgrounding; native text selection and theme polish |
+
+# GnomeAI-RS 3.0 — Android & multi-device preview
+
+Version 3.0 added the native Android client and the multi-device foundation.
+Full details live in [RELEASE_NOTES_v3.0.md](RELEASE_NOTES_v3.0.md); the
+short version:
 
 | Area | Version 3.0 |
 | --- | --- |
@@ -34,8 +46,11 @@ tested both on Wi-Fi and across 5G.
 | Desktop | Device selector (`This PC` / phone / paired devices) and remote approvals bound to the peer captured at card creation |
 | Builds | `scripts/build-deb.sh` and `scripts/build-android.sh` produce the Debian package and the signed APK |
 
-Known issues and the full change summary are in
-[RELEASE_NOTES_v3.0.md](RELEASE_NOTES_v3.0.md).
+The Android port history (mesh preview 3, camera preview 4, UX previews 5–7)
+is documented in [ANDROID_PORT.md](ANDROID_PORT.md),
+[ANDROID_PREVIEW4.md](ANDROID_PREVIEW4.md), [MESH_PREVIEW3.md](MESH_PREVIEW3.md)
+and [PREVIEW5_UPDATE.md](PREVIEW5_UPDATE.md) /
+[PREVIEW6_UPDATE.md](PREVIEW6_UPDATE.md) / [PREVIEW7_UPDATE.md](PREVIEW7_UPDATE.md).
 
 ## What changed in 2.4-1
 
@@ -70,7 +85,6 @@ against stalled upstream connections.
 | MCP | Generic Streamable HTTP and stdio MCP servers shared by API and account-backed providers |
 | Recovery | Automatic recall after transient, empty or interrupted provider responses |
 | Privileges | Dynamic PAM/sudo prompts through a private local askpass channel |
-| WhatsApp | Separate conversation browser with structured assistant responses |
 
 ## What changed in 2.0
 
@@ -92,8 +106,8 @@ nodes in one interface.
 
 ## Native desktop interface
 
-The primary `gnomef-rs` executable now opens a native application window on
-Linux and macOS. `gnomef-agent` remains a compatibility alias to the same app.
+The primary `gnomef-rs` executable opens a native application window on Linux
+and macOS. `gnomef-agent` remains a compatibility alias to the same app.
 
 The GUI includes:
 
@@ -108,11 +122,11 @@ The GUI includes:
 - concurrent saved conversations: start or resume another chat while the first
   keeps running in the background, with independent Stop/queue state and live
   sidebar status;
+- photo bubbles for image attachments, with a Save photo action;
 - structured reasoning, tool output, patches and verification results;
 - Stop/interrupt during model calls and long-running tools;
 - command approvals and a separate masked sudo credential dialog;
 - persisted sessions with automatic titles, resume, rename, delete and fork;
-- conversation deletion directly from the sidebar, without a second window;
 - compact, resizable provider, model, settings, WhatsApp and device windows;
 - native provider, account-login and model selectors;
 - native workspace and attachment file pickers plus drag-and-drop;
@@ -123,18 +137,19 @@ The GUI includes:
   or exported before restarting;
 - native WhatsApp setup, live status, QR pairing and test messaging;
 - a Hub for weak Linux devices, with root policy controlled per device;
-- slash-command suggestions in the composer;
+- a device selector for working from `This PC`, the phone or a paired device,
+  with safe session handoff and explicit discard of failed transfers;
 - English Windows Apps styling with persistent System, Light and Dark Fluent
   themes, consistent title surfaces, navigation pane, command bar and
   selectable transcript text. Use the title-bar theme button, Settings, or
   `/theme light|dark|system`.
 
-There is no `index.html`, WebTool page or browser launcher in version 2.0. The
-Debian desktop entry uses `Terminal=false`. WhatsApp keeps a
-token-protected loopback service because the Node bridge must deliver inbound
-messages somewhere; it is a private helper process with no HTML route and is
-started and stopped by the native app. Coding-agent logic stays outside the
-GUI and communicates through the serializable protocol in `src/protocol.rs`.
+There is no `index.html`, WebTool page or browser launcher. The Debian desktop
+entry uses `Terminal=false`. WhatsApp keeps a token-protected loopback service
+because the Node bridge must deliver inbound messages somewhere; it is a
+private helper process with no HTML route and is started and stopped by the
+native app. Coding-agent logic stays outside the GUI and communicates through
+the serializable protocol in `src/protocol.rs`.
 
 ## Quick start
 
@@ -164,9 +179,6 @@ Building all binaries once also places the private `gnomef-whatsapp` helper
 next to the desktop executable, so QR pairing and inbound messages work in a
 development run.
 
-Run `/provider` in the composer or use the Provider button in the sidebar to
-select an API or account-backed provider.
-
 ## Build
 
 Rust stable with edition 2024 support is required.
@@ -195,6 +207,7 @@ Package builders:
 
 ```bash
 ./scripts/build-deb.sh
+./scripts/build-android.sh
 ./scripts/build-node-packages.sh
 ./scripts/build-macos-arm64.sh
 ```
@@ -202,13 +215,34 @@ Package builders:
 The Debian builder pins Microsoft .NET SDK 10.0.400 for Linux x64. It downloads
 the official tar.gz directly from Microsoft, verifies the published SHA-512,
 uses that SDK to publish Avalonia and includes the complete SDK privately under
-`/usr/lib/gnomeai-rs/dotnet` in the generated package. The installed app does
-not need `dotnet-sdk-10.0` from a Debian or Microsoft APT repository. Repeated
-builds reuse the verified archive from the user cache. For offline builds, set
+`/usr/lib/gnomeai-rs/dotnet` in the generated package. Repeated builds reuse
+the verified archive from the user cache. For offline builds, set
 `GNOMEAI_DOTNET_SDK_ARCHIVE=/path/to/dotnet-sdk-10.0.400-linux-x64.tar.gz`.
 
-The Debian launcher uses `Terminal=false`; the macOS application launches the
-native Rust window directly rather than opening Terminal or a browser.
+### Android build
+
+The signed APK is produced by `scripts/build-android.sh`. Prerequisites:
+.NET 10 SDK with the `android` workload, Android NDK r28+, a full JDK 21,
+the Android SDK platform matching the workload, `cargo-ndk`, and
+`ANDROID_NDK_HOME` pointing at the NDK.
+
+```bash
+dotnet workload install android
+rustup target add aarch64-linux-android
+cargo install cargo-ndk --locked
+export ANDROID_NDK_HOME=/path/to/android-ndk
+bash scripts/build-android.sh
+```
+
+The APK is published as:
+
+```text
+ui/GnomeAI.UI.Android/bin/Release/net10.0-android/android-arm64/publish/io.github.adrgu372.gnomeai-Signed.apk
+```
+
+The Rust core is built for `aarch64-linux-android` with 16 KiB page
+compatibility (`-C link-arg=-Wl,-z,max-page-size=16384`) and linked into the
+App as `libgnomeai_core.so`.
 
 ## Providers
 
@@ -225,15 +259,16 @@ Provider keys are never placed in transcripts or diagnostic events. They are
 stored in owner-only settings files. Account-backed entries delegate login and
 token refresh to the official vendor runtime.
 
-The model selector is populated from the provider API and falls back to the
+The model selector is populated from the provider API (through the
+`available_models` core action, also used by the phone) and falls back to the
 maintained provider catalog. `/model MODEL` remains available for a direct
 override.
 
 `Z.ai Coding Plan` uses the dedicated OpenAI-compatible subscription endpoint
 `https://api.z.ai/api/coding/paas/v4`. Enter the API key associated with the
-active Coding Plan; `glm-5.3-flash` is selected by default and `glm-5.3` is
-available from the model selector. This entry is separate from Z.ai's general
-pay-as-you-go API endpoint so Coding Plan requests use the intended quota path.
+active Coding Plan; `glm-5.3-flash` is selected by default. This entry is
+separate from Z.ai's general pay-as-you-go API endpoint so Coding Plan requests
+use the intended quota path.
 
 API keys are saved in an owner-only settings file and restored when the same
 provider is selected later. OpenAI Account authentication is owned by the
@@ -242,9 +277,10 @@ Claude Code runtime; GnomeAI reuses their valid sessions until the provider
 reports that login has changed or expired. Both account providers expose model
 selection rather than forcing every conversation to use `default`.
 
-The same provider selection is available to allowed WhatsApp chats. Account
-providers run through their vendor runtimes on the main PC, so no OpenAI or
-Anthropic credentials are copied to WhatsApp or to a lightweight node.
+The same provider selection is available to allowed WhatsApp chats and to the
+paired phone. Account providers run through their vendor runtimes on the main
+PC, so no OpenAI or Anthropic credentials are copied to WhatsApp, to a
+lightweight node or to the phone.
 
 ## Attachments, documents and vision
 
@@ -264,6 +300,11 @@ only on names containing `vision`. If a nominally OpenAI-compatible endpoint
 returns a schema error for `image_url`, GnomeAI retries safely with a text-only
 attachment description instead of failing the whole turn.
 
+Since 3.1, images sent by the model are also displayed: photo bubbles render
+in the transcript on desktop and Android. Photos shared with a paired device
+travel through the mesh transport in frames capped at 8 MiB
+(`ui/GnomeAI.Client/PhotoMessage.cs`) and support JPEG, PNG, WebP and GIF.
+
 ## Execution policies
 
 - `read-only` blocks workspace mutations;
@@ -277,7 +318,7 @@ added to model context, command arguments, environment variables, files or
 logs. If a supported desktop keyring is available, saving the credential is an
 explicit opt-in.
 
-## Sessions and workspaces
+## Sessions, workspaces and devices
 
 Sessions are stored in SQLite and remain bound to their coding workspace.
 Switching workspaces rebuilds path-sensitive providers, tools and sandbox
@@ -297,6 +338,11 @@ Use the GUI controls or these commands:
 /rollback
 /diff
 ```
+
+Since 3.0, sessions can also be taken over by a paired device. Execution
+handoff stages and commits a snapshot between the desktop and the phone;
+discarding a failed transfer records a tombstone and restores the previous
+ownership, so a stale snapshot can never be activated later.
 
 ## Skills
 
@@ -327,6 +373,10 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/gnomeai-rs/skills
 Project-local skills under `./skills`, `./.agents/skills` and
 `./.gnomeai/skills` are also discovered. Activating a skill never widens the
 current execution policy.
+
+Since 3.1, the phone manages skills too: the Android Skills panel lists
+installed packages, inspects them, installs from a source path or Git URL and
+activates them for a conversation, using the same core actions as the desktop.
 
 When the user explicitly asks the agent to learn a reusable workflow, the
 `Learn`/`learn_skill` tool creates a managed skill with an optional POSIX-shell
@@ -372,18 +422,9 @@ than relabelling the host executable:
 | Void aarch64 (glibc) | `.xbps` |
 | Void aarch64-musl | `.xbps` |
 
-Build node packages for both supported CPU architectures with:
-
 ```bash
 ./scripts/build-node-release.sh
 ```
-
-This creates real amd64 and arm64 builds rather than relabelling the host
-binary. It also creates `.xbps` packages for `x86_64`, glibc `aarch64`, and
-`aarch64-musl`: with local `xbps-create` on Void, or inside the official Void
-glibc OCI image through Podman/Docker on Debian. Cross-rs builds the actual
-static musl executable. On Void Linux that format can also be selected directly
-with `GNOMEAI_NODE_FORMATS=xbps,tar ./scripts/build-node-packages.sh arm64-musl`.
 
 ### Start a node at boot with runit
 
@@ -444,6 +485,9 @@ content copied from untrusted uploads or web pages.
 ```
 
 The store is located at `store/memory.db` beneath the per-user state directory.
+On the phone, model reasoning is additionally persisted per conversation by
+`MobileThinkingStore` under `store/mobile-thinking/`, so reopening a session
+restores the thinking blocks exactly as they were received.
 
 ## Web Search and Firecrawl
 
@@ -502,7 +546,9 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/gnomeai-rs
 
 Set `GNOMEF_RS_HOME` to override it. The selected coding workspace is separate
 from the state directory. Provider settings, session storage, tool output and
-memory remain private user data and must not be committed.
+memory remain private user data and must not be committed. Desktop device
+identities and peers live in `store/devices/devices.json` under the same root;
+pairing material on the phone is protected by the Android Keystore.
 
 ## WhatsApp bridge
 
@@ -517,7 +563,8 @@ request, so unattended tasks do not wait for a hidden desktop approval dialog.
 `read-only` still blocks mutations, and sudo still requires an existing local
 ticket or a credential explicitly stored in the desktop keyring. Pairing state
 is persisted; transient stream reconnects do not normally require scanning a
-new QR code.
+new QR code. On Android, reply notifications are owned by the foreground
+service and keep working while the app is in the background.
 
 The bridge requires Node.js 20 or newer and the pinned dependencies in
 `whatsapp/`. Distribution packages stage those dependencies automatically.
@@ -525,8 +572,23 @@ Source builds should run `cargo build --bins --locked` so the private
 `gnomef-whatsapp` helper is available beside `gnomef-rs`. The helper listens
 only on loopback, requires a per-process token and serves no web page.
 
+## Verification
+
+The Rust test suite covers the core actions added in 3.1 (skills, model
+listing, photo content and transfer aborts). The `tests/DeviceLifecycle` and
+`tests/MobileThinking` console harnesses exercise pairing, session transfer
+and abort handling, and reasoning persistence, across the Rust core and the
+.NET clients. Run them with:
+
+```bash
+cargo test --locked
+dotnet run --project tests/DeviceLifecycle
+dotnet run --project tests/MobileThinking
+```
+
 ## Third-party notices
 
 GnomeAI-RS is GPL-3.0. The optional OpenAI Codex sidecar is distributed under
-Apache-2.0. The optional Firecrawl deployment is AGPL-3.0; its exact upstream source tag,
-commit, image pins and license are recorded under `third_party/firecrawl/`.
+Apache-2.0. The optional Firecrawl deployment is AGPL-3.0; its exact upstream
+source tag, commit, image pins and license are recorded under
+`third_party/firecrawl/`.

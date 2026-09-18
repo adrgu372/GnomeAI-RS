@@ -21,10 +21,10 @@ public class MainActivity : AvaloniaMainActivity<MobileApp>
     private WindowInsetsObserver? _insets;
     protected override void OnCreate(Bundle? savedInstanceState)
     {
-        CameraCapture.Attach(this);PairingScanner.Attach(this);
+        CameraCapture.Attach(this);PairingScanner.Attach(this);NativeTextSelection.Attach(this);MobileAppearance.Attach(this);
         MobileHost.Ensure(FilesDir!.AbsolutePath);
         base.OnCreate(savedInstanceState);
-        _insets=new WindowInsetsObserver(this);
+        _insets=new WindowInsetsObserver(this);MobileAppearance.Refresh();
         StartForegroundService(new Intent(this,typeof(DeviceService)));
         if(OperatingSystem.IsAndroidVersionAtLeast(33) && CheckSelfPermission(global::Android.Manifest.Permission.PostNotifications)!=Permission.Granted)
             RequestPermissions(new[]{global::Android.Manifest.Permission.PostNotifications},104);
@@ -41,11 +41,18 @@ public class MainActivity : AvaloniaMainActivity<MobileApp>
         try { MobileHost.Hub!.Pair(code); }
         catch(Exception error) { new AlertDialog.Builder(this).SetTitle("Pairing").SetMessage(error.Message).SetPositiveButton("OK",(_,_)=>{}).Show(); }
     }
-    protected override AppBuilder CustomizeAppBuilder(AppBuilder builder) => base.CustomizeAppBuilder(builder).WithInterFont();
+    protected override AppBuilder CustomizeAppBuilder(AppBuilder builder) => base.CustomizeAppBuilder(builder).WithInterFont()
+            .With(new Avalonia.Media.FontManagerOptions {
+                FontFallbacks = new[] {
+                    new Avalonia.Media.FontFallback {
+                        FontFamily = new Avalonia.Media.FontFamily("avares://GnomeAI.UI.Android/Assets/Fonts#Noto Color Emoji")
+                    }
+                }
+            });
     protected override void OnDestroy()
     {
         _insets?.Dispose();
-        CameraCapture.Detach(this);PairingScanner.Detach(this);if(IsFinishing)CameraPermission.Cancel();
+        NativeTextSelection.Detach(this);MobileAppearance.Detach(this);CameraCapture.Detach(this);PairingScanner.Detach(this);if(IsFinishing)CameraPermission.Cancel();
         // The foreground service owns background availability, not the screen.
         base.OnDestroy();
     }
@@ -53,7 +60,8 @@ public class MainActivity : AvaloniaMainActivity<MobileApp>
 public sealed class MobileApp : Avalonia.Application
 {
     public override void Initialize() {
-        RequestedThemeVariant=Avalonia.Styling.ThemeVariant.Dark;
+        RequestedThemeVariant=MobileAppearance.LoadTheme();
+        ActualThemeVariantChanged+=(_,_)=>MobileAppearance.Refresh();
         Styles.Add(new FluentTheme());
         Styles.Add(new Avalonia.Markup.Xaml.Styling.StyleInclude(new Uri("avares://GnomeAI.UI.Android/")) {Source=new Uri("avares://GnomeAI.UI.Android/MobileTheme.axaml")});
     }

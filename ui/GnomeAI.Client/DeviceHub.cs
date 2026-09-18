@@ -51,7 +51,7 @@ public sealed class DeviceHub : IAsyncDisposable
     {
         var link=new PeerLink(Identity,peer,_transport);
         link.RequestReceived=(id,action,payload) => {
-            if(action.StartsWith("mesh_",StringComparison.Ordinal) || action=="workspace_location")throw new IOException("Local operation only.");
+            if(action.StartsWith("skills_",StringComparison.Ordinal) || action.StartsWith("mesh_",StringComparison.Ordinal) || action is "workspace_location" or "abort_handoff" or "available_models")throw new IOException("Local operation only.");
             return action.StartsWith("workspace_",StringComparison.Ordinal)?WorkspaceReplyAsync(action,payload):CoreRawAsync(peer.Id,action,payload,id);
         };
         link.Changed+=() => Changed?.Invoke();
@@ -74,7 +74,14 @@ public sealed class DeviceHub : IAsyncDisposable
     public void Pair(string code) { Attach(Identity.AcceptInvitation(code.Trim())); Changed?.Invoke(); }
     public async Task ForgetAsync(PeerLink link)
     {
-        if(HasPendingTransfer)throw new IOException("Finish the pending transfer before revoking a device.");
+        await _transferLock.WaitAsync();
+        try {
+            if(HasPendingTransfer)throw new IOException("A session transfer is pending. Resume it or explicitly discard it before forgetting this device.");
+            await ForgetCoreAsync(link);
+        } finally {_transferLock.Release();}
+    }
+    private async Task ForgetCoreAsync(PeerLink link)
+    {
         link.StopReconnect();
         var acknowledged=false;
         if(link.Online && link.Peer.Trusted) {
@@ -207,6 +214,31 @@ public sealed class DeviceHub : IAsyncDisposable
     private sealed record Transfer(string Id,string PeerId,string SessionId,bool Pull,bool WorkspaceSynced=false);
     private string TransferFile => Path.Combine(_directory,"pending-transfer.json");
     public bool HasPendingTransfer => File.Exists(TransferFile);
+    public string PendingTransferPeerId => HasPendingTransfer ? ReadPendingTransfer().PeerId : "";
+    private Transfer ReadPendingTransfer() {
+        var transfer=JsonSerializer.Deserialize<Transfer>(File.ReadAllText(TransferFile))??throw new IOException("Invalid pending transfer file; no state was changed.");
+        if(!Guid.TryParse(transfer.Id,out _) || !Guid.TryParse(transfer.PeerId,out _) || !Guid.TryParse(transfer.SessionId,out _))throw new IOException("Invalid pending transfer identifiers; no state was changed.");
+        return transfer;
+    }
+    public async Task DiscardTransferAndForgetAsync(PeerLink? expectedPeer=null)
+    {
+        await _transferLock.WaitAsync();
+        try {
+            if(!HasPendingTransfer)throw new IOException("No pending transfer remains. Refresh Devices before retrying.");
+            var transfer=ReadPendingTransfer();
+            if(expectedPeer is not null && expectedPeer.Peer.Id!=transfer.PeerId)throw new IOException("The pending transfer belongs to another device; no state was changed.");
+            // DB ownership, not the JSON Pull flag, is authoritative.
+            Unwrap(await CoreRawAsync(transfer.PeerId,"abort_handoff",new {transfer_id=transfer.Id,session_id=transfer.SessionId}));
+            File.Delete(TransferFile);
+            var link=Links.SingleOrDefault(l=>l.Peer.Id==transfer.PeerId);
+            if(link is not null)await ForgetCoreAsync(link);
+            else {
+                Identity.Update(()=>Identity.Peers.RemoveAll(p=>p.Id==transfer.PeerId));
+                lock(_bindings){_bindings.RemoveAll(b=>b.Peer==transfer.PeerId);SaveBindings();}
+            }
+            SyncStatus="Incomplete transfer discarded locally; device forgotten.";Changed?.Invoke();
+        } finally {_transferLock.Release();}
+    }
     private static string StepId(string id,string step) => new Guid(SHA256.HashData(Encoding.UTF8.GetBytes(id+"|"+step)).AsSpan(0,16)).ToString();
     public async Task MergeMemoriesAsync(PeerLink link)
     {
@@ -237,7 +269,7 @@ public sealed class DeviceHub : IAsyncDisposable
         try
         {
             var transfer=JsonSerializer.Deserialize<Transfer>(await File.ReadAllTextAsync(TransferFile)) ?? throw new IOException("Invalid pending transfer.");
-            var link=Links.Single(l=>l.Peer.Id==transfer.PeerId);
+            var link=Links.SingleOrDefault(l=>l.Peer.Id==transfer.PeerId)??throw new IOException("The device for this pending transfer no longer exists. Use Discard transfer and forget device to recover locally.");
             await ContinueMoveAsync(link,transfer);
         }
         finally { _transferLock.Release(); }

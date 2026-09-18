@@ -11,6 +11,7 @@ namespace GnomeAI.Android;
 [Service(Name="io.github.adrgu372.gnomeai.DeviceService",Exported=false)]
 public sealed class DeviceService : Service
 {
+    private ReplyNotifications? _replies;
     private const string Channel="gnomeai_devices";
     public override IBinder? OnBind(Intent? intent)=>null;
     public override StartCommandResult OnStartCommand(Intent? intent,StartCommandFlags flags,int startId)
@@ -27,6 +28,13 @@ public sealed class DeviceService : Service
         if(OperatingSystem.IsAndroidVersionAtLeast(34))
             StartForeground(104,notification,ForegroundService.TypeSpecialUse);
         else StartForeground(104,notification);
+        if (_replies is null && MobileHost.Hub is { } hub)
+            _replies = new ReplyNotifications(this, hub);
         return StartCommandResult.NotSticky;
+    }
+    public override void OnDestroy()
+    {
+        _replies?.Dispose(); _replies = null;
+        base.OnDestroy();
     }
 }

@@ -79,7 +79,7 @@ public sealed partial class MainWindow
         DevicePicker.IsEnabled=!_changingSource && (_selectedPeer is not null || (!_dispatching && !_sessionTransitioning));
         MoveSessionButton.IsVisible=_currentSessionId.Length>0 && (_selectedPeer?.Online==true || _devices.Links.Any(l=>l.Online));
         ProviderButton.IsEnabled=SearchButton.IsEnabled=WorkspaceButton.IsEnabled=ModelButton.IsEnabled=_selectedPeer is null;
-        AttachButton.IsEnabled=_selectedPeer is null;
+        AttachButton.IsEnabled=true;
         if(_selectedPeer is {} peer) {
             ConnectionText.Text=peer.Peer.Name+" · "+peer.ConnectionLabel;
             WorkspaceText.Text=peer.Peer.Name+(_workspace.Length>0?" · "+_workspace:"")+(!_remoteSessionActive?" · Execution moved":"");
@@ -190,6 +190,12 @@ public sealed partial class MainWindow
             case "resume_session": await source.SelectSessionAsync(Value("id"));break;
             case "new_session": await source.NewAsync();break;
             case "submit": await source.RequestAsync("submit",new {session_id=_currentSessionId,text=Value("text")});break;
+            case "submit_attachment":
+                var photoSession = _currentSessionId;
+                var photo = await GnomeAI.Client.PhotoMessage.FromFileAsync(Value("path"), Value("text"));
+                if (!Current()) throw new IOException("Device selection changed; photo was not sent.");
+                await source.RequestAsync("submit", new { session_id=photoSession, text=photo });
+                break;
             case "interrupt": await source.RequestAsync("interrupt",new {session_id=_currentSessionId});break;
             case "approve": await source.RequestAsync("approve",new {session_id=_currentSessionId,call_id=Value("call_id"),decision=Value("decision")});break;
             case "rename_session": await source.RequestAsync("rename",new {session_id=Value("id"),title=Value("title")});await source.RefreshListAsync();break;
@@ -230,7 +236,7 @@ public sealed partial class MainWindow
             await dialog.ShowDialog(this);
         }));
         body.Children.Add(feedback);
-        if(_devices.HasPendingTransfer)body.Children.Add(ActionButton("Resume pending transfer",()=>_devices.ResumeMoveAsync()));
+        if(_devices.HasPendingTransfer)body.Children.Add(ActionButton("Pending session transfer · Resume or discard",()=>ShowTransferRecoveryAsync()));
         _deviceCards=new StackPanel {Spacing=10};body.Children.Add(_deviceCards);RefreshDeviceCards();
         var nodes=new StackPanel {Spacing=10};
         async Task RefreshNodes() {
@@ -247,6 +253,28 @@ public sealed partial class MainWindow
         if(_whatsapp is {} cfg)body.Children.Add(new Expander {Header="Enroll an execution node",Content=ActionButton("Copy enrollment command",()=>CopyTextAsync($"gnomeai-node enroll --server http://PC-IP:{cfg.NodePort} --token {cfg.NodeEnrollmentToken} --name NAME"))});
         DevicesPage.Content=new ScrollViewer {Content=body};_ = RunUiAsync(RefreshNodes);
     }
+    private async Task ShowTransferRecoveryAsync(PeerLink? peer=null) {
+        if(_devices is null)return;
+        var dialog=new Window {Title="Pending session transfer",Width=520,Height=420,WindowStartupLocation=WindowStartupLocation.CenterOwner};
+        var body=new StackPanel {Spacing=12,Margin=new Thickness(20)};
+        body.Children.Add(MutedText("A session transfer is still pending. Resume it, or discard the incomplete transfer and forget its device. Completed ownership changes cannot be undone here."));
+        var error=new TextBlock {TextWrapping=Avalonia.Media.TextWrapping.Wrap};body.Children.Add(error);
+        var canResume=false;
+        try {var pending=_devices.Links.FirstOrDefault(p=>p.Peer.Id==_devices.PendingTransferPeerId);canResume=pending is not null;
+            body.Children.Add(MutedText(pending is null?"The transfer's device no longer exists locally. Use discard to recover this checkpoint.":"Transfer with "+pending.Peer.Name));
+        }catch(Exception e){error.Text=e.Message;}
+        var resume=ActionButton("Resume transfer",async()=>{try{await _devices.ResumeMoveAsync();dialog.Close();ShowDevicesPage();}catch(Exception e){error.Text=e.Message;}});resume.IsEnabled=canResume;body.Children.Add(resume);
+        var confirmation=new StackPanel {Spacing=8,IsVisible=false};
+        confirmation.Children.Add(MutedText("Confirm discarding the incomplete transfer and forgetting its device?"));
+        confirmation.Children.Add(ActionButton("Confirm discard and forget",async()=>{
+            try{await _devices.DiscardTransferAndForgetAsync(peer);dialog.Close();ShowDevicesPage();}
+            catch(Exception e){error.Text=e.Message;}
+        }));
+        body.Children.Add(ActionButton("Discard transfer and forget device",()=>{confirmation.IsVisible=true;return Task.CompletedTask;}));
+        body.Children.Add(confirmation);
+        body.Children.Add(ActionButton("Cancel",()=>{dialog.Close();return Task.CompletedTask;}));
+        dialog.Content=new ScrollViewer {Content=body};await dialog.ShowDialog(this);
+    }
     private void RefreshDeviceCards() {
         if(_deviceCards is null || _devices is null)return;
         _deviceCards.Children.Clear();
@@ -255,6 +283,7 @@ public sealed partial class MainWindow
             var card=new StackPanel {Spacing=8};
             card.Children.Add(new TextBlock {Text=link.Peer.Name+" · "+link.ConnectionLabel,FontSize=18});
             card.Children.Add(MutedText(_capabilities.GetValueOrDefault(link.Peer.Channel,"Conversations · encrypted transport · workspace Move / Sync")));
+            if(link.LastConnectionError.Length>0)card.Children.Add(MutedText(link.LastConnectionError));
             if(link.Online && !_capabilities.ContainsKey(link.Peer.Channel) && _capabilitiesLoading.Add(link.Peer.Channel))_ = LoadCapabilitiesAsync(link);
             if(link.AwaitingConfirmation) {
                 card.Children.Add(new TextBlock {Text=link.SecurityCode,FontSize=30});
@@ -263,6 +292,7 @@ public sealed partial class MainWindow
             }
             if(link.Peer.Trusted)card.Children.Add(ActionButton("Open conversations",()=>SelectSourceAsync(link)));
             card.Children.Add(ActionButton(link.Peer.Trusted?"Forget device":"Cancel invitation",async()=>{
+                if(_devices.HasPendingTransfer){await ShowTransferRecoveryAsync(link);return;}
                 if(!await ConfirmAsync("Forget device",$"Remove pairing and cached drafts for {link.Peer.Name}? The other device will be notified if connected."))return;
                 if(_selectedPeer==link)await SelectSourceAsync(null);
                 await _devices.ForgetAsync(link);

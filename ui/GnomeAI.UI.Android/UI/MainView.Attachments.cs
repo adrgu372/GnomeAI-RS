@@ -36,7 +36,6 @@ public sealed partial class MainView
     private async Task CaptureAsync()
     {
         if(_capturePhoto is null)throw new IOException("Camera capture is available in the Android app.");
-        if(Selected is not null)throw new IOException("Switch to This phone to take a photo for a local conversation.");
         if(_session.Length==0)await NewAsync();
         var session=_session;var source=Selected;
         var path=await _capturePhoto();
@@ -46,7 +45,6 @@ public sealed partial class MainView
     }
     private async Task AttachAsync()
     {
-        if(Selected is not null)throw new IOException("Switch to this device to attach a photo or document.");
         if(_session.Length==0)await NewAsync();
         var session=_session;var source=Selected;
         var storage=TopLevel.GetTopLevel(this)?.StorageProvider??throw new IOException("File picker is unavailable.");
@@ -82,6 +80,13 @@ public sealed partial class MainView
     private async Task SubmitAttachmentAsync(string session,string text)
     {
         var draft=_attachmentPath??throw new IOException("Attachment is missing.");
+        if (Selected is { } peer) {
+            var message = await PhotoMessage.FromFileAsync(draft, text);
+            if (Selected != peer || _session != session) throw new IOException("Device selection changed; photo was not sent.");
+            await _hub.RequestAsync(peer, "submit", new { session_id=session, text=message });
+            if (_attachmentPath == draft) ClearAttachment();
+            return;
+        }
         var root=Path.Combine(await _hub.LocalWorkspaceAsync(session),"attachments");Directory.CreateDirectory(root);
         var path=Path.Combine(root,Guid.NewGuid().ToString("N")+Path.GetExtension(draft));
         File.Copy(draft,path);

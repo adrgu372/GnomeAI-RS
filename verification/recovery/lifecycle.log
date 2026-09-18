@@ -1,0 +1,9 @@
+PASS: conversation image parsing preserves text, inline photo and plain JSON.
+PASS: recovery rejects a checkpoint belonging to another peer.
+PASS: abort failure retains pending file and peer.
+PASS: successful discard removes pending and forgets unavailable peer without acknowledgement.
+PASS: orphaned checkpoint recovers when peer is already absent locally.
+PASS: authenticated connection idle does not rewrite identity at the old 5-second interval.
+PASS: repeated authenticated confirmation is idempotent.
+PASS: a plaintext revocation cannot remove pairing.
+PASS: authenticated revoke/ack removes both peer stores and associated sync baseline.

@@ -1,3 +1,33 @@
+# GnomeAI-RS 3.1-1 - 2026-09-18
+
+## Photos in messages, mobile thinking and on-device skills
+
+- Send and receive photos inside conversations on both desktop and Android.
+  Multi-part `image_url` content round-trips through the Rust core, photo
+  bubbles render on desktop (`ConversationPhoto`) with a Save photo action and
+  on Android with tap-to-zoom, and remote photo attachments share peer
+  conversations in frames capped at 8 MiB (`PhotoMessage`).
+- Keep model reasoning on the phone. A dedicated `MobileThinkingStore`
+  persists the thinking actually received by the device, keyed by answer
+  digest, and the transcript offers expandable thinking blocks, copy actions
+  and a compact rendering that no longer truncates long reasoning.
+- Manage skills from the phone. The new Android Settings, Skills and
+  Transcript panels list, inspect, install and activate SKILL.md packages,
+  backed by new `skills_list`, `skills_inspect`, `skills_install` and
+  `skills_activate` actions in the Rust core.
+- Pick the model per conversation from a provider-aware model picker backed by
+  the new `available_models` core action, with reasonable errors surfaced
+  when a provider key is missing or a model list is unavailable.
+- Abandon failed session handoffs safely. Discarding a transfer now records a
+  tombstone (`device_transfer_aborts`) and rolls the session status back, so
+  retries of an aborted transfer are rejected instead of silently reusing the
+  old snapshot.
+- Notify reliably about WhatsApp replies. Reply notifications are owned by the
+  Android foreground service and keep working when the activity is gone, with
+  native text selection and a mobile appearance/theme polish pass.
+- Bump the Debian package to `3.1-1` and the Rust core to `3.1.0`; the
+  Android app is published as version `3.1.0` (versionCode `16`).
+
 # GnomeAI-RS 3.0-1 - 2026-09-12
 
 ## Android & multi-device preview

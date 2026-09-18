@@ -27,6 +27,7 @@ public abstract class ObservableObject : INotifyPropertyChanged
 
 public sealed class MessageItem : ObservableObject
 {
+    public IReadOnlyList<string> Images {get;init;}=[];
     private string _title = "";
     private string _text = "";
     private string _status = "";

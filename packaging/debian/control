@@ -1,5 +1,5 @@
 Package: gnomeai-rs
-Version: 3.0-1
+Version: 3.1-1
 Section: utils
 Priority: optional
 Architecture: amd64
@@ -7,7 +7,7 @@ Maintainer: GnomeAI-RS Project <noreply@example.invalid>
 Homepage: https://github.com/adrgu372/GnomeAI-RS
 Installed-Size: 408924
 Depends: libc6 (>= 2.39), libgcc-s1, libgssapi-krb5-2, libicu76, libssl3t64, libstdc++6, tzdata, zlib1g, libx11-6, libxkbcommon0, libwayland-client0, libdbus-1-3, at-spi2-core, ca-certificates, curl, util-linux, nodejs (>= 20), poppler-utils, xdotool, scrot | gnome-screenshot
-Recommends: podman (>= 4.3), xdg-utils, git, libsecret-tools, wl-clipboard | xclip | xsel, grim
+Recommends: fonts-noto-color-emoji, podman (>= 4.3), xdg-utils, git, libsecret-tools, wl-clipboard | xclip | xsel, grim
 Suggests: npm, claude-code
 Description: native graphical multi-provider AI agent written in Rust
  GnomeAI-RS provides a native desktop coding agent and optional WhatsApp

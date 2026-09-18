@@ -740,11 +740,13 @@ public sealed partial class MainWindow : Window
         HorizontalAlignment alignment = HorizontalAlignment.Stretch, bool hasInput = false,
         string inputHint = "", bool rememberVisible = false)
     {
+        var content=kind=="user"?GnomeAI.Client.MessageContent.Read(text):new GnomeAI.Client.MessageContent(text,[]);
         var message = new MessageItem
         {
+            Images=content.Images,
             Kind = kind,
             Title = title,
-            Text = text,
+            Text = content.Text,
             CardBrush = brush,
             Alignment = alignment,
             HasInput = hasInput,
@@ -1109,8 +1111,18 @@ public sealed partial class MainWindow : Window
             throw;
         }
         var display = text;
-        if (attachment is not null)
-            display += (display.Length == 0 ? "" : "\n") + $"📎 {attachment.Name}";
+        if (attachment is not null) {
+            try {
+                var extension=Path.GetExtension(attachment.Path).ToLowerInvariant();
+                var mime=extension switch {".png"=>"image/png",".jpg" or ".jpeg"=>"image/jpeg",".webp"=>"image/webp",".gif"=>"image/gif",_=>""};
+                if(mime.Length>0 && new FileInfo(attachment.Path).Length<=16*1024*1024)
+                    display=JsonSerializer.Serialize(new object[]{new {type="text",text},new {type="image_url",image_url=new {url="data:"+mime+";base64,"+Convert.ToBase64String(await File.ReadAllBytesAsync(attachment.Path))}}});
+                else display += (display.Length == 0 ? "" : "\n") + $"📎 {attachment.Name}";
+            } catch(Exception error) when(error is IOException or UnauthorizedAccessException) {
+                // Core already accepted the message: preview failure must not imply failed submission.
+                display=text+"\n📎 "+attachment.Name;
+            }
+        }
         if (originGeneration==_sourceGeneration && _currentSessionId == sessionId)
         {
             AppendMessage("user", "You", display, UserBrush, HorizontalAlignment.Right);
@@ -1756,7 +1768,7 @@ public sealed partial class MainWindow : Window
     {
         var dialog = CreateDialog("Model", 570, 500);
         var filter = new TextBox { Watermark = "Filter models…" };
-        var list = new ListBox { MinHeight = 300 };
+        var list = new ListBox { Height=280, MaxHeight=280 };
         var use = AccentButton("Use model");
         var cancel = new Button { Content = "Cancel" };
 
@@ -1906,7 +1918,7 @@ public sealed partial class MainWindow : Window
             SelectedItem = workerProviders.FirstOrDefault(provider => provider.Id == _subagentProviderId)
                 ?? workerProviders[0],
         };
-        var workerModel = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch };
+        var workerModel = new ComboBox { MaxDropDownHeight=280, HorizontalAlignment = HorizontalAlignment.Stretch };
         var workerReasoning = new ComboBox
         {
             ItemsSource = reasoningLevels,
@@ -1934,8 +1946,10 @@ public sealed partial class MainWindow : Window
             workerFields.Opacity = workerFields.IsEnabled ? 1.0 : 0.55;
         }
 
+        var workerModelRequest=0;
         async Task RefreshWorkerModelsAsync(bool preserveConfiguredModel)
         {
+            var request=++workerModelRequest;
             var selected = workerProvider.SelectedItem as ProviderInfo ?? workerProviders[0];
             var rows = new List<string> { "inherit" };
             workerModelStatus.Text = "";
@@ -1947,19 +1961,18 @@ public sealed partial class MainWindow : Window
             {
                 try
                 {
-                    var response = await PostWhatsAppAsync("/api/models", new { provider_id = selected.Id });
-                    if (response.HasValue && response.Value.ValueKind == JsonValueKind.Array)
-                        rows.AddRange(response.Value.EnumerateArray()
-                            .Where(item => item.ValueKind == JsonValueKind.String)
-                            .Select(item => item.GetString() ?? "")
-                            .Where(model => model.Length > 0));
+                    var response = await (_devices??throw new IOException("Device service is not ready.")).RequestAsync(null,"available_models",new {provider_id=selected.Id});
+                    if(request!=workerModelRequest)return;
+                    rows.AddRange(response.GetProperty("models").EnumerateArray().Where(item=>item.ValueKind==JsonValueKind.String).Select(item=>item.GetString()??"").Where(model=>model.Length>0));
                 }
                 catch (Exception error)
                 {
+                    if(request!=workerModelRequest)return;
                     workerModelStatus.Text = $"Could not refresh models: {error.Message}";
                 }
                 if (!string.IsNullOrWhiteSpace(selected.DefaultModel)) rows.Add(selected.DefaultModel);
             }
+            if(request!=workerModelRequest)return;
             rows = rows.Distinct(StringComparer.Ordinal).ToList();
             var desired = preserveConfiguredModel ? _subagentModel : "inherit";
             if (!string.IsNullOrWhiteSpace(desired) && !rows.Contains(desired, StringComparer.Ordinal))

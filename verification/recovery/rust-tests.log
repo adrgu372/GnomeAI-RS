@@ -1,0 +1,371 @@
+   Compiling gnomef-rs v2.4.0 (/workspace/scratch/0410636291eb/work/GnomeAI-RS)
+warning: function `login_with_chatgpt` is never used
+   --> src/codex_app_server.rs:275:14
+    |
+275 | pub async fn login_with_chatgpt() -> Result<()> {
+    |              ^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `entries` is never read
+  --> src/firecrawl.rs:21:9
+   |
+20 | pub struct FirecrawlBundle {
+   |            --------------- field in this struct
+21 |     pub entries: Vec<FirecrawlEntry>,
+   |         ^^^^^^^
+   |
+   = note: `FirecrawlBundle` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `build_release_answer` is never used
+   --> src/firecrawl.rs:227:8
+    |
+227 | pub fn build_release_answer(query: &str, entries: &[FirecrawlEntry]) -> Option<String> {
+    |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `version_sort_key` is never used
+   --> src/firecrawl.rs:716:4
+    |
+716 | fn version_sort_key(version: &str) -> Vec<u32> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: field `tool_calls` is never read
+  --> src/llama.rs:21:9
+   |
+19 | pub struct LlamaResponse {
+   |            ------------- field in this struct
+20 |     pub content: String,
+21 |     pub tool_calls: Vec<Value>,
+   |         ^^^^^^^^^^
+   |
+   = note: `LlamaResponse` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: type alias `TokenStream` is never used
+   --> src/llama.rs:160:10
+    |
+160 | pub type TokenStream = Pin<Box<dyn Stream<Item = anyhow::Result<String>> + Send>>;
+    |          ^^^^^^^^^^^
+
+warning: methods `http`, `chat_with_tools`, `chat_stream`, and `anthropic_chat_stream` are never used
+   --> src/llama.rs:187:12
+    |
+178 | impl LlamaClient {
+    | ---------------- methods in this implementation
+...
+187 |     pub fn http(&self) -> &reqwest::Client {
+    |            ^^^^
+...
+309 |     pub async fn chat_with_tools(
+    |                  ^^^^^^^^^^^^^^^
+...
+322 |     pub async fn chat_stream(
+    |                  ^^^^^^^^^^^
+...
+694 |     async fn anthropic_chat_stream(
+    |              ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `stream_tokens_from_response` is never used
+    --> src/llama.rs:1118:4
+     |
+1118 | fn stream_tokens_from_response(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `stream_anthropic_tokens` is never used
+    --> src/llama.rs:1413:4
+     |
+1413 | fn stream_anthropic_tokens(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `forget_conversation` is never used
+   --> src/memory_engine.rs:944:12
+    |
+528 | impl MemoryEngine {
+    | ----------------- method in this implementation
+...
+944 |     pub fn forget_conversation(&self, chat_id: &str) -> Result<()> {
+    |            ^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `parse` is never used
+  --> src/node_protocol.rs:23:12
+   |
+22 | impl RootPolicy {
+   | --------------- associated function in this implementation
+23 |     pub fn parse(value: &str) -> Option<Self> {
+   |            ^^^^^
+
+warning: struct `NodePoll` is never constructed
+  --> src/node_protocol.rs:77:12
+   |
+77 | pub struct NodePoll {
+   |            ^^^^^^^^
+
+warning: struct `NodePollResponse` is never constructed
+  --> src/node_protocol.rs:82:12
+   |
+82 | pub struct NodePollResponse {
+   |            ^^^^^^^^^^^^^^^^
+
+warning: struct `SetRootPolicyRequest` is never constructed
+   --> src/node_protocol.rs:124:12
+    |
+124 | pub struct SetRootPolicyRequest {
+    |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `LONG_POLL_SECS` is never used
+  --> src/nodes.rs:36:7
+   |
+36 | const LONG_POLL_SECS: u64 = 25;
+   |       ^^^^^^^^^^^^^^
+
+warning: constant `MAX_RESULT_CHARS` is never used
+  --> src/nodes.rs:37:7
+   |
+37 | const MAX_RESULT_CHARS: usize = 1_000_000;
+   |       ^^^^^^^^^^^^^^^^
+
+warning: methods `poll` and `submit_result` are never used
+   --> src/nodes.rs:120:18
+    |
+ 67 | impl NodeHub {
+    | ------------ methods in this implementation
+...
+120 |     pub async fn poll(&self, node_id: &str) -> Result<NodePollResponse> {
+    |                  ^^^^
+...
+169 |     pub async fn submit_result(&self, mut result: NodeResult) -> Result<()> {
+    |                  ^^^^^^^^^^^^^
+
+warning: struct `NodeServerState` is never constructed
+   --> src/nodes.rs:272:8
+    |
+272 | struct NodeServerState {
+    |        ^^^^^^^^^^^^^^^
+
+warning: function `serve` is never used
+   --> src/nodes.rs:278:14
+    |
+278 | pub async fn serve(
+    |              ^^^^^
+
+warning: function `protect_node_api` is never used
+   --> src/nodes.rs:312:10
+    |
+312 | async fn protect_node_api(
+    |          ^^^^^^^^^^^^^^^^
+
+warning: function `register_node` is never used
+   --> src/nodes.rs:337:10
+    |
+337 | async fn register_node(
+    |          ^^^^^^^^^^^^^
+
+warning: function `poll_node` is never used
+   --> src/nodes.rs:344:10
+    |
+344 | async fn poll_node(
+    |          ^^^^^^^^^
+
+warning: function `submit_result` is never used
+   --> src/nodes.rs:351:10
+    |
+351 | async fn submit_result(
+    |          ^^^^^^^^^^^^^
+
+warning: function `list_nodes` is never used
+   --> src/nodes.rs:359:10
+    |
+359 | async fn list_nodes(State(state): State<NodeServerState>) -> Json<Value> {
+    |          ^^^^^^^^^^
+
+warning: function `queue_job` is never used
+   --> src/nodes.rs:363:10
+    |
+363 | async fn queue_job(
+    |          ^^^^^^^^^
+
+warning: function `set_policy` is never used
+   --> src/nodes.rs:371:10
+    |
+371 | async fn set_policy(
+    |          ^^^^^^^^^^
+
+warning: struct `NodeApiError` is never constructed
+   --> src/nodes.rs:381:8
+    |
+381 | struct NodeApiError(anyhow::Error);
+    |        ^^^^^^^^^^^^
+
+warning: method `set_policy` is never used
+   --> src/nodes.rs:430:18
+    |
+406 | impl NodeClient {
+    | --------------- method in this implementation
+...
+430 |     pub async fn set_policy(&self, node_id: &str, policy: RootPolicy) -> Result<Value> {
+    |                  ^^^^^^^^^^
+
+warning: function `cap_text` is never used
+   --> src/nodes.rs:526:4
+    |
+526 | fn cap_text(value: &str, max: usize) -> String {
+    |    ^^^^^^^^
+
+warning: function `constant_time_eq` is never used
+   --> src/nodes.rs:534:4
+    |
+534 | fn constant_time_eq(left: &str, right: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: field `truncated` is never read
+   --> src/sandbox.rs:192:9
+    |
+186 | pub struct ExecOutput {
+    |            ---------- field in this struct
+...
+192 |     pub truncated: bool,
+    |         ^^^^^^^^^
+    |
+    = note: `ExecOutput` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `web_catalog_prompt` is never used
+   --> src/skills.rs:200:8
+    |
+200 | pub fn web_catalog_prompt(workspace: &Path) -> String {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: fields `workspace_dir`, `config_file`, `whatsapp_bridge_file`, `whatsapp_log_file`, and `workflow_file` are never read
+  --> src/storage.rs:20:9
+   |
+17 | pub struct AppPaths {
+   |            -------- fields in this struct
+...
+20 |     pub workspace_dir: PathBuf,
+   |         ^^^^^^^^^^^^^
+...
+23 |     pub config_file: PathBuf,
+   |         ^^^^^^^^^^^
+...
+28 |     pub whatsapp_bridge_file: PathBuf,
+   |         ^^^^^^^^^^^^^^^^^^^^
+29 |     pub whatsapp_log_file: PathBuf,
+   |         ^^^^^^^^^^^^^^^^^
+30 |     pub workflow_file: PathBuf,
+   |         ^^^^^^^^^^^^^
+   |
+   = note: `AppPaths` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: struct `ChatListItem` is never constructed
+   --> src/storage.rs:160:12
+    |
+160 | pub struct ChatListItem {
+    |            ^^^^^^^^^^^^
+
+warning: function `list_chat_files` is never used
+   --> src/storage.rs:165:8
+    |
+165 | pub fn list_chat_files(paths: &AppPaths) -> anyhow::Result<Vec<PathBuf>> {
+    |        ^^^^^^^^^^^^^^^
+
+warning: function `list_chats` is never used
+   --> src/storage.rs:186:8
+    |
+186 | pub fn list_chats(paths: &AppPaths) -> anyhow::Result<Vec<ChatListItem>> {
+    |        ^^^^^^^^^^
+
+warning: function `load_chat` is never used
+   --> src/storage.rs:242:8
+    |
+242 | pub fn load_chat(paths: &AppPaths, cid: &str) -> anyhow::Result<Chat> {
+    |        ^^^^^^^^^
+
+warning: function `append_msg` is never used
+   --> src/storage.rs:300:8
+    |
+300 | pub fn append_msg(
+    |        ^^^^^^^^^^
+
+warning: function `clear_chat` is never used
+   --> src/storage.rs:323:8
+    |
+323 | pub fn clear_chat(paths: &AppPaths, cid: &str) -> anyhow::Result<()> {
+    |        ^^^^^^^^^^
+
+warning: function `image_meta` is never used
+   --> src/storage.rs:376:8
+    |
+376 | pub fn image_meta(filename: &str, path: &Path, ocr: &str) -> Value {
+    |        ^^^^^^^^^^
+
+warning: function `encode_image_as_base64` is never used
+   --> src/uploads.rs:801:8
+    |
+801 | pub fn encode_image_as_base64(path: &Path) -> anyhow::Result<String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `encode_image_as_data_url` is never used
+   --> src/uploads.rs:806:8
+    |
+806 | pub fn encode_image_as_data_url(path: &Path) -> anyhow::Result<String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `save_base64_image` is never used
+   --> src/uploads.rs:814:14
+    |
+814 | pub async fn save_base64_image(
+    |              ^^^^^^^^^^^^^^^^^
+
+warning: function `fingerprints` is never used
+  --> src/verify.rs:86:4
+   |
+86 | fn fingerprints(diags: &[Diagnostic]) -> HashSet<String> {
+   |    ^^^^^^^^^^^^
+
+warning: function `verify` is never used
+   --> src/verify.rs:371:14
+    |
+371 | pub async fn verify(root: &Path, policy: &SandboxPolicy) -> Result<VerifyReport> {
+    |              ^^^^^^
+
+warning: enum `Outcome` is never used
+   --> src/verify.rs:441:10
+    |
+441 | pub enum Outcome {
+    |          ^^^^^^^
+
+warning: struct `Loop` is never constructed
+   --> src/verify.rs:462:12
+    |
+462 | pub struct Loop {
+    |            ^^^^
+
+warning: associated items `new` and `step` are never used
+   --> src/verify.rs:472:18
+    |
+470 | impl Loop {
+    | --------- associated items in this implementation
+471 |     /// Establish the baseline. Call once, before the first patch is applied.
+472 |     pub async fn new(root: &Path, policy: &SandboxPolicy, max_rounds: usize) -> Result<Self> {
+    |                  ^^^
+...
+486 |     pub async fn step(
+    |                  ^^^^
+
+warning: `gnomef-rs` (lib test) generated 48 warnings
+    Finished `test` profile [unoptimized] target(s) in 24.79s
+     Running unittests src/lib.rs (work/GnomeAI-RS/target/debug/deps/gnomeai_core-5074e5b3d8e14324)
+
+running 11 tests
+test device_store::tests::missing_tool_result_blocks_handoff_without_freezing_source ... ok
+test device_store::tests::abort_outgoing_restores_owner_and_prevents_replay ... ok
+test device_store::tests::abort_unknown_checkpoint_is_idempotent_but_rejects_unexplained_frozen_session ... ok
+test device_store::tests::abort_incoming_never_activates_and_prevents_late_stage ... ok
+test device_store::tests::abort_inconsistent_status_rolls_back_all_changes ... ok
+test device_store::tests::workspace_lock_blocks_session_start_and_handoff_until_owner_unlocks ... ok
+test device_store::tests::bad_snapshot_does_not_replace_an_active_session ... ok
+test device_store::tests::abort_completed_transfers_preserves_ownership ... ok
+test device_store::tests::workspace_identity_survives_handoff_to_a_different_path ... ok
+test device_store::tests::transfer_never_gives_both_devices_execution_and_retries_are_idempotent ... ok
+test device_store::tests::restart_preserves_a_staged_transfer_and_round_trip_preserves_new_turns ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 169 filtered out; finished in 0.03s
+

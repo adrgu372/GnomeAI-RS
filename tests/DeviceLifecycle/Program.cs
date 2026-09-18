@@ -26,6 +26,7 @@ static class Program
         var directory=Path.Combine(Path.GetTempPath(),"gnomeai-device-test-"+Guid.NewGuid());Directory.CreateDirectory(directory);
         try
         {
+            await RecoveryTests(directory);
             using var stop=new CancellationTokenSource();
             var reserve=new TcpListener(IPAddress.Loopback,0);reserve.Start();var port=((IPEndPoint)reserve.LocalEndpoint).Port;reserve.Stop();
             using var relay=new HttpListener();relay.Prefixes.Add($"http://127.0.0.1:{port}/");relay.Start();
@@ -64,6 +65,46 @@ static class Program
             stop.Cancel();relay.Stop();try{await relayTask;}catch(OperationCanceledException){}
         }
         finally{Directory.Delete(directory,true);}
+    }
+    static async Task RecoveryTests(string root) {
+        var photo=MessageContent.Read("[{\"type\":\"text\",\"text\":\"Look\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AA==\"}}]");
+        Check(photo.Text=="Look" && photo.Images.Count==1,"Photo lost in conversation content");
+        Check(MessageContent.Read("[1,2]").Text=="[1,2]","Ordinary JSON text changed");
+        Check(MessageContent.Read("[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.com/image\"}}]").Images.Count==0,"Remote image should not be fetched implicitly");
+        Console.WriteLine("PASS: conversation image parsing preserves text, inline photo and plain JSON.");
+        var path=Path.Combine(root,"recovery");var bridge=new RecoveryBridge();
+        await using var hub=new DeviceHub(bridge,path,"Recovery");var remote=DeviceIdentity.Open(Path.Combine(root,"absent-peer"),"Absent");
+        hub.Pair(remote.CreateInvitation("wss://127.0.0.1:1").Item2);var link=hub.Links.Single();
+        hub.Identity.Update(()=>{link.Peer.Trusted=true;link.Peer.LocalConfirmed=true;link.Peer.RemoteConfirmed=true;});
+        var file=Path.Combine(path,"pending-transfer.json");var id=Guid.NewGuid().ToString();
+        var json=JsonSerializer.Serialize(new {Id=id,PeerId=link.Peer.Id,SessionId=Guid.NewGuid().ToString(),Pull=true,WorkspaceSynced=false});
+        var mismatch=json.Replace(link.Peer.Id,Guid.NewGuid().ToString());File.WriteAllText(file,mismatch);
+        try{await hub.DiscardTransferAndForgetAsync(link);throw new Exception("Expected peer mismatch rejection");}catch(IOException){}
+        Check(File.ReadAllText(file)==mismatch && bridge.Aborts==0,"Mismatched peer reached core or changed checkpoint");
+        Console.WriteLine("PASS: recovery rejects a checkpoint belonging to another peer.");
+        File.WriteAllText(file,json);bridge.Fail=true;
+        try{await hub.DiscardTransferAndForgetAsync(link);throw new Exception("Expected abort rejection");}catch(IOException e){Check(e.Message.Contains("unsafe"),"Abort error lost");}
+        Check(File.ReadAllText(file)==json && hub.Links.Count==1,"Abort failure changed JSON or pairing");
+        Console.WriteLine("PASS: abort failure retains pending file and peer.");
+        bridge.Fail=false;await hub.DiscardTransferAndForgetAsync(link);
+        Check(!File.Exists(file) && hub.Links.Count==0 && hub.Identity.Peers.Count==0,"Discard did not permit offline local forget");
+        Check(bridge.LastPeer==remote.Id && bridge.Aborts==2,"Wrong peer or missing local abort");
+        Console.WriteLine("PASS: successful discard removes pending and forgets unavailable peer without acknowledgement.");
+        File.WriteAllText(file,json);await hub.DiscardTransferAndForgetAsync();Check(!File.Exists(file),"Missing-peer recovery failed");
+        Console.WriteLine("PASS: orphaned checkpoint recovers when peer is already absent locally.");
+    }
+    sealed class RecoveryBridge : IAgentBridge {
+        public bool Fail;public int Aborts;public string LastPeer="";
+        public event Func<JsonElement,Task>? EventReceived;
+        public event Action<string>? Disconnected {add{} remove{}}
+        public void Start(){}
+        public async Task SendAsync(IReadOnlyDictionary<string,object?> op) {
+            if(op["action"]?.ToString()!="abort_handoff")throw new Exception("Unexpected recovery operation");
+            Aborts++;LastPeer=op["peer_id"]?.ToString()??"";
+            var result=JsonSerializer.SerializeToElement(new { @event="device_response",request_id=op["request_id"],result=new {ok=!Fail,error=Fail?"unsafe ownership state":"",data=new {aborted=true}}});
+            if(EventReceived is {} handler)await handler(result);
+        }
+        public ValueTask DisposeAsync()=>ValueTask.CompletedTask;
     }
     sealed class UnusedBridge : IAgentBridge
     {
