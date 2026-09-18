@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GnomeAI-RS — your AI agent on desktop and phone</title>
+<meta name="description" content="GnomeAI-RS 3.1: an open-source AI coding agent with a native Linux desktop app and an Android client, paired over your own relay. Local-first, bring your own model.">
+<link rel="icon" type="image/png" href="promo/icon.png">
+<meta property="og:title" content="GnomeAI-RS — your AI agent on desktop and phone">
+<meta property="og:description" content="One Rust core behind a native desktop app and an Android client. Photos in messages, mobile thinking, on-device skills.">
+<meta property="og:image" content="promo/social-card.png">
+<meta property="og:type" content="website">
+<style>
+:root{
+  --bg:#0d1117;--bg2:#161b22;--line:#30363d;--fg:#e6edf3;--mut:#8b949e;
+  --green:#3fb950;--blue:#58a6ff;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--fg);font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+a{color:var(--blue);text-decoration:none}
+a:hover{text-decoration:underline}
+img{max-width:100%;height:auto;border-radius:14px}
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+header{position:sticky;top:0;background:rgba(13,17,23,.92);backdrop-filter:blur(6px);border-bottom:1px solid var(--line);z-index:10}
+nav{display:flex;align-items:center;gap:20px;padding:14px 0}
+nav .logo{font-weight:700;font-size:18px;color:var(--fg)}
+nav .logo span{color:var(--green)}
+nav .links{margin-left:auto;display:flex;gap:18px;flex-wrap:wrap}
+.hero{padding:72px 0 48px;text-align:center}
+.hero-icon{width:96px;height:96px;margin-bottom:18px}
+.hero h1{font-size:clamp(30px,5vw,52px);line-height:1.15}
+.hero h1 span{color:var(--green)}
+.hero p.sub{color:var(--mut);font-size:clamp(16px,2.4vw,20px);max-width:720px;margin:18px auto 28px}
+.cta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
+.btn{display:inline-block;padding:12px 22px;border-radius:10px;font-weight:600;border:1px solid var(--line)}
+.btn.primary{background:var(--green);color:#0d1117;border-color:var(--green)}
+.btn.primary:hover{filter:brightness(1.1);text-decoration:none}
+.btn.ghost:hover{border-color:var(--blue);text-decoration:none}
+.hero img{margin-top:44px;border:1px solid var(--line)}
+.badges{margin-top:18px;color:var(--mut);font-size:14px}
+.section{padding:56px 0;border-top:1px solid var(--line)}
+.section h2{font-size:clamp(24px,3.4vw,34px);margin-bottom:8px}
+.section p.lead{color:var(--mut);margin-bottom:32px;max-width:760px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px}
+.card{background:var(--bg2);border:1px solid var(--line);border-radius:14px;padding:22px}
+.card h3{font-size:18px;margin-bottom:8px}
+.card p{color:var(--mut);font-size:15px}
+.card .ic{font-size:24px;display:block;margin-bottom:10px}
+.shot-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-bottom:16px}
+.shot-grid a{display:block;cursor:zoom-in}
+.shot-grid img{border:1px solid var(--line);width:100%;transition:filter .15s}
+.shot-grid a:hover img{filter:brightness(1.15)}
+#lightbox{position:fixed;inset:0;background:rgba(1,4,9,.88);display:none;
+  align-items:center;justify-content:center;z-index:50;cursor:zoom-out;padding:24px}
+#lightbox.open{display:flex}
+#lightbox img{max-width:96vw;max-height:94vh;border:1px solid var(--line)}
+.phones{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.newlist{list-style:none;display:grid;gap:12px}
+.newlist li{background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:16px 20px}
+.newlist b{color:var(--green)}
+.download{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px}
+.dl{background:var(--bg2);border:1px solid var(--line);border-radius:14px;padding:26px;text-align:center}
+.dl h3{margin-bottom:6px}
+.dl p{color:var(--mut);font-size:14px;margin-bottom:18px}
+footer{border-top:1px solid var(--line);padding:32px 0;color:var(--mut);font-size:14px;text-align:center}
+footer a{color:var(--mut);text-decoration:underline}
+</style>
+</head>
+<body>
+
+<header>
+  <nav class="wrap">
+    <a class="logo" href="#">GnomeAI<span>-RS</span></a>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#screenshots">Screenshots</a>
+      <a href="#whats-new">What's new</a>
+      <a href="#download">Download</a>
+      <a href="https://github.com/adrgu372/GnomeAI-RS">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<main>
+  <section class="hero wrap">
+    <img class="hero-icon" src="promo/icon.png?v=2" alt="GnomeAI-RS logo">
+    <h1>Your AI agent —<br>on your desktop <span>and</span> your phone.</h1>
+    <p class="sub">Open-source, local-first coding agent. One Rust core behind a native
+    Linux desktop app and an Android client, paired over your own relay.
+    Your keys, chats and files never leave your machines.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/adrgu372/GnomeAI-RS/releases/tag/v3.1">Download 3.1</a>
+      <a class="btn ghost" href="https://github.com/adrgu372/GnomeAI-RS">View on GitHub</a>
+    </div>
+    <p class="badges">GPL-3.0 · Rust core · Avalonia UI · .NET Android · Bring your own model</p>
+    <img src="promo/hero-banner.png?v=2" alt="GnomeAI-RS banner — desktop and Android">
+  </section>
+
+  <section class="section" id="features">
+    <div class="wrap">
+      <h2>Why GnomeAI-RS</h2>
+      <p class="lead">Not another chat wrapper — a full agent with real tool use, on hardware you control.</p>
+      <div class="grid">
+        <div class="card"><span class="ic">🖥️📱</span><h3>One core, two platforms</h3>
+          <p>Native Linux desktop app (Avalonia) and Android client share the same Rust core. Pair them with QR or invite codes and hand sessions over safely.</p></div>
+        <div class="card"><span class="ic">🔒</span><h3>Local-first &amp; private</h3>
+          <p>Conversations, drafts, attachments and API keys stay on your devices. Device sync runs through a relay you host — no third-party sync service.</p></div>
+        <div class="card"><span class="ic">🛠️</span><h3>Real tool use</h3>
+          <p>Shell, file edits with patches, verification, desktop control, web search, sub-agents and guarded sudo — with approvals you control.</p></div>
+        <div class="card"><span class="ic">💬</span><h3>WhatsApp built in</h3>
+          <p>Chat with the same agent and tools directly from WhatsApp through a local bridge. QR pairing, persistent sessions, photo support.</p></div>
+        <div class="card"><span class="ic">🧩</span><h3>Skills as SKILL.md</h3>
+          <p>Extend the agent with plain Markdown skill packages — install them on the desktop or directly on your phone, no build step required.</p></div>
+        <div class="card"><span class="ic">🔑</span><h3>Bring your own model</h3>
+          <p>OpenAI, Anthropic, Z.ai and any OpenAI-compatible endpoint — cloud or local. Pick the model per conversation.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="screenshots">
+    <div class="wrap">
+      <h2>Screenshots</h2>
+      <p class="lead">Real captures from the desktop app and the Android client.</p>
+      <div class="shot-grid">
+        <a href="promo/web/desktop-1.png"><img src="promo/web/desktop-1.png" alt="Desktop — conversations, devices and WhatsApp"></a>
+        <a href="promo/web/desktop-2.png"><img src="promo/web/desktop-2.png" alt="Desktop — conversation view"></a>
+        <a href="promo/web/desktop-3.png"><img src="promo/web/desktop-3.png" alt="Desktop — device selector"></a>
+      </div>
+      <div class="shot-grid phones">
+        <a href="promo/web/android-1-full.jpg"><img src="promo/web/android-1.jpg" alt="Android — chat with the paired PC"></a>
+        <a href="promo/web/android-2-full.jpg"><img src="promo/web/android-2.jpg" alt="Android — QR pairing"></a>
+        <a href="promo/web/android-3-full.jpg"><img src="promo/web/android-3.jpg" alt="Android — skills and settings"></a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="whats-new">
+    <div class="wrap">
+      <h2>What's new in 3.1</h2>
+      <p class="lead">Built on the 3.0 Android &amp; multi-device foundation.</p>
+      <ul class="newlist">
+        <li><b>Photos in messages</b> — attach, render and save images on desktop and phone; shared across paired devices.</li>
+        <li><b>Mobile thinking</b> — reasoning is persisted on the phone and shown in expandable, copyable transcript blocks.</li>
+        <li><b>On-device skills</b> — list, inspect, install and activate SKILL.md packages straight from the Android app.</li>
+        <li><b>Model picker</b> — per-conversation model selection on desktop and phone.</li>
+        <li><b>Handoff safety</b> — aborted device transfers are tombstoned and can't be silently retried.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section" id="download">
+    <div class="wrap">
+      <h2>Download 3.1</h2>
+      <p class="lead">Packages are published on the GitHub releases page.</p>
+      <div class="download">
+        <div class="dl">
+          <h3>🐧 Linux (Deb)</h3>
+          <p>gnomeai-rs_3.1-1_amd64.deb — native desktop app for Debian/Ubuntu</p>
+          <a class="btn primary" href="https://github.com/adrgu372/GnomeAI-RS/releases/tag/v3.1">Get the .deb</a>
+        </div>
+        <div class="dl">
+          <h3>🤖 Android (APK)</h3>
+          <p>Signed ARM64 APK — io.github.adrgu372.gnomeai, versionCode 16</p>
+          <a class="btn primary" href="https://github.com/adrgu372/GnomeAI-RS/releases/tag/v3.1">Get the APK</a>
+        </div>
+        <div class="dl">
+          <h3>⌨️ From source</h3>
+          <p>cargo build --release --bins --locked</p>
+          <a class="btn ghost" href="https://github.com/adrgu372/GnomeAI-RS#build">Build instructions</a>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="lightbox"><img src="" alt=""></div>
+
+<script>
+(function () {
+  var lb = document.getElementById('lightbox'),
+      img = lb.querySelector('img');
+  document.querySelectorAll('.shot-grid a').forEach(function (a) {
+    a.addEventListener('click', function (e) {
+      e.preventDefault();
+      img.src = a.getAttribute('href');
+      img.alt = a.querySelector('img').alt;
+      lb.classList.add('open');
+    });
+  });
+  lb.addEventListener('click', close);
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(); });
+  function close() { lb.classList.remove('open'); img.src = ''; }
+})();
+</script>
+
+<footer>
+  <div class="wrap">
+    <p>GnomeAI-RS is free software under <a href="https://github.com/adrgu372/GnomeAI-RS/blob/main/LICENSE">GPL-3.0</a>.
+    Built with Rust, Avalonia and .NET.</p>
+    <p><a href="https://github.com/adrgu372/GnomeAI-RS">github.com/adrgu372/GnomeAI-RS</a></p>
+  </div>
+</footer>
+
+</body>
+</html>
