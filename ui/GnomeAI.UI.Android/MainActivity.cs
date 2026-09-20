@@ -82,6 +82,7 @@ internal static class MobileHost
     public static bool KeyboardVisible {get;private set;}
     public static void SetInsets(Thickness padding,bool keyboard) {Insets=padding;KeyboardVisible=keyboard;InsetsChanged?.Invoke(padding,keyboard);}
     private static NetworkObserver? _network;
+    private static DozeMonitor? _doze;
     public static string Home { get; private set; }="";
     public static NativeAgentBridge? Bridge { get; private set; }
     public static DeviceHub? Hub { get; private set; }
@@ -92,9 +93,11 @@ internal static class MobileHost
         Bridge=new NativeAgentBridge(home);
         Hub=new DeviceHub(Bridge,Path.Combine(home,"store","devices"),global::Android.OS.Build.Model??"Android",new AndroidIdentityProtector());
         _network=new NetworkObserver(Hub);
+        _doze=new DozeMonitor(Hub);
     }
     public static async Task ShutdownAsync()
     {
+        _doze?.Dispose();_doze=null;
         _network?.Dispose();_network=null;
         if(Hub is {} hub) await hub.DisposeAsync();
         if(Bridge is {} bridge) await bridge.DisposeAsync();

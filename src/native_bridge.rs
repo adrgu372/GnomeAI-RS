@@ -130,6 +130,11 @@ pub extern "C" fn gnomeai_destroy(id: u64) {
         let core = handles().lock().ok().and_then(|mut map| map.remove(&id));
         if let Some(core) = core {
             let _ = core.ops.try_send(Op::Shutdown);
+            // Wake a managed reader blocked in recv(); without this the Arc
+            // never drops to one reference, try_unwrap below fails, and every
+            // destroyed handle leaks a live two-thread Tokio runtime (battery
+            // drain that grows with each activity recreation).
+            let _ = core.wake.try_send("{}".to_owned());
             // Caller stops the event reader before destroy; dropping the receiver
             // releases the bounded forwarding worker before shutting down Tokio.
             if let Ok(core) = Arc::try_unwrap(core) {

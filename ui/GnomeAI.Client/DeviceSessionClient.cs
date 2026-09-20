@@ -55,12 +55,21 @@ public sealed class DeviceSessionClient : IAsyncDisposable
     public async Task RefreshSnapshotAsync() {
         await _refresh.WaitAsync(_stop.Token);
         try {
-            string id;int generation;
-            lock(_gate){id=SessionId;generation=_generation;if(id.Length==0)return;_snapshotting=true;}
+            string id;int generation;string previousEpoch;long previousRevision;
+            lock(_gate){
+                id=SessionId;generation=_generation;if(id.Length==0)return;_snapshotting=true;
+                previousEpoch=_epoch;previousRevision=_revision;
+            }
             var snapshot=await _hub.RequestAsync(Peer,"snapshot",new {session_id=id}).WaitAsync(_stop.Token);
             lock(_gate) {
                 if(generation!=_generation)return;
-                _epoch=snapshot.GetProperty("epoch").GetString()!;_revision=snapshot.GetProperty("revision").GetInt64();
+                var epoch=snapshot.GetProperty("epoch").GetString()!;
+                var revision=snapshot.GetProperty("revision").GetInt64();
+                // Re-publishing an identical snapshot is pure waste; skip it
+                // only when nothing arrived while the request was in flight,
+                // because buffered frames may already be newer than it.
+                if(epoch==previousEpoch && revision<=previousRevision && _buffer.Count==0)return;
+                _epoch=epoch;_revision=revision;
                 SnapshotReceived?.Invoke(id,snapshot);
                 var buffered=_buffer.ToArray();_buffer.Clear();_snapshotting=false;
                 // Publish buffered callbacks before admitting newer live frames.

@@ -290,6 +290,7 @@ impl Tool for MobileAgent {
             store.clone(),
             session.id.clone(),
             model,
+            id.clone(),
             effort,
             ApprovalPolicy::Ask,
             self.root.clone(),

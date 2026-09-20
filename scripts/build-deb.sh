@@ -255,6 +255,13 @@ install -m 0644 packaging/debian/gnomeai-rs-agent.desktop \
     "$package_root/usr/share/applications/gnomeai-rs-agent.desktop"
 install -m 0644 packaging/icons/gnomeai-rs-agent.svg \
     "$package_root/usr/share/icons/hicolor/scalable/apps/gnomeai-rs-agent.svg"
+# Raster sizes so launchers that skip scalable icons (and app grids at small
+# sizes) still show the real artwork instead of a blurry scaled fallback.
+for icon_size in 256 128 64 48 32 16; do
+    install -d "$package_root/usr/share/icons/hicolor/${icon_size}x${icon_size}/apps"
+    install -m 0644 "packaging/icons/hicolor-${icon_size}.png" \
+        "$package_root/usr/share/icons/hicolor/${icon_size}x${icon_size}/apps/gnomeai-rs-agent.png"
+done
 
 install -m 0644 LICENSE "$package_root/usr/share/doc/gnomeai-rs/LICENSE"
 install -m 0644 README.md "$package_root/usr/share/doc/gnomeai-rs/README.md"

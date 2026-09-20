@@ -327,7 +327,9 @@ public sealed class DeviceHub : IAsyncDisposable
         try {while(!_stop.IsCancellationRequested) {
             bool enabled;lock(_bindings)enabled=_bindings.Count>0;
             if(!enabled){await _syncWake.WaitAsync(_stop.Token);continue;}
-            await _syncWake.WaitAsync(TimeSpan.FromSeconds(60),_stop.Token);
+            // Idle workspaces do not need a once-a-minute sweep; five minutes
+            // keeps collaboration fresh without a permanent CPU wake cadence.
+            await _syncWake.WaitAsync(TimeSpan.FromMinutes(5),_stop.Token);
             if(HasPendingTransfer)continue;
             SyncBinding[] bindings;lock(_bindings)bindings=_bindings.ToArray();
             foreach(var binding in bindings) {

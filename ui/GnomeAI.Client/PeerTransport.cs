@@ -73,6 +73,14 @@ internal sealed class PeerTransport : IAsyncDisposable
             _incoming.TryAdd(peer.Channel,Channel.CreateBounded<IPeerConnection>(1));
     }
     private async Task<JsonElement> ReadyAsync(string channel,CancellationToken cancel) {
+        // A healthy mesh needs no churn: skip the ready-wait entirely when the
+        // status already answers, instead of polling the native core each
+        // second for minutes (battery + needless core round-trips).
+        try {
+            var current=await _core("mesh_status",new {}).WaitAsync(cancel);
+            Status=current.GetProperty("status").GetString()??"Tor";
+            if(current.GetProperty("socks_port").GetInt32()>0 && (channel.Length==0 || current.GetProperty("onions").TryGetProperty(channel,out _)))return current;
+        } catch(Exception error) when(error is not OperationCanceledException) { /* fall through to the wait loop */ }
         await _core("mesh_start",new {channel,port=Port}).WaitAsync(cancel);
         var until=DateTime.UtcNow.AddMinutes(4);
         while(DateTime.UtcNow<until) {
@@ -81,7 +89,9 @@ internal sealed class PeerTransport : IAsyncDisposable
             Status=state.GetProperty("status").GetString()??"Tor";
             if(Status.StartsWith("Tor failed:",StringComparison.Ordinal)) throw new IOException(Status);
             if(state.GetProperty("socks_port").GetInt32()>0 && (channel.Length==0 || state.GetProperty("onions").TryGetProperty(channel,out _)))return state;
-            await Task.Delay(1000,cancel);
+            // Tor bootstrap takes tens of seconds; polling any faster does not
+            // speed it up, it only burns CPU and wakes the device.
+            await Task.Delay(3000,cancel);
         }
         throw new TimeoutException("Tor is still connecting. Check connectivity and try again.");
     }

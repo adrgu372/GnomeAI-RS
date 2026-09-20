@@ -111,9 +111,11 @@ impl Provider for CodexAppServer {
                 thread_params["model"] = json!(model);
             }
             if let Some(effort) = reasoning_effort.as_deref() {
-                thread_params["config"] = json!({
-                    "model_reasoning_effort": effort,
-                });
+                if let Some(tier) = crate::config::reasoning_effort_tier(effort) {
+                    thread_params["config"] = json!({
+                        "model_reasoning_effort": tier,
+                    });
+                }
             }
             if !delegated_tools.is_empty() {
                 thread_params["dynamicTools"] = json!(codex_dynamic_tools(&delegated_tools));

@@ -7,7 +7,7 @@
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
   <uses-feature android:name="android.hardware.camera.any" android:required="false" />
-  <application android:label="GnomeAI" android:allowBackup="false" android:usesCleartextTraffic="false" android:supportsRtl="true">
+  <application android:label="GnomeAI" android:icon="@mipmap/icon" android:allowBackup="false" android:usesCleartextTraffic="false" android:supportsRtl="true">
     <provider android:name="io.github.adrgu372.gnomeai.CameraFileProvider" android:authorities="io.github.adrgu372.gnomeai.camera" android:exported="false" android:grantUriPermissions="true">
       <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/camera_paths" />
     </provider>

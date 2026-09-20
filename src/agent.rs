@@ -30,6 +30,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::McpServerConfig;
+use crate::model_catalog;
 use crate::protocol::{Decision, Event};
 use crate::provider::{
     DelegatedToolExecutor, DelegatedToolResult, Delta, Message, Provider, Request, StopReason,
@@ -49,6 +50,32 @@ use crate::verify;
 const AUTO_COMPACT_PCT: i64 = 80;
 const DEFAULT_CONTEXT_WINDOW_TOKENS: i64 = 128_000;
 const RECENT_TURNS_TO_KEEP: usize = 8;
+
+/// Raw context window for a provider/model combination, before the
+/// auto-compaction percentage is applied. The vendored models.dev metadata
+/// is only a default: an explicit `GNOMEF_CONTEXT_WINDOW_TOKENS` override
+/// always wins (useful when a proxy or a quantized local build really has a
+/// different window), and anything unknown keeps the historical 128k value.
+/// Context window actually known from configuration or metadata, `None` when
+/// both are silent (the caller then applies the hard-coded default).
+pub fn known_context_window(provider_id: &str, model: &str) -> Option<i64> {
+    if let Ok(value) = std::env::var("GNOMEF_CONTEXT_WINDOW_TOKENS") {
+        if let Some(tokens) = value
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|tokens| *tokens >= 8_192)
+            .map(|tokens| tokens.clamp(8_192, 2_000_000))
+        {
+            return Some(tokens);
+        }
+    }
+    model_catalog::context_window_for(provider_id, model).filter(|tokens| *tokens >= 8_192)
+}
+
+fn context_window_tokens_for(provider_id: &str, model: &str) -> i64 {
+    known_context_window(provider_id, model).unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
+}
 
 const CONTEXT_COMPACTOR_SYSTEM_PROMPT: &str = r#"# Conversation Compactor
 
@@ -77,14 +104,21 @@ Rules:
 - Do not invent facts or infer preferences.
 - Be dense and factual. This is a continuation checkpoint, not a prose recap."#;
 
-pub fn context_budget_for_model(_model: &str) -> i64 {
-    let context_window = std::env::var("GNOMEF_CONTEXT_WINDOW_TOKENS")
-        .ok()
-        .and_then(|value| value.trim().parse::<i64>().ok())
-        .filter(|tokens| *tokens >= 8_192)
-        .map(|tokens| tokens.clamp(8_192, 2_000_000))
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
-    context_window * AUTO_COMPACT_PCT / 100
+pub fn context_budget_for_model(provider_id: &str, model: &str) -> i64 {
+    context_window_tokens_for(provider_id, model) * AUTO_COMPACT_PCT / 100
+}
+
+impl Agent {
+    /// Clamp a requested completion budget to what the model can actually
+    /// produce. Several gateways reject an oversized `max_tokens` outright
+    /// instead of clamping it, so the advertised output limit wins when the
+    /// snapshot knows the model.
+    fn request_max_tokens(&self, requested: u32) -> u32 {
+        let advertised = model_catalog::max_output_tokens_for(&self.provider_id, &self.model);
+        advertised
+            .filter(|limit| *limit > 0)
+            .map_or(requested, |limit| requested.min(limit as u32))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +143,10 @@ pub struct Agent {
     pub registry: Arc<Registry>,
     pub store: Store,
     pub session_id: String,
+    /// Stable preset id (`openai`, `zai-coding`, `custom`, …) used for
+    /// model-metadata lookups. `model` alone is ambiguous: ids such as
+    /// `gpt-oss-120b` exist at several providers with different windows.
+    pub provider_id: String,
     pub model: String,
     pub reasoning_effort: String,
     pub approval: ApprovalPolicy,
@@ -157,6 +195,7 @@ impl Agent {
         store: Store,
         session_id: String,
         model: String,
+        provider_id: String,
         reasoning_effort: String,
         approval: ApprovalPolicy,
         workspace: PathBuf,
@@ -173,6 +212,7 @@ impl Agent {
             store,
             session_id,
             model,
+            provider_id,
             reasoning_effort,
             approval,
             workspace,
@@ -275,7 +315,10 @@ impl Agent {
                     .then(|| self.reasoning_effort.clone()),
                 messages,
                 tools: self.registry.specs(),
-                max_tokens: 8192,
+                // Never ask for more completion tokens than the model can
+                // produce; several gateways reject an oversized `max_tokens`
+                // outright instead of clamping it.
+                max_tokens: self.request_max_tokens(8192),
                 delegated_tools: self.registry.external_specs(),
                 delegated_tool_executor: Some(Arc::new(AgentDelegatedToolExecutor {
                     agent: self.clone_handle(),
@@ -827,7 +870,7 @@ impl Agent {
     }
 
     async fn compact_if_needed(&self) -> Result<()> {
-        let context_budget = context_budget_for_model(&self.model);
+        let context_budget = context_budget_for_model(&self.provider_id, &self.model);
         let Some(plan) =
             self.store
                 .plan_compaction(&self.session_id, context_budget, RECENT_TURNS_TO_KEEP)?
@@ -874,7 +917,7 @@ impl Agent {
                 },
             ],
             tools: Vec::new(),
-            max_tokens: 4_096,
+            max_tokens: self.request_max_tokens(4_096),
             delegated_tools: Vec::new(),
             delegated_tool_executor: None,
             mcp_servers: Vec::new(),
@@ -933,6 +976,7 @@ impl Agent {
             store: self.store.clone(),
             session_id: self.session_id.clone(),
             model: self.model.clone(),
+            provider_id: self.provider_id.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             approval: self.approval,
             workspace: self.workspace.clone(),
@@ -1087,6 +1131,65 @@ mod title_tests {
             "Repară bara providerului"
         );
         assert!(automatic_session_title(&"ă".repeat(100)).ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod context_window_tests {
+    use super::context_window_tokens_for;
+
+    /// GNOMEF_CONTEXT_WINDOW_TOKENS is read inside the function under test,
+    /// so the environment is mutated in-process. All assertions live in one
+    /// test because cargo runs test functions in parallel threads and the
+    /// variable is process-global.
+    fn with_env(value: Option<&str>, f: impl FnOnce()) {
+        // SAFETY: single-threaded test execution for this binary's unit
+        // tests; no other thread reads this variable concurrently.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("GNOMEF_CONTEXT_WINDOW_TOKENS", v),
+                None => std::env::remove_var("GNOMEF_CONTEXT_WINDOW_TOKENS"),
+            }
+        }
+        f();
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("GNOMEF_CONTEXT_WINDOW_TOKENS") };
+    }
+
+    #[test]
+    fn env_override_precedence_over_catalog_metadata() {
+        with_env(None, || {
+            assert_eq!(
+                context_window_tokens_for("zai-coding", "glm-5.3-flash"),
+                1_000_000,
+                "catalog metadata beats the default"
+            );
+            assert_eq!(
+                context_window_tokens_for("custom", "local-model"),
+                128_000,
+                "unknown providers fall back to the historical default"
+            );
+        });
+        with_env(Some("262144"), || {
+            assert_eq!(
+                context_window_tokens_for("zai-coding", "glm-5.3-flash"),
+                262_144,
+                "explicit override wins over the catalog"
+            );
+        });
+        with_env(Some("1024"), || {
+            assert_eq!(
+                context_window_tokens_for("zai-coding", "glm-5.3-flash"),
+                1_000_000,
+                "invalid overrides are ignored"
+            );
+        });
+        with_env(Some("not-a-number"), || {
+            assert_eq!(
+                context_window_tokens_for("zai-coding", "glm-5.3-flash"),
+                1_000_000
+            );
+        });
     }
 }
 

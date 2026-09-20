@@ -1,3 +1,26 @@
+# GnomeAI-RS 3.1-2 - 2026-09-19
+
+## Numeric reasoning effort, new icon, Android transport and battery fixes
+
+- Reasoning effort accepts the DeepSeek-style numeric 1–100 scale in addition
+  to the named tiers: parse/clamp in config, tier filtering for native
+  structured fields (OpenAI `reasoning_effort`, Anthropic `output_config`,
+  Claude `--effort`, Codex `model_reasoning_effort`) and a universal
+  system-prompt line for local models.
+- New neon G/mesh/speech-bubble icon: hicolor PNGs 16–256 plus a rebuilt SVG
+  for the .deb, mipmaps and a window icon (avares asset) for the desktop app,
+  and the Android launcher icon wired through the manifest.
+- Android transport stability: `NetworkObserver` debounces callback storms
+  and reconnects only on real connectivity loss; mesh status polling skips
+  the ready-wait when healthy and polls at 3 s otherwise.
+- Battery: unified 15 s heartbeat (was 30 s online / 5 s pairing), snapshot
+  refresh skips identical epochs, workspace autosync at 5 min, Tor circuit
+  budget 32 -> 8, and `DozeMonitor` parks peer links during device idle.
+- `native_bridge`: wake the blocked event reader in `gnomeai_destroy` so
+  `Arc::try_unwrap` succeeds and no Tokio runtime leaks per activity
+  recreation.
+- Android app: versionCode **18** (display version **3.1.1**).
+
 # GnomeAI-RS 3.1-1 - 2026-09-18
 
 ## Photos in messages, mobile thinking and on-device skills

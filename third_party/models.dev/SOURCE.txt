@@ -1,0 +1,10 @@
+project: models.dev
+upstream: https://github.com/anomalyco/models.dev
+endpoint: https://models.dev/api.json
+commit: a25d952334e2331e6649b1e054b9a7b4579dd978
+commit_date: 2026-09-19T05:25:15Z
+branch: dev
+file: api.json
+sha256: de3bae6008c6bbeac71c4931b60490dfdb2d45f350f2d55948fcdc3e89794061
+license: MIT
+modified: false

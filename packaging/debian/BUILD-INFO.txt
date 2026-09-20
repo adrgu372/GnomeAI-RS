@@ -1,4 +1,4 @@
-GnomeAI-RS 3.1-1 (Rust core 3.1.0)
+GnomeAI-RS 3.1-2 (Rust core 3.1.1)
 Source: https://github.com/adrgu372/GnomeAI-RS
 License: GPL-3.0
 Primary executable: /usr/lib/gnomeai-rs/gnomef-rs

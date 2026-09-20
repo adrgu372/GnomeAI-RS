@@ -48,7 +48,9 @@ async fn run(home:PathBuf,mut rx:mpsc::Receiver<Command>,state:Arc<Mutex<Value>>
     let client=TorClient::create_bootstrapped(config).await?;
     let socks=TcpListener::bind((std::net::Ipv4Addr::LOCALHOST,0)).await?;
     state.lock().unwrap()["socks_port"]=json!(socks.local_addr()?.port());
-    let budget=Arc::new(Semaphore::new(32));
+    // Desktops tolerate a 32-circuit budget; a phone pairs with a handful of
+    // devices, and every kept-alive circuit costs CPU and cover traffic.
+    let budget=Arc::new(Semaphore::new(8));
     let dialer=client.clone();let proxy_stop=stop.clone();let slots=budget.clone();
     tokio::spawn(async move {
         loop {

@@ -14,3 +14,17 @@ descriere
 
 /relay/target/
 /ui/GnomeAI.UI.Android/native/
+
+/site/dist/
+
+# Local-only material kept out of the repository (promotional media,
+# screenshots, documents). Only promo/icon.png is published in the README.
+/screenshots/
+/site/
+/contact-sheet.png
+/Screenshot from*.png
+*.pdf
+/promo/*
+!/promo/icon.png
+/PROMOTION.md
+/gnomeai_export_*.md

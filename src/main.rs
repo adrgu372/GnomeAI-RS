@@ -14,6 +14,7 @@ mod generation;
 mod llama;
 mod memory;
 mod memory_engine;
+mod model_catalog;
 mod native_service;
 mod node_protocol;
 mod nodes;

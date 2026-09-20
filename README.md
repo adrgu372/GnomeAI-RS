@@ -1,10 +1,13 @@
-> **Current release: 3.1 — photos in messages, mobile thinking and on-device
-> skills.** The highlights are below; [CHANGELOG.md](CHANGELOG.md) has the
-> full history. For the Android and multi-device foundation introduced in
-> 3.0, see [RELEASE_NOTES_v3.0.md](RELEASE_NOTES_v3.0.md) and
+> **Current release: 3.1.1 — numeric reasoning effort, a new app icon and
+> Android transport & battery fixes.** The highlights are below;
+> [CHANGELOG.md](CHANGELOG.md) has the full history. For the Android and
+> multi-device foundation introduced in 3.0, see
+> [RELEASE_NOTES_v3.0.md](RELEASE_NOTES_v3.0.md) and
 > [ANDROID_PORT.md](ANDROID_PORT.md).
 
 # GnomeAI-RS
+
+<p align="center"><img src="promo/icon.png" width="96" alt="GnomeAI-RS logo"></p>
 
 GnomeAI-RS is a native graphical coding agent written in Rust. The desktop
 application keeps the proven agent core and `Op`/`Event` protocol of the former
@@ -13,8 +16,8 @@ window. A native Android ARM64 client (`.NET 10` + Avalonia) shares the same
 Rust core through `libgnomeai_core.so` and pairs with the desktop over a
 Tor/Arti mesh transport.
 
-Current Debian package version: **3.1-1** (Rust core: **3.1.0**, Android app:
-**3.1.0**, versionCode **16**). See [CHANGELOG.md](CHANGELOG.md) for the
+Current Debian package version: **3.1-2** (Rust core: **3.1.1**, Android app:
+**3.1.1**, versionCode **18**). See [CHANGELOG.md](CHANGELOG.md) for the
 historical release notes.
 
 ## What changed in 3.1
@@ -30,6 +33,81 @@ reasoning visibility and phone-side management.
 | Model picker | Per-conversation model selection backed by the new `available_models` core action |
 | Handoff safety | Discarded session transfers record a tombstone and roll the session status back, so aborted transfers cannot be silently retried |
 | Notifications | WhatsApp reply notifications are owned by the Android foreground service and survive backgrounding; native text selection and theme polish |
+
+## What changed in 3.1.1
+
+### Numeric reasoning effort (DeepSeek-style 1–100 scale)
+
+The reasoning-effort setting now accepts a number in addition to the named
+tiers, following the effort control described in the
+DeepSeek-V4.1-Flash technical report: one `u8` on a 1–100 scale that a client
+can interpolate, with the public tiers as anchors (`low`=50, `medium`=25,
+`high`=75, `xhigh`=90, `max`=100; values below 5 are clamped to 5 and anything
+unparsable falls back to `default`, so existing configs keep their meaning).
+The value travels through two deliberately separate channels:
+
+- **Native structured fields** (`reasoning_effort` for OpenAI,
+  `output_config.effort` for Anthropic, `--effort` for the Claude CLI,
+  `model_reasoning_effort` for the Codex app server) only ever receive tier
+  names — a numeric value is filtered out because those APIs would reject it.
+- **A system-prompt line** (`Reasoning effort: N (range 1-100; higher values
+  request more thorough reasoning)`) carries numeric values to any model,
+  which is the same prompt-conditioning mechanism the report uses to make
+  effort control work on providers without a structured field (Ollama, vLLM,
+  llama.cpp).
+
+Set it with `/effort 42`, `/effort max`, the desktop Settings dialog (the
+effort combo boxes are editable) or the `reasoning_effort` /
+`subagent_reasoning_effort` config keys. Both agent and delegated-worker
+efforts support the scale.
+
+### New application icon
+
+The old robot mark is replaced by a neon "G" built from a speech bubble,
+device-mesh nodes and an assist sparkle on a rounded dark tile
+(`promo/icon.png`). It ships everywhere:
+
+- Debian: PNG sizes 16–256 installed into `hicolor` alongside the rebuilt
+  scalable SVG, so small app-grid sizes stay crisp instead of downscaling a
+  blurry fallback
+- Android: launcher mipmaps at every density (`mdpi` 48 through `xxxhdpi`
+  192), referenced by `android:icon` in the manifest (the app previously had
+  no launcher icon at all)
+- Desktop window: taskbar/window icon loaded from the Avalonia asset bundle
+  (`Assets/AppIcon.png`)
+
+### Android transport stability
+
+- `NetworkObserver` now counts live networks and debounces callback storms
+  for 5 s, reconnecting only on a real loss or return of the last transport.
+  USB plugging, Wi-Fi/cell handovers and captive-portal checks no longer tear
+  down healthy peer sockets (the old 1 s debounce re-connected on every
+  callback, which made phone-to-PC sessions visibly stutter).
+- The mesh ready-wait skips polling entirely when `mesh_status` already
+  answers, and otherwise polls every 3 s instead of 1 s. Tor bootstrap takes
+  tens of seconds regardless; faster polling only burned CPU.
+
+### Android battery work
+
+- Peer heartbeat unified at one liveness exchange per **15 s** (previously
+  30 s when online but 5 s while pairing), with the hello deadline reduced to
+  three missed beats. Pairing probes no longer fire every 5 s while a human
+  is still looking at the confirmation code.
+- Snapshot refresh skips re-downloading a full transcript when the epoch and
+  revision are unchanged (frames that arrived mid-request are still honored).
+- Workspace autosync sweeps every 5 minutes instead of every minute.
+- Tor circuit budget reduced 32 → 8: a phone pairs with a handful of devices,
+  and every kept-alive circuit costs CPU and cover traffic.
+- New `DozeMonitor` parks peer links while the system is in Doze (where
+  sockets are torn down anyway and retries would fail deterministically) and
+  resumes them the moment the device wakes.
+- `gnomeai_destroy` now wakes the event reader blocked in `recv()` before
+  unwrapping the handle. Without this the reader kept an extra `Arc`
+  reference, `Arc::try_unwrap` silently failed, and every destroyed handle
+  leaked a live two-thread Tokio runtime — battery drain that grew with each
+  activity recreation.
+
+Android build: versionCode **17**, versionName **3.1.1**.
 
 # GnomeAI-RS 3.0 — Android & multi-device preview
 

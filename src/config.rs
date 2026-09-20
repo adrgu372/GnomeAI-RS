@@ -352,13 +352,13 @@ impl AppConfig {
         if self.subagent_provider_id.is_empty() {
             self.subagent_provider_id = "inherit".into();
         }
-        self.reasoning_effort = normalize_reasoning_effort(&self.reasoning_effort);
+        self.reasoning_effort = parse_reasoning_effort(&self.reasoning_effort);
         self.subagent_model = compact_ws(&self.subagent_model);
         if self.subagent_model.is_empty() {
             self.subagent_model = "inherit".into();
         }
         self.subagent_reasoning_effort =
-            normalize_reasoning_effort(&self.subagent_reasoning_effort);
+            parse_reasoning_effort(&self.subagent_reasoning_effort);
         self.agent_max_concurrent = self.agent_max_concurrent.clamp(1, 16);
         self.memory_max_facts_in_prompt = self.memory_max_facts_in_prompt.clamp(1, 20);
         if self.memory_max_age_days > 0 {
@@ -554,13 +554,66 @@ fn mcp_name(name: &str, fallback: usize) -> String {
     }
 }
 
-pub fn normalize_reasoning_effort(value: &str) -> String {
+/// Parse a user-supplied reasoning-effort scalar. Adapted from the effort
+/// control of DeepSeek-V4.1-Flash (tech report §5.1.4): one `u8` in 1..=100
+/// that a client can interpolate, with named tiers as anchors. Anything that
+/// is not a plain number or a tier name falls back to `default` (model
+/// decides), so old configs keep their meaning.
+pub fn parse_reasoning_effort(value: &str) -> String {
     let value = compact_ws(value).to_ascii_lowercase();
-    if matches!(value.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
-        value
-    } else {
-        "default".into()
+    if matches!(value.as_str(), "default" | "low" | "medium" | "high" | "xhigh" | "max") {
+        return value;
     }
+    match value.parse::<u8>() {
+        // 1 is accepted but clamped to 5: DeepSeek's report reserves the
+        // bottom of the scale, and we refuse to ask a model to think in
+        // less than one percentile of its budget.
+        Ok(n @ 1..=100) => format!("{}", n.max(5)),
+        _ => "default".into(),
+    }
+}
+
+/// Anchor the scalar on DeepSeek's public API tiers: low=50, high=75,
+/// max=100; the report's "xhigh" maps to 90, medium to 25 (the report's own
+/// evaluation floor), and default stays None — the payload field is omitted.
+pub fn reasoning_effort_scalar(effort: &str) -> Option<u8> {
+    match parse_reasoning_effort(effort).as_str() {
+        "low" => Some(50),
+        "medium" => Some(25),
+        "high" => Some(75),
+        "xhigh" => Some(90),
+        "max" => Some(100),
+        other => other.parse::<u8>().ok().filter(|n| (1..=100).contains(n)),
+    }
+}
+
+/// The value a *native* structured field accepts. OpenAI's
+/// `reasoning_effort`, Anthropic's `output_config.effort` and the Claude CLI's
+/// `--effort` all speak tier names, not numbers; a numeric scale value is
+/// deliberately filtered out here so it travels only through the
+/// system-prompt line (see `reasoning_effort_prompt_line`), where any model
+/// can condition on it.
+pub fn reasoning_effort_tier(value: &str) -> Option<&'static str> {
+    match parse_reasoning_effort(value).as_str() {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" => Some("xhigh"),
+        "max" => Some("max"),
+        _ => None,
+    }
+}
+
+/// One-line instruction for the system prompt, the mechanism from the same
+/// report section that lets effort control work with any model: native
+/// providers get the structured field, everything else (Ollama, vLLM,
+/// llama.cpp) still sees the number as text and conditions on it.
+pub fn reasoning_effort_prompt_line(effort: &str) -> Option<String> {
+    reasoning_effort_scalar(effort).map(|b| {
+        format!(
+            "Reasoning effort: {b} (range 1-100; higher values request more thorough reasoning)"
+        )
+    })
 }
 
 pub fn compact_ws(text: &str) -> String {
@@ -571,6 +624,42 @@ pub fn compact_ws(text: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn numeric_reasoning_effort_parses_clamps_and_falls_back() {
+        assert_eq!(parse_reasoning_effort("42"), "42");
+        assert_eq!(parse_reasoning_effort(" 7 "), "7");
+        // Below the scale floor: accepted then clamped to 5.
+        assert_eq!(parse_reasoning_effort("1"), "5");
+        // Beyond u8 or beyond 100: not a scalar, fall back to default.
+        assert_eq!(parse_reasoning_effort("300"), "default");
+        assert_eq!(parse_reasoning_effort("abc"), "default");
+        assert_eq!(parse_reasoning_effort(""), "default");
+        // Tiers still parse unchanged.
+        assert_eq!(parse_reasoning_effort("HIGH"), "high");
+    }
+
+    #[test]
+    fn effort_scalar_anchors_tiers_and_effort_tier_rejects_numbers() {
+        assert_eq!(reasoning_effort_scalar("low"), Some(50));
+        assert_eq!(reasoning_effort_scalar("medium"), Some(25));
+        assert_eq!(reasoning_effort_scalar("high"), Some(75));
+        assert_eq!(reasoning_effort_scalar("xhigh"), Some(90));
+        assert_eq!(reasoning_effort_scalar("max"), Some(100));
+        assert_eq!(reasoning_effort_scalar("66"), Some(66));
+        assert_eq!(reasoning_effort_scalar("default"), None);
+
+        assert!(reasoning_effort_tier("max").is_some());
+        // Numbers must never reach native structured fields.
+        assert!(reasoning_effort_tier("66").is_none());
+        assert!(reasoning_effort_tier("default").is_none());
+
+        assert_eq!(
+            reasoning_effort_prompt_line("42").as_deref(),
+            Some("Reasoning effort: 42 (range 1-100; higher values request more thorough reasoning)")
+        );
+        assert!(reasoning_effort_prompt_line("default").is_none());
+    }
 
     #[test]
     fn runtime_web_token_is_neither_serialized_nor_lost_by_patch() {

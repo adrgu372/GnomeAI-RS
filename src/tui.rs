@@ -291,6 +291,8 @@ pub struct App {
     branch: Option<String>,
     sandbox: String,
     web_search_enabled: bool,
+    /// Raw context window of the active model, when the backend knows it.
+    context_window: Option<i64>,
     recent_workspaces: Vec<String>,
     tokens_in: i64,
     tokens_out: i64,
@@ -364,6 +366,7 @@ impl App {
             branch: None,
             sandbox: "normal".into(),
             web_search_enabled: false,
+            context_window: None,
             recent_workspaces: Vec::new(),
             tokens_in: 0,
             tokens_out: 0,
@@ -560,6 +563,7 @@ fn apply_event(app: &mut App, ev: Event) {
             workspace,
             sandbox,
             web_search_enabled,
+            context_window,
             git_branch,
             recent_workspaces,
             models,
@@ -571,6 +575,7 @@ fn apply_event(app: &mut App, ev: Event) {
             app.workspace = workspace.display().to_string();
             app.sandbox = sandbox;
             app.web_search_enabled = web_search_enabled;
+            app.context_window = context_window;
             app.branch = git_branch;
             app.recent_workspaces = recent_workspaces;
         }
@@ -2791,6 +2796,17 @@ fn scroll_percent(scroll: u16, max_scroll: u16) -> u16 {
     }
 }
 
+/// Compact token count for the status line: 128000 -> "128k", 1000000 -> "1.0M".
+fn format_tokens(tokens: i64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
 /// `Text::height()` and `Vec<Line>::len()` only count explicit newlines. Model
 /// output often streams as one long logical line, which Ratatui wraps into many
 /// terminal rows. Using `Paragraph::line_count` keeps the viewport attached to
@@ -2849,6 +2865,12 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "web:off"
     };
+    // Context window: shown only when the backend actually knows it, so a
+    // custom endpoint never advertises a guessed default.
+    let context = app
+        .context_window
+        .map(|tokens| format!("  · ctx {}", format_tokens(tokens)))
+        .unwrap_or_default();
     // Scroll position: visible only while detached from the tail, which is
     // exactly when you have lost track of where you are.
     let scroll_pos = if app.detached {
@@ -2884,7 +2906,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         .map(|(message, _)| format!("✓ {message}"))
         .unwrap_or_else(|| {
             format!(
-                "{spinner}{elapsed}  {} · {}  {} · {web}{branch}{queued}{mouse}{search}{scroll_pos}",
+                "{spinner}{elapsed}  {} · {}  {} · {web}{context}{branch}{queued}{mouse}{search}{scroll_pos}",
                 app.provider, app.model, app.sandbox
             )
         });
@@ -3515,6 +3537,13 @@ fn show_token_usage(app: &mut App) {
         "\n{turns} turns · average {avg_in} in / {avg_out} out per turn · model: {}",
         app.model
     ));
+    if let Some(tokens) = app.context_window {
+        lines.push_str(&format!(
+            "\ncontext window: {} tokens — compaction triggers around {}",
+            tokens,
+            format_tokens(tokens * 80 / 100)
+        ));
+    }
 
     app.blocks.push(Block_::Note(lines));
 }
@@ -3533,6 +3562,9 @@ fn export_conversation(app: &mut App) {
     ));
     content.push_str(&format!("**Provider:** {}\n", app.provider));
     content.push_str(&format!("**Model:** {}\n", app.model));
+    if let Some(tokens) = app.context_window {
+        content.push_str(&format!("**Context window:** {} tokens\n", tokens));
+    }
     content.push_str(&format!("**Workspace:** {}\n\n", app.workspace));
     content.push_str("---\n\n");
 
@@ -4513,6 +4545,13 @@ mod tests {
         assert!(sequence.starts_with("\x1b]52;c;"));
         assert!(sequence.ends_with('\x07'));
         assert!(sequence.contains("c2FsdXQ="));
+    }
+
+    #[test]
+    fn format_tokens_keeps_the_status_line_short() {
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(128_000), "128k");
+        assert_eq!(format_tokens(1_000_000), "1.0M");
     }
 
     #[test]

@@ -350,7 +350,9 @@ impl OpenAiCompatible {
                     .map(|object| object.remove("temperature"));
             }
             if let Some(effort) = req.reasoning_effort.as_deref() {
-                body["reasoning_effort"] = json!(effort);
+                if let Some(tier) = crate::config::reasoning_effort_tier(effort) {
+                    body["reasoning_effort"] = json!(tier);
+                }
             }
         }
 
@@ -626,7 +628,9 @@ impl Anthropic {
             body["thinking"] = json!({ "type": "disabled" });
         }
         if let Some(effort) = req.reasoning_effort.as_deref() {
-            body["output_config"] = json!({ "effort": effort });
+            if let Some(tier) = crate::config::reasoning_effort_tier(effort) {
+                body["output_config"] = json!({ "effort": tier });
+            }
         }
         if !req.tools.is_empty() {
             body["tools"] = json!(
@@ -1024,7 +1028,9 @@ fn cli_command(
                 args.extend(["--model".to_string(), model.to_string()]);
             }
             if let Some(effort) = reasoning_effort {
-                args.extend(["--effort".to_string(), effort.to_string()]);
+                if let Some(tier) = crate::config::reasoning_effort_tier(effort) {
+                    args.extend(["--effort".to_string(), tier.to_string()]);
+                }
             }
             if let Some(path) = mcp_config {
                 args.extend([

@@ -28,6 +28,7 @@ mod mcp_client;
 mod memory;
 #[path = "memory_engine.rs"]
 mod memory_engine;
+mod model_catalog;
 #[path = "native_service.rs"]
 mod native_service;
 #[path = "node_protocol.rs"]

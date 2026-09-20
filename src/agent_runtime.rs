@@ -2,7 +2,7 @@ use crate::*;
 use agent::{Agent, ApprovalPolicy};
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
-use config::{AppConfig, normalize_reasoning_effort};
+use config::AppConfig;
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use memory_engine::{DreamHandle, MemoryEngine, spawn_dream_worker};
 use privilege::{PrivilegeBroker, PrivilegeCredential};
@@ -236,6 +236,7 @@ async fn run_engine(
         store,
         session_id,
         model,
+        provider_selection.provider_id.clone(),
         mcp_config.reasoning_effort.clone(),
         approval_for(cli.sandbox),
         workspace,
@@ -1195,7 +1196,7 @@ async fn set_reasoning_effort(
     effort: String,
     events: &mpsc::Sender<Event>,
 ) -> Result<()> {
-    let effort = normalize_reasoning_effort(&effort);
+    let effort = config::parse_reasoning_effort(&effort);
     core.agent.reasoning_effort = effort.clone();
     {
         let mut config = core.config_state.write().await;
@@ -1235,6 +1236,7 @@ async fn set_provider(
     }
 
     core.agent.provider = provider;
+    core.agent.provider_id = selection.provider_id.clone();
     core.agent.model = selection.model.clone();
     core.agent.reasoning_effort = core.config_state.read().await.reasoning_effort.clone();
     core.provider_selection = selection;
@@ -1512,7 +1514,7 @@ async fn set_subagent_defaults(
     };
     let model = model.trim();
     let model = if model.is_empty() { "inherit" } else { model };
-    let reasoning_effort = normalize_reasoning_effort(&reasoning_effort);
+    let reasoning_effort = config::parse_reasoning_effort(&reasoning_effort);
 
     if enabled && provider_id != "inherit" {
         let provider = preset(&provider_id)
@@ -2173,6 +2175,7 @@ async fn send_ready(
                 .map(|path| path.display().to_string())
                 .collect(),
             models,
+            context_window: agent::known_context_window(&agent.provider_id, &agent.model),
             mcp_servers,
             subagent_use_separate_model,
             subagent_provider_id,
@@ -2204,6 +2207,13 @@ fn initialize_session(
 ) -> Result<()> {
     if store.live_turns(session_id)?.is_empty() {
         let mut prompt = tools::build_system_prompt(workspace);
+        // Numeric effort scales (e.g. DeepSeek's 1-100 control) reach
+        // non-native providers as a system-prompt line; native providers get
+        // the structured payload field instead.
+        if let Some(line) = config::reasoning_effort_prompt_line(&config.reasoning_effort) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&line);
+        }
         // Shared cross-conversation memory, same database WebTool maintains.
         if config.memory_enabled {
             let block = engine.agent_memory_block(config);

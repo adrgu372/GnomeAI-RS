@@ -335,6 +335,11 @@ pub enum Event {
         /// Available models for the current provider, for the model picker.
         #[serde(default)]
         models: Vec<String>,
+        /// Raw context window (tokens) for the active provider/model, when the
+        /// vendored models.dev snapshot knows it. `None` keeps the client
+        /// silent rather than guessing.
+        #[serde(default)]
+        context_window: Option<i64>,
         #[serde(default)]
         mcp_servers: Vec<McpServerConfig>,
         #[serde(default)]
@@ -544,6 +549,30 @@ mod tests {
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["event"], "provider_changed");
         assert_eq!(value["models"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ready_serializes_the_context_window() {
+        let event = Event::Ready {
+            session_id: "s".into(),
+            provider: "Ollama (local)".into(),
+            model: "qwen3-coder".into(),
+            reasoning_effort: "medium".into(),
+            workspace: "/tmp".into(),
+            sandbox: "normal".into(),
+            web_search_enabled: false,
+            context_window: Some(262_144),
+            git_branch: None,
+            recent_workspaces: Vec::new(),
+            models: vec!["qwen3-coder".into()],
+            mcp_servers: Vec::new(),
+            subagent_use_separate_model: false,
+            subagent_provider_id: "inherit".into(),
+            subagent_model: "inherit".into(),
+            subagent_reasoning_effort: "medium".into(),
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["context_window"].as_i64(), Some(262_144));
     }
 
     #[test]

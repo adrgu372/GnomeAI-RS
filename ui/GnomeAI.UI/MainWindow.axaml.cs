@@ -156,6 +156,21 @@ public sealed partial class MainWindow : Window
 
         Opened += (_, _) => Composer.Focus();
         RefreshComposer();
+
+        // Window/taskbar icon; also used by Android for the recents image.
+        try
+        {
+            using var iconStream = Avalonia.Platform.AssetLoader.Open(
+                new Uri("avares://GnomeAI.UI/Assets/AppIcon.png"));
+            if (iconStream is not null)
+            {
+                Icon = new WindowIcon(iconStream);
+            }
+        }
+        catch
+        {
+            // A missing icon must never block startup.
+        }
     }
 
     protected override void OnClosed(EventArgs e)
@@ -1881,6 +1896,7 @@ public sealed partial class MainWindow : Window
         {
             ItemsSource = reasoningLevels,
             SelectedItem = reasoningLevels.Contains(_reasoningEffort) ? _reasoningEffort : "default",
+            IsEditable = true,
             HorizontalAlignment = HorizontalAlignment.Stretch,
         };
         content.Children.Add(Surface(new StackPanel
@@ -1889,7 +1905,7 @@ public sealed partial class MainWindow : Window
             Children =
             {
                 Labeled("Reasoning effort", mainReasoning),
-                MutedText("Default leaves the provider/model default unchanged. Explicit effort is applied when the selected provider supports it."),
+                MutedText("Default leaves the provider/model default unchanged. A tier or a numeric scale 5-100 (e.g. 42) may be typed; numeric scales reach models that support them, tiers are sent to native providers."),
             },
         }));
 
@@ -1923,6 +1939,7 @@ public sealed partial class MainWindow : Window
         {
             ItemsSource = reasoningLevels,
             SelectedItem = reasoningLevels.Contains(_subagentReasoningEffort) ? _subagentReasoningEffort : "default",
+            IsEditable = true,
             HorizontalAlignment = HorizontalAlignment.Stretch,
         };
         var workerNote = MutedText("Normal Agent delegations use this worker only when they omit provider_id and model. Explicit Agent overrides still win.");

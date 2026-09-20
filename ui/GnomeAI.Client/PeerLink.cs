@@ -44,6 +44,9 @@ public sealed class PeerLink : IAsyncDisposable
     public event Action? PairingRevoked;
     private int _forgetting, _disposed;
     public void StopReconnect()=>Interlocked.Exchange(ref _forgetting,1);
+    /// Undo StopReconnect (system idle windows); the runner notices on its
+    /// next loop because the flag is re-read every iteration.
+    public void ResumeReconnect()=>Interlocked.Exchange(ref _forgetting,0);
     public event Action<JsonElement>? Event;
     public Func<string, string, JsonElement, Task<JsonElement>>? RequestReceived { get; set; }
     private readonly CancellationTokenSource _stop = new();
@@ -142,14 +145,20 @@ public sealed class PeerLink : IAsyncDisposable
                 else if (peer.Trusted)
                     await SendHelloAsync("");
                 if(!peer.Trusted && peer.LocalConfirmed && peer.Key.Length>0) await SendConfirmationAsync();
-                if (Environment.TickCount64-_lastHello > 95000) {
+                // Three missed 15 s beats mark the peer gone; the old value
+                // was tuned for the 30 s schedule.
+                if (Environment.TickCount64-_lastHello > 45000) {
                     // Pending invitations wait for human confirmation, but their
                     // authenticated hello transport still has a finite deadline.
                     SetOnline(false);attempt.Cancel();_socket?.Abort();return;
                 }
             }
             catch (Exception) { attempt.Cancel();_socket?.Abort();return; }
-            await Task.Delay(peer.Trusted && Online?30000:5000,cancel);
+            // One liveness exchange per 15 s is plenty for a direct peer
+            // connection and halves the wakeups of the old schedule; pairing
+            // probes previously fired every 5 s and drained battery while
+            // waiting for a human to confirm the code.
+            await Task.Delay(15000,cancel);
         }
     }
     private Task SendHelloAsync(string echo) => SendPlainAsync(new { type="hello", id=identity.Id,
