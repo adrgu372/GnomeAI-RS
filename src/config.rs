@@ -357,8 +357,7 @@ impl AppConfig {
         if self.subagent_model.is_empty() {
             self.subagent_model = "inherit".into();
         }
-        self.subagent_reasoning_effort =
-            parse_reasoning_effort(&self.subagent_reasoning_effort);
+        self.subagent_reasoning_effort = parse_reasoning_effort(&self.subagent_reasoning_effort);
         self.agent_max_concurrent = self.agent_max_concurrent.clamp(1, 16);
         self.memory_max_facts_in_prompt = self.memory_max_facts_in_prompt.clamp(1, 20);
         if self.memory_max_age_days > 0 {
@@ -561,7 +560,10 @@ fn mcp_name(name: &str, fallback: usize) -> String {
 /// decides), so old configs keep their meaning.
 pub fn parse_reasoning_effort(value: &str) -> String {
     let value = compact_ws(value).to_ascii_lowercase();
-    if matches!(value.as_str(), "default" | "low" | "medium" | "high" | "xhigh" | "max") {
+    if matches!(
+        value.as_str(),
+        "default" | "low" | "medium" | "high" | "xhigh" | "max"
+    ) {
         return value;
     }
     match value.parse::<u8>() {
@@ -656,7 +658,9 @@ mod tests {
 
         assert_eq!(
             reasoning_effort_prompt_line("42").as_deref(),
-            Some("Reasoning effort: 42 (range 1-100; higher values request more thorough reasoning)")
+            Some(
+                "Reasoning effort: 42 (range 1-100; higher values request more thorough reasoning)"
+            )
         );
         assert!(reasoning_effort_prompt_line("default").is_none());
     }

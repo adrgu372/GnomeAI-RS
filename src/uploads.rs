@@ -486,7 +486,10 @@ pub fn extract_text_attachment(path: &Path) -> anyhow::Result<String> {
     );
     match file_type.as_str() {
         #[cfg(target_os = "android")]
-        "pdf" => Ok(pdf_extract::extract_text(path)?.chars().take(MAX_EXTRACTED_CHARS).collect()),
+        "pdf" => Ok(pdf_extract::extract_text(path)?
+            .chars()
+            .take(MAX_EXTRACTED_CHARS)
+            .collect()),
         #[cfg(not(target_os = "android"))]
         "pdf" => {
             let output = Command::new("pdftotext")

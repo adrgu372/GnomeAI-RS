@@ -1734,7 +1734,19 @@ fn session_history_turns(agent: &Agent) -> Result<Vec<HistoryTurn>> {
                 }
                 out.push(HistoryTurn {
                     role: "user".into(),
-                    text: if turn.content.trim_start().starts_with('[') && serde_json::from_str::<serde_json::Value>(&turn.content).ok().and_then(|v|v.as_array().map(|a|a.iter().any(|p|p["type"]=="image_url"))).unwrap_or(false) {turn.content.clone()} else {provider::user_content_for_display(&turn.content)},
+                    text: if turn.content.trim_start().starts_with('[')
+                        && serde_json::from_str::<serde_json::Value>(&turn.content)
+                            .ok()
+                            .and_then(|v| {
+                                v.as_array()
+                                    .map(|a| a.iter().any(|p| p["type"] == "image_url"))
+                            })
+                            .unwrap_or(false)
+                    {
+                        turn.content.clone()
+                    } else {
+                        provider::user_content_for_display(&turn.content)
+                    },
                 });
             }
             "assistant" => {
@@ -2402,8 +2414,17 @@ async fn device_request(
     let store = core.agent.store.clone();
     let command_key = format!("{peer}:{request_id}");
     // Reject retries before consulting the response cache as well as inside Store.
-    if matches!(action,"prepare_handoff"|"stage_handoff"|"commit_handoff"|"activate_handoff") {
-        let transfer=if action=="stage_handoff" {payload["snapshot"]["transfer_id"].as_str().context("Missing transfer_id")?} else {text("transfer_id")?};
+    if matches!(
+        action,
+        "prepare_handoff" | "stage_handoff" | "commit_handoff" | "activate_handoff"
+    ) {
+        let transfer = if action == "stage_handoff" {
+            payload["snapshot"]["transfer_id"]
+                .as_str()
+                .context("Missing transfer_id")?
+        } else {
+            text("transfer_id")?
+        };
         uuid::Uuid::parse_str(transfer)?;
         store.assert_handoff_not_aborted(transfer)?;
     }
@@ -2411,56 +2432,83 @@ async fn device_request(
         return Ok(response);
     }
     let response = match action {
-        "mesh_start" | "mesh_status" | "mesh_revoke" => return core.mesh.request(action,&payload),
+        "mesh_start" | "mesh_status" | "mesh_revoke" => return core.mesh.request(action, &payload),
         "skills_list" | "skills_inspect" | "skills_install" | "skills_activate" => {
             let workspace = if id.is_empty() {
                 core.agent.workspace.clone()
             } else {
-                store.get_session(id)?.context("Session not found")?.workspace
+                store
+                    .get_session(id)?
+                    .context("Session not found")?
+                    .workspace
             };
             match action {
                 "skills_list" => json!({"skills":skills::discover(&workspace)}),
                 "skills_inspect" => json!({"report":skills::inspect(&workspace,text("name")?)?}),
                 "skills_install" => {
                     let source = text("source")?.to_owned();
-                    let installed = tokio::task::spawn_blocking(move || skills::install(&source,&workspace))
-                        .await.context("Skill installation worker failed")??;
+                    let installed =
+                        tokio::task::spawn_blocking(move || skills::install(&source, &workspace))
+                            .await
+                            .context("Skill installation worker failed")??;
                     json!({"name":installed.name})
                 }
                 _ => {
-                    if id.is_empty() { bail!("Open a local conversation before activating a skill"); }
+                    if id.is_empty() {
+                        bail!("Open a local conversation before activating a skill");
+                    }
                     store.assert_session_writable(id)?;
-                    if active.contains_key(id) { bail!("Wait for the current response before activating a skill"); }
-                    let skill=skills::load(&workspace,text("name")?)?;
-                    let block=skills::render_for_model(&skill);
-                    store.append_turn(id,"system",&block,(block.len()/4) as i64,true)?;
+                    if active.contains_key(id) {
+                        bail!("Wait for the current response before activating a skill");
+                    }
+                    let skill = skills::load(&workspace, text("name")?)?;
+                    let block = skills::render_for_model(&skill);
+                    store.append_turn(id, "system", &block, (block.len() / 4) as i64, true)?;
                     json!({"name":skill.summary.name,"session_id":id})
                 }
             }
         }
         "available_models" => {
-            let mut cfg=core.config_state.read().await.clone();
-            let provider=text("provider_id")?;
-            if provider!=cfg.provider_id {
-                let key=cfg.resolve_provider_api_key(provider,None);
-                let selection=ProviderSelection::from_choice(provider,key,None)?;
-                apply_selection_to_config(&selection,&mut cfg);
+            let mut cfg = core.config_state.read().await.clone();
+            let provider = text("provider_id")?;
+            if provider != cfg.provider_id {
+                let key = cfg.resolve_provider_api_key(provider, None);
+                let selection = ProviderSelection::from_choice(provider, key, None)?;
+                apply_selection_to_config(&selection, &mut cfg);
             }
-            let models=llama::LlamaClient::new().list_models(&cfg).await?;
+            let models = llama::LlamaClient::new().list_models(&cfg).await?;
             json!({"models":models.into_iter().map(|m|m.id).collect::<Vec<_>>()})
         }
-        "capabilities" => return Ok(json!({"protocol":2,"platform":std::env::consts::OS,"web":true,"vision":true,"files":true,"subagents":true,"shell":!cfg!(target_os="android"),"desktop_control":cfg!(target_os="linux"),"tor":true})),
+        "capabilities" => {
+            return Ok(
+                json!({"protocol":2,"platform":std::env::consts::OS,"web":true,"vision":true,"files":true,"subagents":true,"shell":!cfg!(target_os="android"),"desktop_control":cfg!(target_os="linux"),"tor":true}),
+            );
+        }
         "workspace_location" => {
-            let session=store.get_session(id)?.context("No local replica of this session. Move it once before enabling workspace sync.")?;
-            let workspace_id=store.workspace_identity(&session.workspace)?;
-            return Ok(json!({"root":session.workspace,"workspace_id":workspace_id,"busy":active.values().any(|turn|turn.agent.workspace==session.workspace),"status":session.status}));
-        },
+            let session = store.get_session(id)?.context(
+                "No local replica of this session. Move it once before enabling workspace sync.",
+            )?;
+            let workspace_id = store.workspace_identity(&session.workspace)?;
+            return Ok(
+                json!({"root":session.workspace,"workspace_id":workspace_id,"busy":active.values().any(|turn|turn.agent.workspace==session.workspace),"status":session.status}),
+            );
+        }
         "workspace_lock" | "workspace_unlock" => {
-            let session=store.get_session(id)?.context("Session not found")?;
-            if action=="workspace_lock" && active.values().any(|turn|turn.agent.workspace==session.workspace) {bail!("Workspace is in use by an agent");}
-            store.lock_workspace(&session.workspace,text("token")?,action=="workspace_unlock")?;
+            let session = store.get_session(id)?.context("Session not found")?;
+            if action == "workspace_lock"
+                && active
+                    .values()
+                    .any(|turn| turn.agent.workspace == session.workspace)
+            {
+                bail!("Workspace is in use by an agent");
+            }
+            store.lock_workspace(
+                &session.workspace,
+                text("token")?,
+                action == "workspace_unlock",
+            )?;
             return Ok(json!({}));
-        },
+        }
         "list" => {
             let sessions=store.recent_sessions(500)?.into_iter().map(|s|json!({
                 "id":s.id,"title":s.title,"model":s.model,"status":s.status,"updated_at":s.updated_at,
@@ -2672,11 +2720,17 @@ async fn device_request(
             if active.contains_key(&snapshot.session.id) {
                 bail!("Destination session is running");
             }
-            let workspace_id=if snapshot.workspace_id.is_empty(){&snapshot.session.id}else{&snapshot.workspace_id};
+            let workspace_id = if snapshot.workspace_id.is_empty() {
+                &snapshot.session.id
+            } else {
+                &snapshot.workspace_id
+            };
             uuid::Uuid::parse_str(workspace_id)?;
-            let workspace = if let Some(existing)=store.get_session(&snapshot.session.id)? {
+            let workspace = if let Some(existing) = store.get_session(&snapshot.session.id)? {
                 existing.workspace
-            } else {core.app_paths.app_dir.join("workspaces").join(workspace_id)};
+            } else {
+                core.app_paths.app_dir.join("workspaces").join(workspace_id)
+            };
             std::fs::create_dir_all(&workspace)?;
             store.stage_handoff(
                 &snapshot,
@@ -2687,8 +2741,10 @@ async fn device_request(
             json!({"session_id":snapshot.session.id,"persisted":true})
         }
         "abort_handoff" => {
-            if active.contains_key(id) {bail!("Session is running; finish the current turn before discarding the transfer");}
-            store.abort_handoff(text("transfer_id")?,peer,text("session_id")?)?;
+            if active.contains_key(id) {
+                bail!("Session is running; finish the current turn before discarding the transfer");
+            }
+            store.abort_handoff(text("transfer_id")?, peer, text("session_id")?)?;
             json!({"session_id":id,"aborted":true})
         }
         "commit_handoff" | "activate_handoff" => {

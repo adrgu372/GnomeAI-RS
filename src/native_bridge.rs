@@ -96,12 +96,7 @@ pub unsafe extern "C" fn gnomeai_send_json(id: u64, json: *const c_char) -> i32 
 pub extern "C" fn gnomeai_next_event(id: u64) -> *mut c_char {
     std::panic::catch_unwind(|| {
         let core = lookup(id)?;
-        let text = core
-            .events
-            .lock()
-            .ok()?
-            .recv()
-            .ok()?;
+        let text = core.events.lock().ok()?.recv().ok()?;
         CString::new(text).ok().map(CString::into_raw)
     })
     .ok()
@@ -113,7 +108,9 @@ pub extern "C" fn gnomeai_next_event(id: u64) -> *mut c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn gnomeai_interrupt_events(id: u64) {
     let _ = std::panic::catch_unwind(|| {
-        if let Some(core) = lookup(id) { let _ = core.wake.try_send("{}".to_owned()); }
+        if let Some(core) = lookup(id) {
+            let _ = core.wake.try_send("{}".to_owned());
+        }
     });
 }
 

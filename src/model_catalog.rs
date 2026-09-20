@@ -45,11 +45,13 @@ fn models_dev_provider_id(preset_id: &str) -> Option<&str> {
         "gemini" => "google",
         "together" => "togetherai",
         "fireworks" => "fireworks-ai",
-        other => return match other {
-            "deepseek" | "xai" | "mistral" | "groq" | "openrouter" | "perplexity"
-            | "cerebras" | "nvidia" | "cohere" => Some(other),
-            _ => None,
-        },
+        other => {
+            return match other {
+                "deepseek" | "xai" | "mistral" | "groq" | "openrouter" | "perplexity"
+                | "cerebras" | "nvidia" | "cohere" => Some(other),
+                _ => None,
+            };
+        }
     })
 }
 
@@ -80,10 +82,11 @@ fn snapshot() -> Option<&'static Snapshot> {
 fn limits_for(preset_id: &str, model: &str) -> Option<ModelLimits> {
     let provider_id = models_dev_provider_id(preset_id)?;
     let provider = snapshot()?.get(provider_id)?;
-    let entry = provider
-        .models
-        .get(model)
-        .or_else(|| model.rsplit_once('/').and_then(|(_, bare)| provider.models.get(bare)))?;
+    let entry = provider.models.get(model).or_else(|| {
+        model
+            .rsplit_once('/')
+            .and_then(|(_, bare)| provider.models.get(bare))
+    })?;
     entry.limit.clone()
 }
 
@@ -165,7 +168,11 @@ mod tests {
             // Fireworks renamed their DeepSeek line (now v4); the bundled
             // default id predates the rename and falls back to the 128k
             // default until the preset is refreshed.
-            ("fireworks", "accounts/fireworks/models/deepseek-v3p1", false),
+            (
+                "fireworks",
+                "accounts/fireworks/models/deepseek-v3p1",
+                false,
+            ),
             ("perplexity", "sonar-pro", true),
             ("cerebras", "gpt-oss-120b", true),
             ("nvidia", "openai/gpt-oss-120b", true),

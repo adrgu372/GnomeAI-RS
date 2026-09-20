@@ -54,8 +54,12 @@ fn register_mobile(
     registry.register(Arc::new(MobileRead {
         root: root.to_path_buf(),
     }));
-    registry.register(Arc::new(MobileWrite {root:root.to_path_buf()}));
-    registry.register(Arc::new(MobileList {root:root.to_path_buf()}));
+    registry.register(Arc::new(MobileWrite {
+        root: root.to_path_buf(),
+    }));
+    registry.register(Arc::new(MobileList {
+        root: root.to_path_buf(),
+    }));
     registry.register(Arc::new(MobileFetch {
         config: config.clone(),
     }));
@@ -105,57 +109,120 @@ impl Tool for MobileRead {
         Ok(outcome(tokio::fs::read_to_string(path).await?))
     }
 }
-struct MobileWrite {root:PathBuf}
+struct MobileWrite {
+    root: PathBuf,
+}
 #[async_trait::async_trait]
 impl Tool for MobileWrite {
-    fn definition(&self)->ToolDefinition {
+    fn definition(&self) -> ToolDefinition {
         ToolDefinition::workspace_write(ToolSpec {name:"write_file".into(),description:"Create or replace a UTF-8 workspace file, at most 1 MiB. For replacement, supply expected_sha256 from list_files; omit it only for a new file.".into(),parameters:json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":"string"}},"required":["path","content"]})})
     }
-    async fn call(&self,args:Value,cancel:&CancellationToken)->Result<ToolOutcome> {
+    async fn call(&self, args: Value, cancel: &CancellationToken) -> Result<ToolOutcome> {
+        use sha2::{Digest, Sha256};
         use std::io::Write;
-        use sha2::{Digest,Sha256};
-        if cancel.is_cancelled(){bail!("Write interrupted");}
-        let relative=Path::new(args["path"].as_str().context("path required")?);
-        if relative.as_os_str().is_empty() || relative.components().any(|p|!matches!(p,std::path::Component::Normal(_))) {bail!("Use a relative workspace path");}
-        let root=self.root.canonicalize()?;let mut target=root.clone();
+        if cancel.is_cancelled() {
+            bail!("Write interrupted");
+        }
+        let relative = Path::new(args["path"].as_str().context("path required")?);
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|p| !matches!(p, std::path::Component::Normal(_)))
+        {
+            bail!("Use a relative workspace path");
+        }
+        let root = self.root.canonicalize()?;
+        let mut target = root.clone();
         for part in relative.components() {
             target.push(part.as_os_str());
-            if let Ok(meta)=std::fs::symlink_metadata(&target) {if meta.file_type().is_symlink(){bail!("Linked files cannot be edited");}}
+            if let Ok(meta) = std::fs::symlink_metadata(&target) {
+                if meta.file_type().is_symlink() {
+                    bail!("Linked files cannot be edited");
+                }
+            }
         }
-        let content=args["content"].as_str().context("content required")?;
-        if content.len()>1024*1024 {bail!("Text file exceeds 1 MiB");}
-        let expected=args["expected_sha256"].as_str();
+        let content = args["content"].as_str().context("content required")?;
+        if content.len() > 1024 * 1024 {
+            bail!("Text file exceeds 1 MiB");
+        }
+        let expected = args["expected_sha256"].as_str();
         if target.exists() {
-            if target.metadata()?.len()>1024*1024 {bail!("Existing file exceeds 1 MiB");}
-            let current=format!("{:x}",Sha256::digest(std::fs::read(&target)?));
-            if !expected.is_some_and(|h|h.eq_ignore_ascii_case(&current)){bail!("File exists or changed; read/list it and provide its current hash before replacing it");}
-        } else if expected.is_some(){bail!("Expected file is missing");}
-        let parent=target.parent().context("File parent missing")?;std::fs::create_dir_all(parent)?;
-        if !parent.canonicalize()?.starts_with(&root){bail!("File is outside workspace");}
-        let temp=parent.join(format!(".gnomeai-write-{}",uuid::Uuid::new_v4()));
-        let write=(||->Result<()> {
-            let mut options=std::fs::OpenOptions::new();options.write(true).create_new(true);
-            #[cfg(unix)] {use std::os::unix::fs::OpenOptionsExt;options.mode(0o600);}
-            let mut file=options.open(&temp)?;file.write_all(content.as_bytes())?;file.sync_all()?;
-            std::fs::rename(&temp,&target)?;Ok(())
+            if target.metadata()?.len() > 1024 * 1024 {
+                bail!("Existing file exceeds 1 MiB");
+            }
+            let current = format!("{:x}", Sha256::digest(std::fs::read(&target)?));
+            if !expected.is_some_and(|h| h.eq_ignore_ascii_case(&current)) {
+                bail!(
+                    "File exists or changed; read/list it and provide its current hash before replacing it"
+                );
+            }
+        } else if expected.is_some() {
+            bail!("Expected file is missing");
+        }
+        let parent = target.parent().context("File parent missing")?;
+        std::fs::create_dir_all(parent)?;
+        if !parent.canonicalize()?.starts_with(&root) {
+            bail!("File is outside workspace");
+        }
+        let temp = parent.join(format!(".gnomeai-write-{}", uuid::Uuid::new_v4()));
+        let write = (|| -> Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temp, &target)?;
+            Ok(())
         })();
-        if write.is_err(){let _=std::fs::remove_file(&temp);}write?;
-        Ok(ToolOutcome {content:format!("Saved {}",relative.display()),ok:true,touched:vec![target],patches:vec![]})
+        if write.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        write?;
+        Ok(ToolOutcome {
+            content: format!("Saved {}", relative.display()),
+            ok: true,
+            touched: vec![target],
+            patches: vec![],
+        })
     }
 }
-struct MobileList {root:PathBuf}
+struct MobileList {
+    root: PathBuf,
+}
 #[async_trait::async_trait]
 impl Tool for MobileList {
-    fn definition(&self)->ToolDefinition {ToolDefinition::workspace_read(ToolSpec {name:"list_files".into(),description:"List one workspace directory; returns SHA-256 for text-sized files. Use a relative path; default is the workspace root.".into(),parameters:json!({"type":"object","properties":{"path":{"type":"string"}}})})}
-    async fn call(&self,args:Value,_:&CancellationToken)->Result<ToolOutcome> {
-        use sha2::{Digest,Sha256};
-        let root=self.root.canonicalize()?;let path=root.join(args["path"].as_str().unwrap_or(".")).canonicalize()?;
-        if !path.starts_with(&root){bail!("Directory is outside workspace");}
-        let mut rows=Vec::new();
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::workspace_read(ToolSpec {name:"list_files".into(),description:"List one workspace directory; returns SHA-256 for text-sized files. Use a relative path; default is the workspace root.".into(),parameters:json!({"type":"object","properties":{"path":{"type":"string"}}})})
+    }
+    async fn call(&self, args: Value, _: &CancellationToken) -> Result<ToolOutcome> {
+        use sha2::{Digest, Sha256};
+        let root = self.root.canonicalize()?;
+        let path = root
+            .join(args["path"].as_str().unwrap_or("."))
+            .canonicalize()?;
+        if !path.starts_with(&root) {
+            bail!("Directory is outside workspace");
+        }
+        let mut rows = Vec::new();
         for entry in std::fs::read_dir(path)?.take(500) {
-            let entry=entry?;let meta=entry.metadata()?;
-            if entry.file_type()?.is_symlink(){continue;}
-            let hash=if meta.is_file() && meta.len()<=1024*1024 {Some(format!("{:x}",Sha256::digest(std::fs::read(entry.path())?)))}else{None};
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            if entry.file_type()?.is_symlink() {
+                continue;
+            }
+            let hash = if meta.is_file() && meta.len() <= 1024 * 1024 {
+                Some(format!(
+                    "{:x}",
+                    Sha256::digest(std::fs::read(entry.path())?)
+                ))
+            } else {
+                None
+            };
             rows.push(json!({"path":entry.path().strip_prefix(&root)?.to_string_lossy(),"directory":meta.is_dir(),"size":meta.len(),"sha256":hash}));
         }
         Ok(outcome(serde_json::to_string(&rows)?))
