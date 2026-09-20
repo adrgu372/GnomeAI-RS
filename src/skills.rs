@@ -1066,7 +1066,8 @@ mod tests {
         fs::create_dir(root.join("target")).unwrap();
         fs::write(root.join("target/unrelated"), "build output").unwrap();
         let prepared = prepare_source("SKILL.md", &root).unwrap();
-        assert_eq!(prepared.source, root.join("SKILL.md").to_string_lossy());
+        let expected_source = fs::canonicalize(root.join("SKILL.md")).unwrap();
+        assert_eq!(prepared.source, expected_source.to_string_lossy());
         let source_root = locate_skill_root(&prepared.root).unwrap();
         assert_eq!(
             load_skill_dir(&source_root, "source").unwrap().summary.name,
