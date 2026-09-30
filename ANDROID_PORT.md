@@ -109,6 +109,20 @@ temporară și trebuie oferită numai dispozitivului pe care vrei să-l împerec
 5. Când vizualizezi o conversație remote, Send, Stop și aprobările se referă la
    acea sesiune. Deschiderea ei nu schimbă sesiunea afișată local de gazdă.
 
+## Fișierele produse pe telefon
+
+Android ascunde directorul privat al aplicației de managerul de fișiere și de
+selectorul de sistem, deci fișierele create de agent nu pot fi deschise direct.
+Fila **Files** listează `workspace`, `workspaces`, `generated`,
+`store/tool_outputs` și `uploads`, plus spațiul de lucru al conversației
+raportat de nucleu. Orice cale vizitată trebuie să rămână în interiorul
+rădăcinii alese, iar legăturile simbolice sunt ignorate.
+
+Pentru un fișier: previzualizare text, **Export a copy…** prin selectorul de
+salvare al sistemului și **Share with another app…** printr-un URI
+`content://` de numai citire al aplicației. Copia temporară din cache se șterge
+la următoarea partajare.
+
 Nu există scanner de cameră integrat. Codul text este alternativa disponibilă
 în aplicație. Pe Android, rularea locală și conexiunea peer sunt legate de
 procesul aplicației; acest preview nu implementează serviciu Android foreground
@@ -161,6 +175,11 @@ nu se mută. Destinația folosește propriul director `workspace`.
   OCR în această implementare. Răspunsul la imagini depinde de modelul ales.
 - Vizualizarea mobilă folosește text simplu pentru istoric și reasoning;
   formatarea Markdown avansată a desktopului nu a fost portată aici.
+- Directorul de lucru este în spațiul privat al aplicației, inaccesibil pentru
+  managerul de fișiere al telefonului. Rădăcina reală este
+  `/data/data/io.github.adrgu372.gnomeai/files/workspace`; fișierele scrise de
+  agent se văd, se previzualizează, se exportă și se trimit altor aplicații din
+  fila **Files** a aplicației.
 - Skills din workspace pot fi citite ca instrucțiuni. Nu există manager mobil
   complet de instalare și actualizare. MCP HTTP rămâne în nucleu, dar editorul
   complet de configurare MCP nu este inclus în interfața mobilă compactă.

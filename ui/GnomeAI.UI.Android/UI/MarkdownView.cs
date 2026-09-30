@@ -7,6 +7,7 @@ using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Styling;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
 
 using GnomeAI.Client;
 
@@ -30,12 +31,15 @@ public sealed class MarkdownView : UserControl
     private IBrush QuoteBrush => Brush.Parse(IsDark ? "#60CDFF" : "#4C8DCE");
     private IBrush TableHeaderBrush => Brush.Parse(IsDark ? "#343434" : "#EDF2F7");
     private IBrush TableCellBrush => Brush.Parse(IsDark ? "#2B2B2B" : "#FFFFFF");
+    /// Selection and caret colours, shared by every text block of the reply.
+    private IBrush SelectionBrush => Brush.Parse(IsDark ? "#3F6E8C" : "#B9D9F0");
+    private IBrush CaretBrush => Brush.Parse(IsDark ? "#EAF4EF" : "#172B23");
     private readonly StackPanel _content = new() { Spacing = 7 };
     private readonly DispatcherTimer _renderTimer = new() { Interval = TimeSpan.FromMilliseconds(50) };
     private string _renderedMarkdown = "";
     private bool _streaming;
     private readonly StackPanel _streamPanel=new(){Spacing=0};
-    private TextBlock _streamTail=new(){TextWrapping=TextWrapping.Wrap};
+    private SelectableTextView _streamTail=null!;
     private string _streamRendered="";
     private int _streamCommitted;
     public bool IsStreaming {
@@ -43,34 +47,55 @@ public sealed class MarkdownView : UserControl
         set{if(_streaming==value)return;_streaming=value;_renderedMarkdown="\0";QueueRebuild();}
     }
     private bool _renderedDark;
+    /// Set when a rebuild was skipped because the user is selecting text.
+    private bool _rebuildPending;
     private readonly StackPanel _root=new() {Spacing=8};
-    private bool _selectingText;
-    private Action? _closeSelection;
-    public bool IsSelectingText=>_selectingText;
+    /// True while any block holds a selection. Callers use this to defer
+    /// transcript refreshes instead of wiping the user's highlighted text. A
+    /// caret alone does not count: it would otherwise block live updates forever
+    /// after a single tap.
+    public bool IsSelectingText=>Blocks().Any(block=>block.HasSelection);
+    /// Highlighted text of this reply, in reading order. The blocks are separate,
+    /// so the caller needs the union rather than one block's fragment.
+    public string SelectedText=>
+        string.Join("\n",Blocks().Select(block=>block.SelectedText).Where(text=>!string.IsNullOrEmpty(text)));
+    /// The reply's plain text, used when the whole conversation is copied.
+    public string PlainText=>string.Join("\n\n",Blocks().Select(block=>block.Text??"").Where(text=>text.Length>0));
     public event EventHandler? SelectionModeChanged;
     public event EventHandler? ContentUpdated;
 
     public MarkdownView()
     {
         _root.Children.Add(_content);Content=_root;_root.IsVisible=false;
-        Avalonia.Input.Gestures.SetIsHoldingEnabled(this,true);
-        AddHandler(Avalonia.Input.Gestures.HoldingEvent,(_,args)=>{
-            if(args.HoldingState!=Avalonia.Input.HoldingState.Started || string.IsNullOrEmpty(Markdown))return;
-            args.Handled=true;BeginSelection(Markdown);
-        },Avalonia.Interactivity.RoutingStrategies.Bubble,true);
         _renderTimer.Tick+=(_,_)=>{_renderTimer.Stop();RebuildNow();};
         ActualThemeVariantChanged+=(_,_)=>QueueRebuild();
     }
-    private void BeginSelection(string text)
+
+    /// Selection lives in the transcript itself, so a refresh must wait until the
+    /// caret and any highlight are released. A rebuild skipped meanwhile is
+    /// applied here, so streaming text is never lost.
+    public void EndSelection()
     {
-        if(_selectingText)return;
-        _selectingText=true;SelectionModeChanged?.Invoke(this,EventArgs.Empty);
-        // The Android selection view owns its frozen text until dismissed.
-        _closeSelection=NativeTextSelection.Show(text,IsDark,()=>{
-            _closeSelection=null;_selectingText=false;RebuildNow();SelectionModeChanged?.Invoke(this,EventArgs.Empty);
-        });
-        if(_closeSelection is null){_selectingText=false;SelectionModeChanged?.Invoke(this,EventArgs.Empty);}
+        ClearBlockSelection();
+        if(!_rebuildPending)return;
+        _rebuildPending=false;
+        _renderedMarkdown="\0";
+        RebuildNow();
     }
+
+    /// The selectable text blocks of this reply, in visual order.
+    private IEnumerable<SelectableTextView> Blocks()=>
+        _content.GetVisualDescendants().OfType<SelectableTextView>();
+    private void ClearBlockSelection()
+    {
+        foreach(var block in Blocks())block.ClearSelection();
+    }
+    private void TrackSelection(SelectableTextView block)
+    {
+        block.SelectionChanged+=OnBlockSelectionChanged;
+    }
+    private void OnBlockSelectionChanged(object? sender,EventArgs args)=>
+        SelectionModeChanged?.Invoke(this,EventArgs.Empty);
 
     public string Markdown
     {
@@ -85,33 +110,48 @@ public sealed class MarkdownView : UserControl
             QueueRebuild();
     }
 
-    public void EndSelection()=>_closeSelection?.Invoke();
-
     private void QueueRebuild()
     {
-        if(_selectingText)return;
+        // Replacing the text while a word is highlighted would drop the selection
+        // under the user's finger; remember that a rebuild is owed instead.
+        if(IsSelectingText){_rebuildPending=true;return;}
         if(_streaming)RebuildNow();
         else if(!_renderTimer.IsEnabled)_renderTimer.Start();
     }
 
     private void UpdateStream(string text)
     {
+        if(_streamTail is null) {
+            _content.Children.Clear();_streamPanel.Children.Clear();_content.Children.Add(_streamPanel);
+            _streamTail=StreamBlock();_streamPanel.Children.Add(_streamTail);_streamCommitted=0;
+        }
         if(_content.Children.Count!=1 || _content.Children[0]!=_streamPanel || !text.StartsWith(_streamRendered,StringComparison.Ordinal)) {
             _content.Children.Clear();_streamPanel.Children.Clear();_content.Children.Add(_streamPanel);
-            _streamTail=new TextBlock {TextWrapping=TextWrapping.Wrap};_streamPanel.Children.Add(_streamTail);_streamCommitted=0;
+            _streamTail=StreamBlock();_streamPanel.Children.Add(_streamTail);_streamCommitted=0;
         }
         // Completed paragraphs remain untouched while only the trailing paragraph grows.
         int split;
         while((split=text.IndexOf("\n\n",_streamCommitted,StringComparison.Ordinal))>=0) {
             _streamTail.Text=text[_streamCommitted..split];_streamTail.Margin=new Thickness(0,0,0,12);
-            _streamCommitted=split+2;_streamTail=new TextBlock {TextWrapping=TextWrapping.Wrap};_streamPanel.Children.Add(_streamTail);
+            _streamCommitted=split+2;_streamTail=StreamBlock();_streamPanel.Children.Add(_streamTail);
         }
         _streamTail.Text=text[_streamCommitted..];_streamRendered=text;
+    }
+    /// The trailing paragraph of live output, selectable like finished text.
+    private SelectableTextView StreamBlock()
+    {
+        var block=new SelectableTextView {
+            TextWrapping=TextWrapping.Wrap,FontSize=14,
+            SelectionBrush=SelectionBrush,CaretBrush=CaretBrush,
+        };
+        TrackSelection(block);
+        return block;
     }
 
     private void RebuildNow()
     {
-        if(_selectingText)return;
+        // Rebinding text while the user is selecting would drop the highlight.
+        if(IsSelectingText)return;
         var text = Markdown ?? "";
         _root.IsVisible=text.Length>0;
         var dark = IsDark;
@@ -160,14 +200,18 @@ public sealed class MarkdownView : UserControl
             if (TryHeading(trimmed, out var level, out var heading))
             {
                 FlushParagraph();
-                _content.Children.Add(new TextBlock
+                var headingBlock = new SelectableTextView
                 {
                     Text = CleanInline(heading),
                     FontSize = level switch { 1 => 23, 2 => 19, 3 => 16, _ => 14 },
                     FontWeight = level <= 2 ? FontWeight.SemiBold : FontWeight.Medium,
                     TextWrapping = TextWrapping.Wrap,
                     Margin = new Thickness(0, level == 1 ? 5 : 3, 0, 1),
-                });
+                    SelectionBrush = SelectionBrush,
+                    CaretBrush = CaretBrush,
+                };
+                TrackSelection(headingBlock);
+                _content.Children.Add(headingBlock);
                 index++;
                 continue;
             }
@@ -198,12 +242,15 @@ public sealed class MarkdownView : UserControl
             {
                 FlushParagraph();
                 var quote = trimmed.TrimStart('>', ' ');
-                var body = new TextBlock
+                var body = new SelectableTextView
                 {
                     Text = CleanInline(quote),
                     TextWrapping = TextWrapping.Wrap,
                     Foreground = MutedBrush,
+                    SelectionBrush = SelectionBrush,
+                    CaretBrush = CaretBrush,
                 };
+                TrackSelection(body);
                 _content.Children.Add(new Border
                 {
                     BorderBrush = QuoteBrush,
@@ -220,7 +267,12 @@ public sealed class MarkdownView : UserControl
                 FlushParagraph();
                 var row = new Grid { ColumnDefinitions = new ColumnDefinitions("Auto,*"), ColumnSpacing = 8 };
                 row.Children.Add(new TextBlock { Text = marker, Foreground = MutedBrush });
-                var itemText = new TextBlock { Text = CleanInline(item), TextWrapping = TextWrapping.Wrap };
+                var itemText = new SelectableTextView
+                {
+                    Text = CleanInline(item), TextWrapping = TextWrapping.Wrap,
+                    SelectionBrush = SelectionBrush, CaretBrush = CaretBrush,
+                };
+                TrackSelection(itemText);
                 Grid.SetColumn(itemText, 1);
                 row.Children.Add(itemText);
                 _content.Children.Add(row);
@@ -245,13 +297,16 @@ public sealed class MarkdownView : UserControl
 
     private void AddSelectable(string text, bool wrap)
     {
-        var block = new TextBlock
+        var block = new SelectableTextView
         {
             Text = CleanInline(text),
             TextWrapping = wrap ? TextWrapping.Wrap : TextWrapping.NoWrap,
             FontSize = 14,
             HorizontalAlignment = HorizontalAlignment.Stretch,
+            SelectionBrush = SelectionBrush,
+            CaretBrush = CaretBrush,
         };
+        TrackSelection(block);
         _content.Children.Add(block);
     }
 
@@ -268,13 +323,16 @@ public sealed class MarkdownView : UserControl
         });
 
 
-        var codeBlock = new TextBlock
+        var codeBlock = new SelectableTextView
         {
             Text = code,
             TextWrapping = TextWrapping.NoWrap,
             FontFamily = new FontFamily("monospace"),
             FontSize = 13,
+            SelectionBrush = SelectionBrush,
+            CaretBrush = CaretBrush,
         };
+        TrackSelection(codeBlock);
         var scroll = new ScrollViewer
         {
             HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
@@ -309,18 +367,22 @@ public sealed class MarkdownView : UserControl
             for (var column = 0; column < columns; column++)
             {
                 var cell = column < rows[row].Length ? CleanInline(rows[row][column]) : "";
+                var cellText = new SelectableTextView
+                {
+                    Text = cell,
+                    TextWrapping = TextWrapping.Wrap,
+                    FontWeight = row == 0 ? FontWeight.SemiBold : FontWeight.Normal,
+                    SelectionBrush = SelectionBrush,
+                    CaretBrush = CaretBrush,
+                };
+                TrackSelection(cellText);
                 var border = new Border
                 {
                     Background = row == 0 ? TableHeaderBrush : TableCellBrush,
                     BorderBrush = MarkdownBorderBrush,
                     BorderThickness = new Thickness(0.5),
                     Padding = new Thickness(8, 6),
-                    Child = new TextBlock
-                    {
-                        Text = cell,
-                        TextWrapping = TextWrapping.Wrap,
-                        FontWeight = row == 0 ? FontWeight.SemiBold : FontWeight.Normal,
-                    },
+                    Child = cellText,
                 };
                 Grid.SetRow(border, row);
                 Grid.SetColumn(border, column);

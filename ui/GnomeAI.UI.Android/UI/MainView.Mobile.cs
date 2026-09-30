@@ -28,6 +28,7 @@ public sealed partial class MainView
         var geometry=name switch {
             "camera"=>"M4 7H8L10 4H14L16 7H20V20H4Z M16 13A4 4 0 1 1 8 13A4 4 0 1 1 16 13Z",
             "files"=>"M21.44 11.05L12.25 20.24A6 6 0 0 1 3.76 11.75L12.95 2.56A4 4 0 0 1 18.61 8.22L9.41 17.41A2 2 0 0 1 6.58 14.58L15.07 6.1",
+            "folder"=>"M3 6A2 2 0 0 1 5 4H10L12 7H19A2 2 0 0 1 21 9V18A2 2 0 0 1 19 20H5A2 2 0 0 1 3 18Z",
             "chat"=>"M4 4H20V17H9L4 21Z M8 9H16 M8 13H13",
             "chats"=>"M6 3H21V15H17 M3 7H17V19H8L3 22Z",
             "devices"=>"M2 4H15V14H2Z M5 19H12 M9 14V19 M17 8H23V21H17Z M19 18H21",
@@ -84,11 +85,15 @@ public sealed partial class MainView
         _composeSurface=new Border {Child=compose,Padding=new Thickness(10),Margin=new Thickness(14,4,14,10),CornerRadius=new CornerRadius(24),
             Background=Ink("#1B282E"),BorderThickness=new Thickness(1),BorderBrush=Ink("#31433B")};
         Grid.SetRow(_composeSurface,3);root.Children.Add(_composeSurface);
-        var navigation=_bottomNavigation=new Grid {ColumnDefinitions=new ColumnDefinitions("*,*,*,*"),ColumnSpacing=4,Margin=new Thickness(12,0,12,10)};
+        // Copying happens in the conversation itself: the floating bar appears over
+        // the transcript as soon as text is selected, and no second screen is opened.
+        Grid.SetRow(BuildCopyBar(),2);root.Children.Add(_copyBar!);
+        var navigation=_bottomNavigation=new Grid {ColumnDefinitions=new ColumnDefinitions("*,*,*,*,*"),ColumnSpacing=4,Margin=new Thickness(12,0,12,10)};
         AddTab(navigation,0,"Chat","chat",async()=>{ShowTranscript();if(_session.Length>0)await RefreshCurrentAsync();else{_messages.Children.Clear();_messages.Children.Add(Welcome());}});
         AddTab(navigation,1,"Chats","chats",ShowChatsAsync);
         AddTab(navigation,2,"Devices","devices",()=>{ShowDevices();return Task.CompletedTask;});
-        AddTab(navigation,3,"Settings","settings",ShowSettingsAsync);
+        AddTab(navigation,3,"Files","folder",()=>ShowFilesAsync());
+        AddTab(navigation,4,"Settings","settings",ShowSettingsAsync);
         Grid.SetRow(navigation,4);root.Children.Add(navigation);return root;
     }
     private void AddTab(Grid host,int column,string label,string icon,Func<Task> action)

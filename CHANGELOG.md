@@ -1,3 +1,20 @@
+# GnomeAI-RS unreleased
+
+## Android: reach the files the agent creates
+
+- New **Files** tab in the Android app. The coding workspace lives in the
+  application's private directory, which no file manager or system picker can
+  open under Android scoped storage, so generated files could not be retrieved
+  from the phone before. The panel browses `workspace`, `workspaces`,
+  `generated`, `store/tool_outputs` and `uploads`, plus the conversation
+  workspace reported by the core, and it refuses any path outside the selected
+  root.
+- Per-file actions: text preview, **Export a copy…** through the system save
+  picker, and **Share with another app…** through a read-only `content://` URI
+  served by a second non-exported `ShareFileProvider` limited to `cache/share/`.
+  Temporary share copies are deleted on the next share.
+- Android app: versionCode **19**.
+
 # GnomeAI-RS 3.1-2 - 2026-09-19
 
 ## Numeric reasoning effort, new icon, Android transport and battery fixes

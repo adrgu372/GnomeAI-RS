@@ -322,6 +322,31 @@ The Rust core is built for `aarch64-linux-android` with 16 KiB page
 compatibility (`-C link-arg=-Wl,-z,max-page-size=16384`) and linked into the
 App as `libgnomeai_core.so`.
 
+### Getting files off the phone
+
+On Android the coding workspace is the application's private directory
+(`/data/data/io.github.adrgu372.gnomeai/files/workspace`). No file manager and
+no system picker can open it, because Android scoped storage only exposes an
+app's cache and external directories. Everything the agent writes on the phone
+therefore stays inside the app by design.
+
+The **Files** tab in the Android app browses it:
+
+- it lists the app's `workspace`, `workspaces` (moved sessions), `generated`,
+  `store/tool_outputs` and `uploads` folders, plus the conversation's workspace
+  as reported by the core;
+- every visited path must stay inside the selected root, and symlinks are
+  skipped, so the browser cannot escape into application state;
+- text and source files can be previewed in place;
+- **Export a copy…** writes the file to a folder you choose through the system
+  save picker (Downloads, Drive, another app's folder);
+- **Share with another app…** hands one file to another application through a
+  read-only `content://` URI belonging to the app, and the temporary copy in the
+  cache is deleted on the next share.
+
+The panel exists only on Android, where the private directory is otherwise
+unreachable. On the desktop the same folders are ordinary directories.
+
 ## Providers
 
 The built-in catalog includes:

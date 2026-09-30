@@ -34,7 +34,12 @@ public sealed partial class MainView : UserControl, IDisposable
     private bool _devicesVisible, _running;
     private PeerLink? _observedPeer;
     private bool _observedOnline;
-    private readonly TextBlock _thinking=new() { TextWrapping=TextWrapping.Wrap,Opacity=.65,FontSize=12 };
+    private readonly SelectableTextView _thinking=new() { TextWrapping=TextWrapping.Wrap,Opacity=.65,FontSize=12 };
+    /// Floating copy bar shown over the transcript while text is selected.
+    private Border? _copyBar;
+    private Button? _copyButton;
+    private Button? _copyAllButton;
+    private Func<string>? _selectionSource;
     private readonly Button _send=new() { Content="Send" };
     private string _session="", _epoch="";
     private long _revision;
@@ -49,7 +54,9 @@ public sealed partial class MainView : UserControl, IDisposable
     public MainView(DeviceHub hub,string home,Func<Task<string?>>? capturePhoto=null,Func<Task<string?>>? scanQr=null)
     {
         _hub=hub; _home=home;_reasoning.Content=_thinking;_capturePhoto=capturePhoto;BuildAttachmentCard();
-        _live.SelectionModeChanged+=SelectionModeChanged;
+        // The live reply is a Markdown view like any other, so selecting text in it
+        // must raise the copy bar too.
+        _live.SelectionModeChanged+=OnReplySelectionChanged;
         _scanQr=scanQr;Content=BuildMobileLayout();InitializeTranscript();
         TopLevel.SetAutoSafeAreaPadding(this,false);
         MobileHost.InsetsChanged+=ApplyWindowInsets;ApplyWindowInsets(MobileHost.Insets,MobileHost.KeyboardVisible);
@@ -111,6 +118,10 @@ public sealed partial class MainView : UserControl, IDisposable
         var kind=message.GetProperty("event").GetString();
         if(kind=="ui_config") _config=message.Clone();
         if(kind is "ready" or "provider_changed")AcceptModelUpdate(message);
+        // The core reports the local workspace on every `ready`; the Files panel
+        // browses it so files the agent creates are reachable from the phone.
+        if(kind=="ready" && message.TryGetProperty("workspace",out var workspace) && workspace.GetString() is {Length:>0} root)
+            _conversationWorkspace=root;
         if(kind=="ready" && Selected is null && _session.Length==0)
         { _session=message.GetProperty("session_id").GetString()!;_refreshTimer.Start(); }
         if(kind is "error" or "notice") _status.Text=message.GetProperty("message").GetString();
@@ -206,8 +217,8 @@ public sealed partial class MainView : UserControl, IDisposable
         card.Children.Add(Button("Deny",()=>Decide("deny")));
         _approvalPanel.Children.Add(card);
     }
-    private void ShowPanel() { _settingsGeneration++; if(_composeSurface is not null)_composeSurface.IsVisible=false; _devicesVisible=false;_chatsVisible=false;_panel.Children.Clear();_panelScroll.IsVisible=true;_scroll.IsVisible=false; }
-    private void ShowTranscript() { _settingsGeneration++; if(_composeSurface is not null)_composeSurface.IsVisible=true;SelectTab("Chat"); _devicesVisible=false;_chatsVisible=false;_panelScroll.IsVisible=false;_scroll.IsVisible=true; }
+    private void ShowPanel() { _settingsGeneration++; if(_composeSurface is not null)_composeSurface.IsVisible=false; _devicesVisible=false;_chatsVisible=false;_panel.Children.Clear();_panelScroll.IsVisible=true;_scroll.IsVisible=false;if(_copyBar is not null)_copyBar.IsVisible=false; }
+    private void ShowTranscript() { _settingsGeneration++; if(_composeSurface is not null)_composeSurface.IsVisible=true;SelectTab("Chat"); _devicesVisible=false;_chatsVisible=false;_panelScroll.IsVisible=false;_scroll.IsVisible=true;RefreshCopyBar(); }
     private async Task ShowChatsAsync()
     {
         var link=Selected;var generation=_viewGeneration;
@@ -250,11 +261,23 @@ public sealed partial class MainView : UserControl, IDisposable
         _refreshAgain=false;_refreshTimer.Stop();
         foreach(var view in _messages.GetVisualDescendants().OfType<MarkdownView>().ToArray())view.EndSelection();
         _live.EndSelection();
+        _thinking.ClearSelection();
+        _selectionSource=null;
+        RefreshCopyBar();
     }
-    private bool SelectingResponse()=>NativeTextSelection.IsOpen || _messages.GetVisualDescendants().OfType<MarkdownView>().Any(view=>view.IsSelectingText);
+    /// True while any visible transcript text holds a selection. Historical
+    /// "Thinking" blocks are plain selectable views outside MarkdownView, so they
+    /// are counted here too — otherwise a selection there would never raise the
+    /// copy bar.
+    private bool SelectingResponse()
+    {
+        if(_messages.GetVisualDescendants().OfType<MarkdownView>().Any(view=>view.IsSelectingText))return true;
+        return _messages.GetVisualDescendants().OfType<SelectableTextView>()
+            .Any(block=>block.HasSelection && block.IsEffectivelyVisible);
+    }
     private void SelectionModeChanged(object? sender,EventArgs args) {if(_refreshAgain && !SelectingResponse())_refreshTimer.Start();}
     private MarkdownView ReplyView(string text) {
-        var view=new MarkdownView {Markdown=text};view.SelectionModeChanged+=SelectionModeChanged;view.ContentUpdated+=(_,_)=>QueueTranscriptScroll();return view;
+        var view=new MarkdownView {Markdown=text};view.SelectionModeChanged+=OnReplySelectionChanged;view.ContentUpdated+=(_,_)=>QueueTranscriptScroll();return view;
     }
     private async Task RefreshCurrentAsync()
     {
@@ -330,6 +353,7 @@ public sealed partial class MainView : UserControl, IDisposable
         ShowPanel();_panel.Children.Add(new TextBlock {Text="GnomeAI",FontSize=28,FontWeight=FontWeight.SemiBold});
         _panel.Children.Add(Button("＋ New conversation",NewAsync));_panel.Children.Add(Button("Conversations",ShowChatsAsync));
         _panel.Children.Add(Button("Paired devices",()=>{ShowDevices();return Task.CompletedTask;}));
+        _panel.Children.Add(Button("Files on this phone",()=>ShowFilesAsync()));
         _panel.Children.Add(Button("AI settings",ShowSettingsAsync));return Task.CompletedTask;
     }
     private Task ShowConversationMenuAsync() {

@@ -8,6 +8,8 @@
 /dist/
 /ui/**/bin/
 /ui/**/obj/
+/tests/**/bin/
+/tests/**/obj/
 __pycache__/
 *.pyc
 descriere

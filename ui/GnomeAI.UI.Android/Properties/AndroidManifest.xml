@@ -11,6 +11,9 @@
     <provider android:name="io.github.adrgu372.gnomeai.CameraFileProvider" android:authorities="io.github.adrgu372.gnomeai.camera" android:exported="false" android:grantUriPermissions="true">
       <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/camera_paths" />
     </provider>
+    <provider android:name="io.github.adrgu372.gnomeai.ShareFileProvider" android:authorities="io.github.adrgu372.gnomeai.share" android:exported="false" android:grantUriPermissions="true">
+      <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/share_paths" />
+    </provider>
     <service android:name="io.github.adrgu372.gnomeai.DeviceService" android:exported="false" android:foregroundServiceType="specialUse">
       <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User-started AI agent execution and encrypted peer-device session availability" />
     </service>

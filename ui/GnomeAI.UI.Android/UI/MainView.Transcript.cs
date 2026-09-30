@@ -5,12 +5,14 @@ using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
+using Orientation = Avalonia.Layout.Orientation;
 
 namespace GnomeAI.Android.UI;
 
 public sealed partial class MainView
 {
-    private sealed record HistoryRow(string Role,string Text,Control Bubble,Expander? Thinking,TextBlock? ThinkingText);
+    private sealed record HistoryRow(string Role,string Text,Control Bubble,Expander? Thinking,SelectableTextView? ThinkingText);
     private readonly List<HistoryRow> _historyRows=[];
     private readonly StackPanel _historyPanel=new(){Spacing=20};
     private readonly StackPanel _approvalPanel=new(){Spacing=12};
@@ -23,6 +25,10 @@ public sealed partial class MainView
     private void InitializeTranscript()
     {
         _thinkingStore=new MobileThinkingStore(_home);_reasoning.Header="Thinking";
+        var dark=ActualThemeVariant==Avalonia.Styling.ThemeVariant.Dark;
+        _thinking.SelectionBrush=Ink(dark?"#3F6E8C":"#B9D9F0");
+        _thinking.CaretBrush=Ink(dark?"#EAF4EF":"#172B23");
+        _thinking.SelectionChanged+=(_,_)=>OnSelectionChanged(_thinking);
         _scroll.BringIntoViewOnFocusChange=false;
         _scroll.ScrollChanged+=(_,e)=>{
             if(_applyingScroll)return;
@@ -31,15 +37,60 @@ public sealed partial class MainView
         };
         _messages.LayoutUpdated+=(_,_)=>ApplyTranscriptScroll();
         _live.ContentUpdated+=(_,_)=>QueueTranscriptScroll();
-        AttachTextSelection(_thinking,()=>_thinking.Text??"");
     }
-    private void AttachTextSelection(Control target,Func<string> read)
+    /// A transcript text block with touch selection and a visible caret. Every
+    /// place the transcript shows model or user text uses this, so text behaves
+    /// the same everywhere on the phone.
+    private SelectableTextView Selectable(string? text,double fontSize=14)
     {
-        Gestures.SetIsHoldingEnabled(target,true);
-        target.AddHandler(Gestures.HoldingEvent,(_,e)=>{
-            if(e.HoldingState!=HoldingState.Started || string.IsNullOrEmpty(read()))return;
-            e.Handled=true;NativeTextSelection.Show(read(),ActualThemeVariant==Avalonia.Styling.ThemeVariant.Dark,()=>{SelectionModeChanged(this,EventArgs.Empty);QueueTranscriptScroll();});
-        },Avalonia.Interactivity.RoutingStrategies.Bubble,true);
+        var dark=ActualThemeVariant==Avalonia.Styling.ThemeVariant.Dark;
+        var block=new SelectableTextView {
+            Text=text??"",TextWrapping=TextWrapping.Wrap,FontSize=fontSize,
+            SelectionBrush=Ink(dark?"#3F6E8C":"#B9D9F0"),
+            CaretBrush=Ink(dark?"#EAF4EF":"#172B23"),
+        };
+        block.SelectionChanged+=(_,_)=>{OnSelectionChanged(block);};
+        return block;
+    }
+    /// A selection anywhere in the conversation raises the floating copy bar in
+    /// place, so the user never leaves the chat to copy text.
+    private void OnSelectionChanged(SelectableTextView block)
+    {
+        if(!block.HasSelection) {
+            SelectionModeChanged(this,EventArgs.Empty);
+            QueueTranscriptScroll();
+            RefreshCopyBar();
+            return;
+        }
+        var captured=block;
+        _selectionSource=()=>captured.SelectedText;
+        SelectionModeChanged(this,EventArgs.Empty);
+        RefreshCopyBar();
+    }
+    /// Selection inside a reply. `MarkdownView` keeps its text in several blocks,
+    /// so the whole reply is asked for the union instead of one fragment.
+    private void OnReplySelectionChanged(object? sender,EventArgs args)
+    {
+        var view=sender as MarkdownView;
+        if(view is null)return;
+        if(view.IsSelectingText) {
+            var captured=view;
+            _selectionSource=()=>captured.SelectedText;
+        }
+        SelectionModeChanged(this,EventArgs.Empty);
+        RefreshCopyBar();
+    }
+    /// Shows the bar only while something is selected, and never over the composer.
+    private void RefreshCopyBar()
+    {
+        if(_copyBar is null)return;
+        var hasSelection=SelectingResponse();
+        _copyBar.IsVisible=hasSelection && _scroll.IsVisible && !_disposed;
+        if(!hasSelection)return;
+        // Once a selection exists the whole conversation can be copied too, even
+        // though only one block is highlighted.
+        if(_copyButton is not null)_copyButton.Content="Copy";
+        if(_copyAllButton is not null)_copyAllButton.Content="Copy everything";
     }
     private void QueueTranscriptScroll(bool forceEnd=false)
     {
@@ -49,6 +100,77 @@ public sealed partial class MainView
         // Background priority runs after pending measure/arrange; LayoutUpdated
         // also reapplies when the final Markdown has acquired its real height.
         Dispatcher.UIThread.Post(ApplyTranscriptScroll,DispatcherPriority.Background);
+    }
+
+    /// The in-conversation copy bar. It overlays the transcript and only appears
+    /// while text is selected, so copying never opens a separate screen.
+    private Control BuildCopyBar()
+    {
+        var row=new StackPanel {Orientation=Orientation.Horizontal,Spacing=8};
+        _copyButton=Button("Copy",async()=>{
+            var text=_selectionSource?.Invoke()??"";
+            if(text.Length==0)return;
+            await CopyAsync(text);
+            _copyButton!.Content="Copied";
+            await Task.Delay(1100);
+            if(!_disposed)_copyButton!.Content="Copy";
+        });
+        _copyAllButton=Button("Copy everything",async()=>{
+            var text=ConversationText();
+            if(text.Length==0)return;
+            await CopyAsync(text);
+            _copyAllButton!.Content="Copied";
+            await Task.Delay(1100);
+            if(!_disposed)_copyAllButton!.Content="Copy everything";
+        });
+        row.Children.Add(_copyButton);
+        row.Children.Add(_copyAllButton);
+        row.Children.Add(Button("Done",()=>{EndResponseSelection();return Task.CompletedTask;}));
+        _copyBar=new Border {
+            Child=row,IsVisible=false,
+            Background=Ink("#1B282E"),BorderBrush=Ink("#31433B"),BorderThickness=new Thickness(1),
+            CornerRadius=new CornerRadius(18),Padding=new Thickness(10,8),
+            HorizontalAlignment=HorizontalAlignment.Center,VerticalAlignment=VerticalAlignment.Bottom,
+            Margin=new Thickness(16,0,16,10),
+        };
+        return _copyBar;
+    }
+    /// Everything said in the conversation, in reading order, as plain text.
+    /// Reasoning and approval panels are deliberately excluded: they are model
+    /// working notes, not the conversation the user is reading.
+    private string ConversationText()
+    {
+        var blocks=new List<string>();
+        // Reading order: history, live reasoning, then the reply being streamed.
+        foreach(var root in new Control[] {_historyPanel,_reasoning,_live})Collect(root,blocks);
+        return blocks.Count==0?"":string.Join("\n\n",blocks);
+    }
+    /// Depth-first walk, so the copy reads in the same order as the transcript.
+    /// A node that owns its own text is collected and not descended into, which
+    /// both preserves order and avoids emitting the same reply twice. The roots
+    /// themselves are checked because the live reply is a reply, not a container.
+    private static void Collect(Visual node,List<string> blocks)
+    {
+        if(node is MarkdownView reply) {
+            // Replies keep their text in several blocks, so the view is asked for
+            // the whole thing rather than the fragments underneath.
+            if(reply.IsEffectivelyVisible && reply.PlainText.Length>0)blocks.Add(reply.PlainText);
+            return;
+        }
+        if(node is SelectableTextView text) {
+            // Only what the user can see: a collapsed "Thinking" expander must not
+            // leak its text into the copied conversation.
+            if(text.IsEffectivelyVisible && !string.IsNullOrEmpty(text.Text))blocks.Add(text.Text!);
+            return;
+        }
+        foreach(var child in node.GetVisualChildren()) {
+            Collect(child,blocks);
+        }
+    }
+    private async Task CopyAsync(string text)
+    {
+        if(TopLevel.GetTopLevel(this)?.Clipboard is not {} clipboard)return;
+        await clipboard.SetTextAsync(text);
     }
     private void ApplyTranscriptScroll()
     {
@@ -87,22 +209,25 @@ public sealed partial class MainView
         if(_messages.Children.Contains(_historyPanel))return;
         _messages.Children.Clear();_historyPanel.Children.Clear();_historyRows.Clear();_historyScope="";
         _messages.Children.Add(_historyPanel);_messages.Children.Add(_reasoning);_messages.Children.Add(_live);_messages.Children.Add(_approvalPanel);
+        // The blocks that held the selection are gone, so the bar must go with them
+        // instead of offering to copy text that no longer exists.
+        _selectionSource=null;
+        RefreshCopyBar();
     }
     private HistoryRow BuildHistoryRow(string role,string text,string thinking)
     {
         var bubble=new StackPanel {Spacing=6};
         bubble.Children.Add(new TextBlock {Text=role=="user"?"You":"GnomeAI",FontSize=11,Opacity=.6});
-        Expander? expander=null;TextBlock? thought=null;
+        Expander? expander=null;SelectableTextView? thought=null;
         if(role=="assistant") {
-            thought=new TextBlock {Text=thinking,TextWrapping=TextWrapping.Wrap,FontSize=13};
-            var captured=thought;AttachTextSelection(thought,()=>captured.Text??"");
+            thought=Selectable(thinking,13);
             expander=new Expander {Header="Thinking",Content=thought,IsVisible=thinking.Length>0,IsExpanded=false};bubble.Children.Add(expander);
         }
         if(role=="assistant")bubble.Children.Add(ReplyView(text));
         else {
             var content=GnomeAI.Client.MessageContent.Read(text);
             foreach(var image in content.Images)bubble.Children.Add(new GnomeAI.UI.ConversationPhoto {DataUri=image});
-            var body=new TextBlock {Text=DisplayUserText(content.Text),TextWrapping=TextWrapping.Wrap};AttachTextSelection(body,()=>content.Text);bubble.Children.Add(body);
+            bubble.Children.Add(Selectable(DisplayUserText(content.Text)));
         }
         var border=new Border {Child=bubble,Padding=new Thickness(14),CornerRadius=new CornerRadius(14),Background=role=="user"?Ink("#254037"):Brushes.Transparent,HorizontalAlignment=role=="user"?HorizontalAlignment.Right:HorizontalAlignment.Stretch,MaxWidth=960};
         return new(role,text,border,expander,thought);

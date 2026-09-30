@@ -21,7 +21,7 @@ public class MainActivity : AvaloniaMainActivity<MobileApp>
     private WindowInsetsObserver? _insets;
     protected override void OnCreate(Bundle? savedInstanceState)
     {
-        CameraCapture.Attach(this);PairingScanner.Attach(this);NativeTextSelection.Attach(this);MobileAppearance.Attach(this);
+        CameraCapture.Attach(this);PairingScanner.Attach(this);MobileAppearance.Attach(this);
         MobileHost.Ensure(FilesDir!.AbsolutePath);
         base.OnCreate(savedInstanceState);
         _insets=new WindowInsetsObserver(this);MobileAppearance.Refresh();
@@ -52,7 +52,7 @@ public class MainActivity : AvaloniaMainActivity<MobileApp>
     protected override void OnDestroy()
     {
         _insets?.Dispose();
-        NativeTextSelection.Detach(this);MobileAppearance.Detach(this);CameraCapture.Detach(this);PairingScanner.Detach(this);if(IsFinishing)CameraPermission.Cancel();
+        MobileAppearance.Detach(this);CameraCapture.Detach(this);PairingScanner.Detach(this);if(IsFinishing)CameraPermission.Cancel();
         // The foreground service owns background availability, not the screen.
         base.OnDestroy();
     }
