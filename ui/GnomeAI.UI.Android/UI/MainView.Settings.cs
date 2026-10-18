@@ -57,6 +57,9 @@ public sealed partial class MainView
         var reasoning=new ComboBox {ItemsSource=new[]{"default","low","medium","high","xhigh"},SelectedItem=Setting("reasoning")};
         var web=new CheckBox {Content="Enable web search",IsChecked=settings.GetProperty("web").GetBoolean()};
         var brave=new TextBox {Watermark="Brave API key (blank keeps saved key)",PasswordChar='●'};
+        var fcUrl=new TextBox {Text=Setting("firecrawl_api_url"),Watermark="http://127.0.0.1:3002"};
+        var fcLauncher=new TextBox {Text=Setting("firecrawl_launcher_path"),Watermark="/data/data/com.termux/files/home/.termux/firecrawl/gnomeai-firecrawl"};
+        var fcStatus=new TextBlock {Text="Local Firecrawl runs in Termux; web_search_firecrawl extracts result pages, Brave snippets remain the fallback.",TextWrapping=TextWrapping.Wrap,FontSize=12};
         var memory=new CheckBox {Content="Enable memory",IsChecked=settings.GetProperty("memory").GetBoolean()};
         var workers=new CheckBox {Content="Use a separate provider/model for subagents",IsChecked=settings.GetProperty("workers").GetBoolean()};
         var workerProviders=catalog.Length>0?catalog.Where(p=>!p.TryGetProperty("auth",out var auth) || auth.GetString()!="account").Select(p=>p.GetProperty("id").GetString()!).Prepend("inherit").Distinct().ToArray():providers.Prepend("inherit").ToArray();
@@ -80,7 +83,7 @@ public sealed partial class MainView
         _=LoadWorkerModels();
         var workerReasoning=new ComboBox {ItemsSource=new[]{"default","low","medium","high","xhigh"},SelectedItem=Setting("worker_reasoning")};
         AddSettingsGroup("Model & provider",SettingField("Provider",provider),key,url,SettingField("Available models",models),model,modelStatus,SettingField("Reasoning",reasoning));
-        AddSettingsGroup("Web & memory",web,brave,memory);
+        AddSettingsGroup("Web & memory",web,brave,SettingField("Firecrawl API URL",fcUrl),SettingField("Firecrawl launcher path (Termux)",fcLauncher),fcStatus,memory);
         AddSettingsGroup("Subagents",workers,SettingField("Provider",workerProvider),SettingField("Available models",workerModels),workerModel,workerStatus,SettingField("Reasoning",workerReasoning));
         _panel.Children.Add(Button("Save",async()=>{
             var providerId=provider.SelectedItem?.ToString()??savedProvider;
@@ -109,6 +112,7 @@ public sealed partial class MainView
             if(!Current())return;
             await LocalOp("set_reasoning_effort",("effort",reasoning.SelectedItem));
             await LocalOp("set_brave",("api_key",string.IsNullOrWhiteSpace(brave.Text)?null:brave.Text),("mode","context"));
+            await LocalOp("set_firecrawl",("launcher_path",string.IsNullOrWhiteSpace(fcLauncher.Text)?null:fcLauncher.Text.Trim()),("api_url",string.IsNullOrWhiteSpace(fcUrl.Text)?null:fcUrl.Text.Trim()));
             await LocalOp("set_web_search",("enabled",web.IsChecked==true));await LocalOp("memory_set",("enabled",memory.IsChecked==true));
             await LocalOp("set_subagent_defaults",("enabled",workers.IsChecked==true),("provider_id",workerProvider.SelectedItem),("model",string.IsNullOrWhiteSpace(workerModel.Text)?"inherit":workerModel.Text),("reasoning_effort",workerReasoning.SelectedItem));
             brave.Text="";_status.Text="Settings saved.";

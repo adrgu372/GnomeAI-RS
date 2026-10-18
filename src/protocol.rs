@@ -163,6 +163,14 @@ pub enum Op {
         enabled: bool,
     },
 
+    /// Configure the local Firecrawl deployment on Android (Termux side).
+    /// `launcher_path` selects the `gnomeai-firecrawl` script; `None` keeps
+    /// the saved value.
+    SetFirecrawl {
+        launcher_path: Option<String>,
+        api_url: Option<String>,
+    },
+
     /// Replace the generic MCP server list and rebuild the shared tool
     /// registry. Each enabled server is connected independently.
     SetMcpServers {

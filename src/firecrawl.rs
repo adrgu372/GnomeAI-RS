@@ -116,6 +116,47 @@ async fn ensure_local_firecrawl(client: &reqwest::Client, cfg: &AppConfig) -> an
         return Ok(());
     }
 
+    #[cfg(target_os = "android")]
+    {
+        let launcher = firecrawl_launcher_path(cfg).ok_or_else(|| {
+            anyhow!(
+                "local Firecrawl is not running and the Android launcher was not found; \
+                 install the gnomeai-firecrawl script in Termux (~/.termux/firecrawl/) and \
+                 set its path in Settings, or point `firecrawl_api_url` at a running instance"
+            )
+        })?;
+        let result = tokio::process::Command::new(&launcher)
+            .arg("ensure")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|error| anyhow!("cannot run {}: {error}", launcher.display()))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let mut detail: String = stderr.trim().chars().take(500).collect();
+            if detail.is_empty() {
+                detail = "no error output".into();
+            }
+            return Err(anyhow!(
+                "local Firecrawl could not start: {detail} — check `gnomeai-firecrawl logs` \
+                 and that the Termux side is awake (termux-wake-lock or a boot script)"
+            ));
+        }
+        for _ in 0..60 {
+            if firecrawl_is_reachable(client, &base).await {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        return Err(anyhow!(
+            "local Firecrawl did not become ready at {base} within 60 seconds; \
+             inspect `gnomeai-firecrawl status` and `gnomeai-firecrawl logs` in Termux"
+        ));
+    }
+
+    #[cfg(not(target_os = "android"))]
     let launcher = firecrawl_launcher().ok_or_else(|| {
         anyhow!(
             "local Firecrawl is not running and the lazy-start launcher was not found; \
@@ -187,6 +228,39 @@ fn is_local_firecrawl_url(base: &str) -> bool {
     lower.starts_with("http://127.0.0.1:")
         || lower.starts_with("http://localhost:")
         || lower.starts_with("http://[::1]:")
+}
+
+/// Absolute launcher path for the Android settings surface: `PATH`-less
+/// environments cannot resolve `scripts/gnomeai-firecrawl`, so resolve the
+/// known locations eagerly and keep the current dir out of the contract.
+#[cfg(target_os = "android")]
+pub fn firecrawl_launcher_path(cfg: &AppConfig) -> Option<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut candidates = Vec::new();
+    if let Some(configured) = cfg
+        .firecrawl_launcher_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        candidates.push(PathBuf::from(configured));
+    }
+    candidates.push(
+        PathBuf::from(&home)
+            .join(".termux")
+            .join("firecrawl")
+            .join("gnomeai-firecrawl"),
+    );
+    candidates.push(PathBuf::from(
+        "/data/data/com.termux/files/usr/opt/gnomeai-rs/firecrawl/gnomeai-firecrawl",
+    ));
+    candidates.push(PathBuf::from(
+        "/data/data/com.termux/files/home/.termux/firecrawl/gnomeai-firecrawl",
+    ));
+    candidates
+        .into_iter()
+        .filter(|path| path.is_file())
+        .find_map(|path| path.canonicalize().ok())
 }
 
 fn firecrawl_launcher() -> Option<PathBuf> {

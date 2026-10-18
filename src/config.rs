@@ -68,6 +68,10 @@ pub struct AppConfig {
     pub firecrawl_count: u32,
     pub firecrawl_extract_count: u32,
     pub firecrawl_timeout_ms: u64,
+    /// Android only: absolute path of the Termux-side `gnomeai-firecrawl`
+    /// script. Optional; well-known Termux locations are also probed.
+    #[cfg(target_os = "android")]
+    pub firecrawl_launcher_path: Option<String>,
     pub firecrawl_excerpt_chars: usize,
     pub search_ttl: u64,
     pub search_cache_max: usize,
@@ -192,6 +196,8 @@ impl Default for AppConfig {
             firecrawl_count: 5,
             firecrawl_extract_count: 3,
             firecrawl_timeout_ms: 30_000,
+            #[cfg(target_os = "android")]
+            firecrawl_launcher_path: None,
             firecrawl_excerpt_chars: 2_200,
             search_ttl: 3_600,
             search_cache_max: 500,

@@ -728,6 +728,12 @@ async fn handle_idle_op(
         Op::SetWebSearch { enabled } => {
             set_web_search(core, enabled, events).await?;
         }
+        Op::SetFirecrawl {
+            launcher_path,
+            api_url,
+        } => {
+            set_firecrawl(core, launcher_path, api_url, events).await?;
+        }
         Op::SetMcpServers { servers } => {
             set_mcp_servers(core, servers, events).await?;
         }
@@ -1462,6 +1468,76 @@ async fn set_web_search(core: &Core, enabled: bool, events: &mpsc::Sender<Event>
     )
     .await;
     Ok(())
+}
+
+async fn set_firecrawl(
+    core: &Core,
+    launcher_path: Option<String>,
+    api_url: Option<String>,
+    events: &mpsc::Sender<Event>,
+) -> Result<()> {
+    {
+        let mut config = core.config_state.write().await;
+        if let Some(url) = api_url.as_deref().map(str::trim) {
+            if !url.is_empty() {
+                config.firecrawl_api_url = url.to_string();
+            }
+        }
+        #[cfg(target_os = "android")]
+        if let Some(path) = launcher_path.as_deref().map(str::trim) {
+            config.firecrawl_launcher_path = if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            };
+        }
+        let _ = &launcher_path;
+        config.normalize();
+        config.save(&core.config_path)?;
+    }
+    let config = core.config_state.read().await;
+    let stored_url = config.firecrawl_api_url.clone();
+    let message = match launcher_known(&config) {
+        true => format!("Firecrawl settings saved; endpoint {stored_url}"),
+        false => format!(
+            "Firecrawl endpoint saved as {stored_url}; the launcher script was not found, \
+             install gnomeai-firecrawl in Termux and set its path in Settings"
+        ),
+    };
+    notice(events, &message).await;
+    Ok(())
+}
+
+/// Saved launcher path for the settings surface; empty on desktop where the
+/// launcher is resolved from package locations instead of settings.
+fn firecrawl_launcher_setting(config: &config::AppConfig) -> String {
+    #[cfg(target_os = "android")]
+    {
+        config
+            .firecrawl_launcher_path
+            .clone()
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = config;
+        String::new()
+    }
+}
+
+/// Whether a startable Firecrawl launcher is known for this configuration.
+/// Desktop resolves the launcher lazily out of well-known package locations,
+/// so it reports known unconditionally.
+fn launcher_known(config: &config::AppConfig) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        crate::firecrawl::firecrawl_launcher_path(config).is_some()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = config;
+        true
+    }
 }
 
 async fn set_mcp_servers(
@@ -2518,11 +2594,14 @@ async fn device_request(
         }
         "settings" => {
             let cfg = core.config_state.read().await;
+            let firecrawl_launcher_path = firecrawl_launcher_setting(&cfg);
             return Ok(
                 json!({"provider_id":cfg.provider_id,"model":cfg.default_model,"base_url":cfg.llama_base_url,
                 "reasoning":cfg.reasoning_effort,"memory":cfg.memory_enabled,"web":cfg.web_search_enabled,
                 "workers":cfg.subagent_use_separate_model,"worker_provider":cfg.subagent_provider_id,
-                "worker_model":cfg.subagent_model,"worker_reasoning":cfg.subagent_reasoning_effort}),
+                "worker_model":cfg.subagent_model,"worker_reasoning":cfg.subagent_reasoning_effort,
+                "firecrawl_api_url":cfg.firecrawl_api_url,
+                "firecrawl_launcher_path":firecrawl_launcher_path}),
             );
         }
         "memory_export" => {

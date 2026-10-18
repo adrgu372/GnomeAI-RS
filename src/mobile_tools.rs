@@ -51,6 +51,12 @@ fn register_mobile(
     registry.register(Arc::new(crate::brave::BraveTool {
         config: config.clone(),
     }));
+    registry.register(Arc::new(MobileFirecrawlSearch {
+        config: config.clone(),
+    }));
+    registry.register(Arc::new(MobileFirecrawlFetch {
+        config: config.clone(),
+    }));
     registry.register(Arc::new(MobileRead {
         root: root.to_path_buf(),
     }));
@@ -264,6 +270,125 @@ impl Tool for MobileFetch {
         tokio::select! { _ = cancel.cancelled() => bail!("Fetch interrupted"), result = fetch => result }
     }
 }
+/// Search through the local Firecrawl deployment (usually in Termux), with a
+/// transparent fallback to Brave so the tool degrades to snippets when the
+/// phone-side stack is asleep instead of failing the turn.
+struct MobileFirecrawlSearch {
+    config: Arc<RwLock<AppConfig>>,
+}
+#[async_trait::async_trait]
+impl Tool for MobileFirecrawlSearch {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::network_read(ToolSpec {
+            name: "web_search_firecrawl".into(),
+            description: "Search the web through the local Firecrawl deployment and extract the                           result pages as markdown. Falls back to Brave snippets when the local                           deployment is not running. Prefer this over web_search for deep or                           structured extraction."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "A concise web search query."}
+                },
+                "required": ["query"]
+            }),
+        })
+    }
+    async fn call(&self, args: Value, cancel: &CancellationToken) -> Result<ToolOutcome> {
+        if cancel.is_cancelled() {
+            bail!("Search cancelled");
+        }
+        let query = args["query"].as_str().unwrap_or("").trim().to_string();
+        if query.is_empty() {
+            bail!("Search query must not be empty");
+        }
+        let config = self.config.read().await.clone();
+        if !config.web_search_enabled {
+            bail!("Web search is disabled in Settings");
+        }
+        let search = crate::firecrawl::firecrawl_search(&config, &query);
+        let bundle = tokio::select! {
+            _ = cancel.cancelled() => bail!("Search interrupted"),
+            bundle = search => bundle,
+        };
+        if bundle.text.starts_with("[Firecrawl") {
+            // Deployment down/unreachable: degrade instead of failing.
+            let fallback = crate::brave::brave_search_bundle(&config, &query, "web").await;
+            let mut content = String::from(
+                "Local Firecrawl is unavailable; Brave snippets follow.\n\n",
+            );
+            content.push_str(&match fallback {
+                Ok(bundle) => bundle.text,
+                Err(error) => {
+                    format!("{content}[Brave fallback unavailable: {error}]")
+                }
+            });
+            return Ok(ToolOutcome {
+                content,
+                ok: true,
+                touched: vec![],
+                patches: vec![],
+            });
+        }
+        Ok(ToolOutcome {
+            content: bundle.text,
+            ok: true,
+            touched: vec![],
+            patches: vec![],
+        })
+    }
+}
+
+/// Full-page extraction through the local Firecrawl deployment; the plain
+/// `web_fetch` tool stays as the direct-HTTPS fallback for simple pages.
+struct MobileFirecrawlFetch {
+    config: Arc<RwLock<AppConfig>>,
+}
+#[async_trait::async_trait]
+impl Tool for MobileFirecrawlFetch {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::network_read(ToolSpec {
+            name: "web_fetch_firecrawl".into(),
+            description: "Fetch one public webpage through the local Firecrawl deployment and                           return it as clean markdown (main content only, ads stripped). Use                           web_fetch for plain HTTPS pages when Firecrawl is unavailable."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "An http:// or https:// URL."}
+                },
+                "required": ["url"]
+            }),
+        })
+    }
+    async fn call(&self, args: Value, cancel: &CancellationToken) -> Result<ToolOutcome> {
+        let url = args["url"]
+            .as_str()
+            .context("url required")?
+            .trim()
+            .to_string();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            bail!("`url` must start with http:// or https://");
+        }
+        let config = self.config.read().await.clone();
+        if !config.web_search_enabled {
+            bail!("Web search is disabled in Settings");
+        }
+        let fetch = crate::firecrawl::firecrawl_fetch(&config, &url);
+        let entry = tokio::select! {
+            _ = cancel.cancelled() => bail!("Fetch interrupted"),
+            entry = fetch => entry,
+        };
+        let content = format!(
+            "Title: {}\nURL: {}\nDescription: {}\n\n{}",
+            entry.title, entry.url, entry.description, entry.content
+        );
+        Ok(ToolOutcome {
+            content,
+            ok: !entry.content.starts_with("[Firecrawl"),
+            touched: vec![],
+            patches: vec![],
+        })
+    }
+}
+
 struct MobileSkill {
     root: PathBuf,
 }
