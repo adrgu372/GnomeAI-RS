@@ -156,51 +156,60 @@ async fn ensure_local_firecrawl(client: &reqwest::Client, cfg: &AppConfig) -> an
         ));
     }
 
-    #[cfg(not(target_os = "android"))]
-    let launcher = firecrawl_launcher().ok_or_else(|| {
-        anyhow!(
-            "local Firecrawl is not running and the lazy-start launcher was not found; \
-             install the packaged `gnomeai-firecrawl` script or point `firecrawl_api_url` \
-             to a running Firecrawl instance"
-        )
-    })?;
-    if !command_in_path("podman") {
-        return Err(anyhow!(
-            "Podman is not installed, so the packaged rootless Firecrawl cannot start. \
-             Install it (e.g. `sudo apt install podman`) or set `firecrawl_api_url` to a \
-             hosted Firecrawl endpoint"
-        ));
-    }
-    let output = tokio::process::Command::new(&launcher)
-        .arg("ensure")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|error| anyhow!("cannot run {}: {error}", launcher.display()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut detail: String = stderr.trim().chars().take(500).collect();
-        if detail.is_empty() {
-            detail = "no error output".into();
-        }
-        return Err(anyhow!(
-            "local Firecrawl could not start: {detail} — check `gnomeai-firecrawl logs` and \
-             that rootless Podman works for this user (`podman info`)"
-        ));
+    #[cfg(target_os = "android")]
+    {
+        // The android block above returns on every path; this branch only
+        // exists so both cfg arms keep the same function signature.
+        unreachable!("android ensure_local_firecrawl always returns");
     }
 
-    for _ in 0..60 {
-        if firecrawl_is_reachable(client, &base).await {
-            return Ok(());
+    #[cfg(not(target_os = "android"))]
+    {
+        let launcher = firecrawl_launcher().ok_or_else(|| {
+            anyhow!(
+                "local Firecrawl is not running and the lazy-start launcher was not found; \
+                 install the packaged `gnomeai-firecrawl` script or point `firecrawl_api_url` \
+                 to a running Firecrawl instance"
+            )
+        })?;
+        if !command_in_path("podman") {
+            return Err(anyhow!(
+                "Podman is not installed, so the packaged rootless Firecrawl cannot start. \
+                 Install it (e.g. `sudo apt install podman`) or set `firecrawl_api_url` to a \
+                 hosted Firecrawl endpoint"
+            ));
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let output = tokio::process::Command::new(&launcher)
+            .arg("ensure")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|error| anyhow!("cannot run {}: {error}", launcher.display()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let mut detail: String = stderr.trim().chars().take(500).collect();
+            if detail.is_empty() {
+                detail = "no error output".into();
+            }
+            return Err(anyhow!(
+                "local Firecrawl could not start: {detail} — check `gnomeai-firecrawl logs` and \
+                 that rootless Podman works for this user (`podman info`)"
+            ));
+        }
+
+        for _ in 0..60 {
+            if firecrawl_is_reachable(client, &base).await {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        Err(anyhow!(
+            "local Firecrawl did not become ready at {base} within 60 seconds; \
+             inspect `gnomeai-firecrawl status` and `gnomeai-firecrawl logs`"
+        ))
     }
-    Err(anyhow!(
-        "local Firecrawl did not become ready at {base} within 60 seconds; \
-         inspect `gnomeai-firecrawl status` and `gnomeai-firecrawl logs`"
-    ))
 }
 
 pub fn command_in_path(name: &str) -> bool {
