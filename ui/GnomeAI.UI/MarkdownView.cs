@@ -73,6 +73,7 @@ public sealed class MarkdownView : UserControl
         AddHandler(PointerPressedEvent,OnResponsePointerPressed,RoutingStrategies.Tunnel,true);
         AddHandler(PointerMovedEvent,OnResponsePointerMoved,RoutingStrategies.Tunnel,true);
         AddHandler(PointerReleasedEvent,OnResponsePointerReleased,RoutingStrategies.Tunnel,true);
+        PointerCaptureLost+=OnResponsePointerCaptureLost;
         _renderTimer.Tick += (_, _) =>
         {
             _renderTimer.Stop();
@@ -131,9 +132,16 @@ public sealed class MarkdownView : UserControl
         var anchor=ordered.IndexOf(_dragAnchorBlock!);
         var current=ordered.IndexOf(block);
         if(anchor<0 || current<0) {
-            // The transcript was rebuilt under the drag; fall back to the block.
-            _draggingAcrossBlocks=false;
-            return;
+            // The transcript was rebuilt under the drag. Re-anchor on the live
+            // block instead of stalling: selection resumes from here rather
+            // than dying on detached controls.
+            _gestureBlocks=OrderedBlocks();
+            _gestureOrigins=null;
+            _dragAnchorBlock=block;
+            _dragAnchorIndex=index;
+            ordered=_gestureBlocks;
+            anchor=ordered.IndexOf(block);
+            current=anchor;
         }
         if(anchor==current) {
             block.SelectionStart=Math.Min(_dragAnchorIndex,index);
@@ -182,6 +190,15 @@ public sealed class MarkdownView : UserControl
         _dragAnchorIndex=TextIndexAt(block,e.GetPosition(block));
         _gestureBlocks=OrderedBlocks();
         _gestureOrigins=_gestureBlocks.Select(item=>item.TranslatePoint(new Point(0,0),this) ?? new Point(double.NaN,double.NaN)).ToList();
+        // Keep the moves coming for the whole drag. A rebuild under the pointer
+        // (a streaming flush lands every 50 ms) would otherwise detach the block
+        // that owns hit testing and the drag would die after the first line.
+        e.Pointer.Capture(this);
+    }
+
+    private void OnResponsePointerCaptureLost(object? sender,PointerCaptureLostEventArgs e)
+    {
+        EndGesture();
     }
 
     private void OnResponsePointerMoved(object? sender,PointerEventArgs e)
@@ -208,9 +225,17 @@ public sealed class MarkdownView : UserControl
     private void OnResponsePointerReleased(object? sender,PointerReleasedEventArgs e)
     {
         if(_draggingAcrossBlocks)SelectionModeChanged?.Invoke(this,EventArgs.Empty);
+        EndGesture();
+    }
+
+    /// Drops the gesture state and picks up any rebuild that was deferred
+    /// while the pointer was down.
+    private void EndGesture()
+    {
         _draggingAcrossBlocks=false;
         _dragAnchorBlock=null;
         _gestureBlocks=null;_gestureOrigins=null;
+        QueueRebuild();
     }
 
     /// The selectable block under `e`, with the character index inside it. Blocks
@@ -309,7 +334,10 @@ public sealed class MarkdownView : UserControl
     private void RebuildNow()
     {
         // Rebinding text while the user is selecting would drop the selection.
-        if(IsSelectingText)return;
+        // A pressed-but-not-yet-moved pointer holds a zero-length selection, so
+        // the armed gesture has to defer the rebuild too, or the drag would
+        // anchor onto detached blocks and stall after the first line.
+        if(IsSelectingText || _dragAnchorBlock is not null)return;
         var text = Markdown ?? "";
         _root.IsVisible=text.Length>0;
         var dark = IsDark;
