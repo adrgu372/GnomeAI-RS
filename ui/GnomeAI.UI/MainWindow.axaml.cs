@@ -1701,15 +1701,77 @@ public sealed partial class MainWindow : Window
         SetSidebarVisible(!_sidebarVisible);
     }
 
+    private const double SidebarWidth = 280;
+    /// Animation in flight: a toggle during it restarts from the current width.
+    private bool _sidebarAnimating;
+
     private void SetSidebarVisible(bool visible)
     {
         _sidebarVisible = visible;
-        SidebarPane.IsVisible = visible;
-        SidebarToggle.Content = visible ? "☰" : "☰";
         ToolTip.SetTip(SidebarToggle, visible ? "Hide the sidebar" : "Show the sidebar");
         UiPreferences.Set("sidebar_visible", visible ? "1" : "0");
-        // Header title needs a moment to re-layout at the new width.
-        InvalidateVisual();
+        AnimateSidebar(visible);
+    }
+
+    /// Slides the sidebar: the navigation column animates 280 -> 0 px so the
+    /// conversation flows over the freed space live, instead of the pane
+    /// vanishing and the layout snapping in one frame.
+    private void AnimateSidebar(bool show)
+    {
+        if (_sidebarAnimating)
+        {
+            DesktopWorkspace.ColumnDefinitions[0].Width = new GridLength(show ? SidebarWidth : 0);
+            FinishSidebar(show);
+            return;
+        }
+        var grid = DesktopWorkspace.ColumnDefinitions[0];
+        var from = show ? 0 : SidebarWidth;
+        var to = show ? SidebarWidth : 0;
+        var animation = new Avalonia.Animation.Animation
+        {
+            Duration = TimeSpan.FromMilliseconds(220),
+            Easing = new Avalonia.Animation.Easings.CubicEaseOut(),
+            Children =
+            {
+                new Avalonia.Animation.KeyFrame
+                {
+                    Cue = new Avalonia.Animation.Cue(0.0),
+                    Setters = { new Avalonia.Styling.Setter(Avalonia.Layout.Layoutable.WidthProperty, from) },
+                },
+                new Avalonia.Animation.KeyFrame
+                {
+                    Cue = new Avalonia.Animation.Cue(1.0),
+                    Setters = { new Avalonia.Styling.Setter(Avalonia.Layout.Layoutable.WidthProperty, to) },
+                },
+            },
+        };
+        // The pane stays visible during the slide so the conversation flows
+        // over the shrinking column live; visibility flips at the end.
+        _sidebarAnimating = true;
+        SidebarPane.IsVisible = true;
+        SidebarPane.Opacity = 1;
+        // The column follows the animated border width so the transcript
+        // reflows every frame instead of snapping at the end.
+        grid.Width = new GridLength(from);
+        var columnSync = SidebarPane.GetObservable(Avalonia.Layout.Layoutable.BoundsProperty)
+            .Subscribe(new Avalonia.Reactive.AnonymousObserver<Avalonia.Rect>(bounds =>
+                grid.Width = new GridLength(Math.Min(bounds.Width + 0.5, SidebarWidth))));
+        _ = animation.RunAsync(SidebarPane).ContinueWith(_ =>
+        {
+            Dispatcher.UIThread.Post(() =>
+            {
+                columnSync.Dispose();
+                _sidebarAnimating = false;
+                FinishSidebar(show);
+            });
+        });
+    }
+
+    private void FinishSidebar(bool visible)
+    {
+        DesktopWorkspace.ColumnDefinitions[0].Width = new GridLength(visible ? SidebarWidth : 0);
+        SidebarPane.IsVisible = visible;
+        SidebarPane.Opacity = visible ? 1 : 0;
     }
 
     private void ApplySidebarPreference()
