@@ -164,7 +164,11 @@ public sealed partial class MainWindow : Window
             ShowNotice("The UI was started without --ipc, so no Rust core is connected.");
         }
 
-        Opened += (_, _) => Composer.Focus();
+        Opened += (_, _) =>
+        {
+            ApplySidebarPreference();
+            Composer.Focus();
+        };
         RefreshComposer();
 
         // Window/taskbar icon; also used by Android for the recents image.
@@ -1686,6 +1690,39 @@ public sealed partial class MainWindow : Window
     {
         _attachments.Clear();
         RefreshAttachmentBar();
+    }
+
+    private bool _sidebarVisible = true;
+
+    /// Collapses the navigation pane: half-screen tiling and narrow windows
+    /// get the full width for the conversation. The choice persists.
+    private void SidebarToggle_Click(object? sender, RoutedEventArgs e)
+    {
+        SetSidebarVisible(!_sidebarVisible);
+    }
+
+    private void SetSidebarVisible(bool visible)
+    {
+        _sidebarVisible = visible;
+        SidebarPane.IsVisible = visible;
+        SidebarToggle.Content = visible ? "☰" : "☰";
+        ToolTip.SetTip(SidebarToggle, visible ? "Hide the sidebar" : "Show the sidebar");
+        UiPreferences.Set("sidebar_visible", visible ? "1" : "0");
+        // Header title needs a moment to re-layout at the new width.
+        InvalidateVisual();
+    }
+
+    private void ApplySidebarPreference()
+    {
+        var stored = UiPreferences.Get("sidebar_visible");
+        var visible = stored switch
+        {
+            "1" => true,
+            "0" => false,
+            // Default on first run: collapse when the window opens narrow.
+            _ => ClientSize.Width >= 1100,
+        };
+        SetSidebarVisible(visible);
     }
 
     private async void NewSession_Click(object? sender, RoutedEventArgs e) => await RunUiAsync(async () => await SendAsync(new() { ["op"] = "new_session" }));

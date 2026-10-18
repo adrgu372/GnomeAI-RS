@@ -8,6 +8,41 @@ internal static class UiPreferences
     private sealed class StoredPreferences
     {
         public string Theme { get; set; } = "system";
+        public Dictionary<string, string> Flags { get; set; } = new(StringComparer.Ordinal);
+    }
+
+    public static string Get(string key)
+    {
+        try
+        {
+            if (!File.Exists(FilePath)) return "";
+            var preferences = JsonSerializer.Deserialize<StoredPreferences>(File.ReadAllText(FilePath));
+            return preferences?.Flags.TryGetValue(key, out var value) == true ? value : "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    public static void Set(string key, string value)
+    {
+        try
+        {
+            StoredPreferences? preferences = null;
+            if (File.Exists(FilePath))
+                preferences = JsonSerializer.Deserialize<StoredPreferences>(File.ReadAllText(FilePath));
+            preferences ??= new StoredPreferences();
+            preferences.Flags[key] = value;
+            Directory.CreateDirectory(DirectoryPath);
+            var json = JsonSerializer.Serialize(preferences,
+                new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(FilePath, json);
+        }
+        catch
+        {
+            // Preference persistence must never prevent the desktop UI from opening.
+        }
     }
 
     private static readonly string DirectoryPath = Path.Combine(
