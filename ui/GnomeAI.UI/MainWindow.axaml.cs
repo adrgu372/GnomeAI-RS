@@ -108,6 +108,12 @@ public sealed partial class MainWindow : Window
     private long _totalInputTokens;
     private long _totalOutputTokens;
     private bool _followTranscriptLayout;
+    /// True while the user scrolled away from the live tail: streaming must not
+    /// yank the viewport until they scroll back to the bottom.
+    private bool _userPinnedAway;
+    /// Set around programmatic offset writes so ScrollChanged can tell them
+    /// apart from user-initiated scrolling.
+    private bool _programmaticScroll;
     private bool _scrollPostQueued;
     private int? _historyPosition;
     private WhatsAppConfig? _whatsapp;
@@ -138,6 +144,7 @@ public sealed partial class MainWindow : Window
             TranscriptScroll_PointerWheelChanged,
             RoutingStrategies.Tunnel);
         TranscriptContent.SizeChanged += TranscriptContent_SizeChanged;
+        TranscriptScroll.ScrollChanged += TranscriptScroll_ScrollChanged;
         _streamFlushTimer.Tick += StreamFlushTimer_Tick;
         _scrollSettleTimer.Tick += ScrollSettleTimer_Tick;
         _draftSaveTimer.Tick += (_, _) => SaveComposerDrafts();
@@ -901,10 +908,42 @@ public sealed partial class MainWindow : Window
 
     private void ScrollDown()
     {
+        // The user took the viewport somewhere else; streaming content still
+        // lands, the view just stops yanking them back to the tail.
+        if (_userPinnedAway) return;
         _followTranscriptLayout = true;
         QueueTranscriptScroll();
         _scrollSettleTimer.Stop();
         _scrollSettleTimer.Start();
+    }
+
+    /// Distinguishes user scrolling from programmatic follows: scrolling away
+    /// unpins the tail, scrolling back to the bottom re-pins it.
+    private void TranscriptScroll_ScrollChanged(object? sender, ScrollChangedEventArgs e)
+    {
+        if (_programmaticScroll)
+        {
+            _programmaticScroll = false;
+            return;
+        }
+        // Pure extent/viewport growth (streamed content) moves nothing; judging
+        // it here would pin the view away while the tail is still being followed.
+        if (Math.Abs(e.OffsetDelta.Y) < double.Epsilon) return;
+        var extent = TranscriptScroll.Extent.Height;
+        var viewport = TranscriptScroll.Viewport.Height;
+        if (!double.IsFinite(extent) || !double.IsFinite(viewport) || viewport <= 0) return;
+        var maximum = Math.Max(0, extent - viewport);
+        var atBottom = TranscriptScroll.Offset.Y >= maximum - 48;
+        if (atBottom)
+        {
+            _userPinnedAway = false;
+        }
+        else
+        {
+            _userPinnedAway = true;
+            _followTranscriptLayout = false;
+            _scrollSettleTimer.Stop();
+        }
     }
 
     private void QueueTranscriptScroll()
@@ -940,6 +979,7 @@ public sealed partial class MainWindow : Window
         e.Handled = true;
         _followTranscriptLayout = false;
         _scrollSettleTimer.Stop();
+        // ScrollChanged finalizes the pin state from where the wheel lands.
 
         var delta = e.Delta.Y;
         if (!double.IsFinite(delta) || Math.Abs(delta) < double.Epsilon) return;
@@ -964,6 +1004,7 @@ public sealed partial class MainWindow : Window
             ? maximum
             : Math.Clamp(requestedY, 0, maximum);
         if (!double.IsFinite(y)) return;
+        _programmaticScroll = true;
         TranscriptScroll.Offset = new Vector(0, y);
     }
 
@@ -1066,6 +1107,8 @@ public sealed partial class MainWindow : Window
         var sessionId = _currentSessionId;
         CaptureComposerDraft();
         _dispatching = true;
+        // Your own submit re-engages tail following.
+        _userPinnedAway = false;
         RefreshComposer();
         try
         {
