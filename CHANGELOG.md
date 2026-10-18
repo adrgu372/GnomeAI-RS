@@ -1,5 +1,35 @@
 # GnomeAI-RS unreleased
 
+## 3.2.0
+
+### Desktop
+
+- **Text selection survives transcript streaming.** Copying an assistant
+  reply no longer stops at the first line: the view owns the pointer for the
+  whole drag, rebuilds are deferred while a gesture is armed and a rebuild
+  that still lands mid-drag re-anchors on the live block.
+- **One click clears a selection.** Pressing anywhere outside a selected
+  reply drops every highlighted line at once instead of one per click.
+- **Reading while streaming works.** Scrolling up pins the viewport away
+  from the tail; scrolling back to the bottom or sending a message re-pins
+  it. Extent growth from streamed tokens can no longer flip the pin state.
+- **Wide tables scroll horizontally.** Auto-sized, non-wrapping cells, and
+  dragging a selection against the table edge auto-scrolls it.
+- **Paste screenshots straight into the composer.** Ctrl+V with an image on
+  the clipboard attaches it as a file; text pastes are unchanged.
+- **Tiled windows and a collapsible sidebar.** Minimum width drops to
+  620 px for half-screen tiling, and the navigation pane slides away with an
+  animated toggle that persists its state.
+
+### Android
+
+- **Local Firecrawl through Termux.** `web_search_firecrawl` and
+  `web_fetch_firecrawl` run against a rootless Firecrawl deployment in
+  Termux, installed by `scripts/android/install-firecrawl-termux.sh`, with
+  transparent Brave snippet fallback when the deployment is asleep. Settings
+  gained the endpoint and launcher path fields.
+
+
 ## Android: reach the files the agent creates
 
 - New **Files** tab in the Android app. The coding workspace lives in the
