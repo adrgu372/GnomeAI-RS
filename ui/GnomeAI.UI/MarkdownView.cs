@@ -74,6 +74,8 @@ public sealed class MarkdownView : UserControl
         AddHandler(PointerMovedEvent,OnResponsePointerMoved,RoutingStrategies.Tunnel,true);
         AddHandler(PointerReleasedEvent,OnResponsePointerReleased,RoutingStrategies.Tunnel,true);
         PointerCaptureLost+=OnResponsePointerCaptureLost;
+        AddHandler(PointerMovedEvent,OnViewPointerMoved,RoutingStrategies.Tunnel,true);
+        _tableAutoScrollTimer.Tick+=PumpTableAutoScroll;
         _renderTimer.Tick += (_, _) =>
         {
             _renderTimer.Stop();
@@ -238,6 +240,20 @@ public sealed class MarkdownView : UserControl
         EndGesture();
     }
 
+    private void OnViewPointerMoved(object? sender,PointerEventArgs e)
+    {
+        _tablePointerPosition=e.GetCurrentPoint(this).Position;
+        _tablePointerLeftDown=e.GetCurrentPoint(this).Properties.IsLeftButtonPressed;
+        // The pump runs only while a selection drag is live inside a table.
+        if(_autoScrollTable is not null && _tablePointerLeftDown && !_tableAutoScrollTimer.IsEnabled)
+            _tableAutoScrollTimer.Start();
+        if(!_tablePointerLeftDown && _tableAutoScrollTimer.IsEnabled)
+        {
+            _tableAutoScrollTimer.Stop();
+            _autoScrollTable=null;
+        }
+    }
+
     private void OnResponsePointerMoved(object? sender,PointerEventArgs e)
     {
         if(_dragAnchorBlock is null)return;
@@ -359,9 +375,58 @@ public sealed class MarkdownView : UserControl
             if(change.Property!=SelectableTextBlock.SelectionStartProperty &&
                change.Property!=SelectableTextBlock.SelectionEndProperty)return;
             BlockSelectionChanged();
+            AutoScrollTables(block);
         };
         block.GotFocus+=(_,_)=>BlockSelectionChanged();
     }
+
+    /// A selection drag reaching a table's horizontal edge scrolls that table —
+    /// the same affordance every spreadsheet and text view has.
+    private void AutoScrollTables(SelectableTextBlock block)
+    {
+        if(block.SelectionStart==block.SelectionEnd){
+            _autoScrollTable=null;
+            return;
+        }
+        var scroller=FindTableScroller(block);
+        if(scroller is null)return;
+        _autoScrollTable=scroller;
+    }
+
+    private ScrollViewer? FindTableScroller(Visual visual)
+    {
+        var current=visual;
+        while(current is not null && !ReferenceEquals(current,_content))
+        {
+            if(current is ScrollViewer sv && sv.HorizontalScrollBarVisibility!=Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled)
+                return sv;
+            current=current.GetVisualParent();
+        }
+        return null;
+    }
+
+    private ScrollViewer? _autoScrollTable;
+    private readonly DispatcherTimer _tableAutoScrollTimer=new(){Interval=TimeSpan.FromMilliseconds(16)};
+
+    /// Nudges the active table scroller left/right while the pointer (with
+    /// button down) hovers near its horizontal edge.
+    private void PumpTableAutoScroll(object? sender,EventArgs e)
+    {
+        if(_autoScrollTable is null || _tablePointerPosition is null){_tableAutoScrollTimer.Stop();return;}
+        if(!_tablePointerLeftDown){_tableAutoScrollTimer.Stop();return;}
+        var scroller=_autoScrollTable;
+        var local=_tablePointerPosition.Value;
+        var edge=48.0;
+        double velocity;
+        if(local.X<edge)velocity=-((edge-local.X)/edge)*14.0;
+        else if(local.X>scroller.Bounds.Width-edge)velocity=((local.X-(scroller.Bounds.Width-edge))/edge)*14.0;
+        else return;
+        var newOffset=Math.Clamp(scroller.Offset.X+velocity,0,Math.Max(0,scroller.Extent.Width-scroller.Viewport.Width));
+        scroller.Offset=scroller.Offset.WithX(newOffset);
+    }
+    private Point? _tablePointerPosition;
+    private bool _tablePointerLeftDown;
+
 
     private void QueueRebuild()
     {

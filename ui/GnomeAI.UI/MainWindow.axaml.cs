@@ -387,7 +387,7 @@ public sealed partial class MainWindow : Window
             case "turn_started":
                 FinishStreamingSegment();
                 _busy = true;
-                _followTranscriptLayout = true;
+                if (!_userPinnedAway) _followTranscriptLayout = true;
                 _streamingMessage = null;
                 _reasoningMessage = null;
                 _streamingBuffer.Clear();
@@ -920,8 +920,9 @@ public sealed partial class MainWindow : Window
         _scrollSettleTimer.Start();
     }
 
-    /// Distinguishes user scrolling from programmatic follows: scrolling away
-    /// unpins the tail, scrolling back to the bottom re-pins it.
+    /// Judges the pin state by absolute viewport position, not by offset delta:
+    /// extent growth from streaming can shift the offset slightly, and a delta
+    /// threshold misreads that as user scrolling and unpins mid-reply.
     private void TranscriptScroll_ScrollChanged(object? sender, ScrollChangedEventArgs e)
     {
         if (_programmaticScroll)
@@ -929,9 +930,9 @@ public sealed partial class MainWindow : Window
             _programmaticScroll = false;
             return;
         }
-        // Pure extent/viewport growth (streamed content) moves nothing; judging
-        // it here would pin the view away while the tail is still being followed.
-        if (Math.Abs(e.OffsetDelta.Y) < double.Epsilon) return;
+        // Only offset changes can be user scroll; pure extent/viewport growth
+        // (new content) must not flip the pin state by itself.
+        if (e.ExtentDelta.Y == 0 && e.ViewportDelta.Y == 0 && Math.Abs(e.OffsetDelta.Y) < double.Epsilon) return;
         var extent = TranscriptScroll.Extent.Height;
         var viewport = TranscriptScroll.Viewport.Height;
         if (!double.IsFinite(extent) || !double.IsFinite(viewport) || viewport <= 0) return;
@@ -941,8 +942,10 @@ public sealed partial class MainWindow : Window
         {
             _userPinnedAway = false;
         }
-        else
+        else if (e.ExtentDelta.Y == 0)
         {
+            // The offset moved while the content size stayed fixed: a real user
+            // scroll (wheel, drag, keyboard) rather than streamed growth.
             _userPinnedAway = true;
             _followTranscriptLayout = false;
             _scrollSettleTimer.Stop();
@@ -982,7 +985,9 @@ public sealed partial class MainWindow : Window
         e.Handled = true;
         _followTranscriptLayout = false;
         _scrollSettleTimer.Stop();
-        // ScrollChanged finalizes the pin state from where the wheel lands.
+        // Only scrolling UP takes the viewport away from the tail; scrolling
+        // down keeps or restores the follow so reaching the bottom resumes it.
+        if (e.Delta.Y > 0) _userPinnedAway = true;
 
         var delta = e.Delta.Y;
         if (!double.IsFinite(delta) || Math.Abs(delta) < double.Epsilon) return;
