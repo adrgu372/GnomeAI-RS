@@ -95,6 +95,34 @@ public sealed class MarkdownView : UserControl
             QueueRebuild();
     }
 
+    protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        base.OnAttachedToVisualTree(e);
+        // Tunnel window presses: a click anywhere outside this reply must clear
+        // its selection, the way every text surface in a desktop app behaves.
+        if (TopLevel.GetTopLevel(this) is { } topLevel)
+            topLevel.AddHandler(PointerPressedEvent, OnTopLevelPointerPressed, RoutingStrategies.Tunnel);
+    }
+
+    protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        if (TopLevel.GetTopLevel(this) is { } topLevel)
+            topLevel.RemoveHandler(PointerPressedEvent, OnTopLevelPointerPressed);
+        base.OnDetachedFromVisualTree(e);
+    }
+
+    private void OnTopLevelPointerPressed(object? sender,PointerPressedEventArgs e)
+    {
+        if(e.Source is Visual source) {
+            var owner=source as MarkdownView ?? source.FindAncestorOfType<MarkdownView>();
+            // Presses inside this reply are handled by the in-view tunnel handler.
+            if(ReferenceEquals(owner,this))return;
+        }
+        if(!Blocks().Any(block=>block.SelectionStart!=block.SelectionEnd))return;
+        ClearBlockSelection();
+        SelectionModeChanged?.Invoke(this,EventArgs.Empty);
+    }
+
     public void EndSelection() {
         if(!IsSelectingText)return;
         ClearBlockSelection();
@@ -183,7 +211,16 @@ public sealed class MarkdownView : UserControl
         if(!e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)return;
         if(e.Source is not Visual source)return;
         var block=source as SelectableTextBlock ?? source.FindAncestorOfType<SelectableTextBlock>();
-        if(block is null || !_content.GetVisualDescendants().Contains(block))return;
+        if(block is null || !_content.GetVisualDescendants().Contains(block)) {
+            // A click on the card around the reply drops the whole selection.
+            ClearBlockSelection();
+            SelectionModeChanged?.Invoke(this,EventArgs.Empty);
+            return;
+        }
+        // A click is a deselect gesture: every block except the pressed one
+        // releases its share, so no per-line cleanup remains for the user.
+        foreach(var other in Blocks())
+            if(!ReferenceEquals(other,block))other.ClearSelection();
         // Arm the gesture. A plain click is left to the block itself; only once the
         // pointer leaves the block does this view take over the selection.
         _dragAnchorBlock=block;
