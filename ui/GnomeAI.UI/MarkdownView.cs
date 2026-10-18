@@ -583,8 +583,11 @@ public sealed class MarkdownView : UserControl
         if (rows.Count == 0) return;
         var columns = rows.Max(row => row.Length);
         var grid = new Grid();
+        // Auto-sized columns keep each cell on one line; the surrounding
+        // ScrollViewer then offers horizontal scrolling for wide tables
+        // instead of crushing every row into the viewport width.
         for (var column = 0; column < columns; column++)
-            grid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Star));
+            grid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
         for (var row = 0; row < rows.Count; row++)
         {
             grid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
@@ -594,7 +597,7 @@ public sealed class MarkdownView : UserControl
                 var cellText = new SelectableTextBlock
                 {
                     Text = cell,
-                    TextWrapping = TextWrapping.Wrap,
+                    TextWrapping = TextWrapping.NoWrap,
                     FontWeight = row == 0 ? FontWeight.SemiBold : FontWeight.Normal,
                 };
                 TrackSelection(cellText);

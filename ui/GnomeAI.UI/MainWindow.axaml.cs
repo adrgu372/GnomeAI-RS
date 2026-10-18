@@ -8,6 +8,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Templates;
 using Avalonia.Input;
+using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
 using Avalonia.Media;
@@ -138,6 +139,8 @@ public sealed partial class MainWindow : Window
         _windowRecovery = new WindowGeometryRecovery(this);
         DragDrop.SetAllowDrop(this, true);
         AddHandler(DragDrop.DropEvent, Files_Drop);
+        Composer.AddHandler(InputElement.KeyDownEvent, Composer_KeyDown, RoutingStrategies.Tunnel);
+        // Ctrl+V with an image on the clipboard attaches it directly, no "+" detour.
         Composer.AddHandler(InputElement.KeyDownEvent, Composer_KeyDown, RoutingStrategies.Tunnel);
         TranscriptScroll.AddHandler(
             InputElement.PointerWheelChangedEvent,
@@ -1261,6 +1264,13 @@ public sealed partial class MainWindow : Window
             }
             return;
         }
+        if (e.Key == Key.V && e.KeyModifiers.HasFlag(KeyModifiers.Control))
+        {
+            // An image on the clipboard becomes an attachment and the paste is
+            // consumed; text-only clipboards fall through to the TextBox paste.
+            if (await TryAttachClipboardImageAsync()) e.Handled = true;
+            return;
+        }
         if (e.Key is not (Key.Enter or Key.Return) || e.KeyModifiers.HasFlag(KeyModifiers.Shift)) return;
         e.Handled = true;
         await DispatchComposerAsync();
@@ -1613,6 +1623,37 @@ public sealed partial class MainWindow : Window
         if (file is null) return;
         SetAttachment(file);
         e.Handled = true;
+    }
+
+    /// Ctrl+V with an image on the clipboard attaches it as a file, no "+"
+    /// detour. Returns false for text-only clipboards so the caller lets the
+    /// normal TextBox paste run.
+    private async Task<bool> TryAttachClipboardImageAsync()
+    {
+        try
+        {
+            var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
+            if (clipboard is null) return false;
+            var bitmap = await clipboard.TryGetBitmapAsync();
+            if (bitmap is null) return false;
+            var cacheDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "gnomeai-rs", "paste");
+            Directory.CreateDirectory(cacheDir);
+            var path = Path.Combine(cacheDir, $"paste-{DateTime.Now:yyyyMMdd-HHmmss-fff}.png");
+            using (var stream = File.Create(path))
+                bitmap.Save(stream);
+            _attachments.Clear();
+            _attachments.Add(new AttachedFile(path, Path.GetFileName(path)));
+            RefreshAttachmentBar();
+            Composer.Focus();
+            return true;
+        }
+        catch (Exception error)
+        {
+            ShowError($"Image paste failed: {error.Message}");
+            return true;
+        }
     }
 
     private void SetAttachment(IStorageItem item)
