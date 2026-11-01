@@ -237,7 +237,22 @@ pub async fn run(
                                 break;
                             }
                         }
-                        Err(error) => eprintln!("ignored invalid Avalonia operation: {error}"),
+                        // Never swallow this. A frontend that sends a tag the
+                        // core does not know would otherwise keep drawing its
+                        // own optimistic "started" line while nothing ran, and
+                        // the error would land in a stderr nobody reads.
+                        Err(error) => {
+                            let rejected = Event::Error {
+                                message: format!(
+                                    "the core rejected an interface operation: {error}. Nothing \
+                                     was run; this build does not accept that tag."
+                                ),
+                                fatal: false,
+                            };
+                            if write_json_line(&mut input, &rejected).await.is_err() {
+                                break;
+                            }
+                        }
                     },
                     Some(_) => {}
                     None => break,

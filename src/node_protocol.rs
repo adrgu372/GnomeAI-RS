@@ -4,6 +4,14 @@ use serde::{Deserialize, Serialize};
 
 pub const NODE_PROTOCOL_VERSION: u32 = 1;
 
+/// How long a node stays "online" after its last contact with the Hub.
+///
+/// A running node polls continuously (each poll long-polls for up to 25 s), so
+/// anything older than this window means the device is not reaching the Hub.
+/// Both sides share the value: the node re-registers once its own silence
+/// approaches it, which keeps the Hub's view accurate after a network outage.
+pub const NODE_ONLINE_WINDOW_SECS: u64 = 45;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RootPolicy {
@@ -56,6 +64,12 @@ pub struct NodeRecord {
     pub online: bool,
     #[serde(default)]
     pub root_policy: RootPolicy,
+    /// Why this node is not connected, phrased for the person reading it.
+    /// Empty while the node is online; never a bare "offline", because that
+    /// leaves the operator guessing between a powered-down device, a stopped
+    /// service and a firewall.
+    #[serde(default)]
+    pub offline_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

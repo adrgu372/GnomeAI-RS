@@ -20,6 +20,8 @@ mod desktop_a11y;
 mod embeddings;
 #[path = "firecrawl.rs"]
 mod firecrawl;
+#[path = "harness2/mod.rs"]
+pub mod harness2;
 #[path = "llama.rs"]
 mod llama;
 #[path = "mcp_client.rs"]
@@ -28,6 +30,8 @@ mod mcp_client;
 mod memory;
 #[path = "memory_engine.rs"]
 mod memory_engine;
+#[path = "messenger/mod.rs"]
+pub mod messenger;
 mod model_catalog;
 #[path = "native_service.rs"]
 mod native_service;

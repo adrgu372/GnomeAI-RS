@@ -1,0 +1,13 @@
+# Node build output and dependencies
+node_modules/
+dist/
+
+# Compiled PoC binaries
+/F1
+/F2
+/F3
+/F4
+/F5
+
+# Local lab state
+*.log

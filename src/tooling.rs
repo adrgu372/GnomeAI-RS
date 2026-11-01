@@ -43,8 +43,8 @@ pub enum ApprovalRequirement {
     None,
     /// Obeys the selected normal/full-access policy.
     Standard,
-    /// External MCP actions always remain visible to the user, including in
-    /// full-access mode.
+    /// External MCP actions also obey the selected policy: `normal` asks,
+    /// `full-access` runs them without a second confirmation.
     External,
     /// Root or equivalent privilege escalation. Full-access never implies root.
     Privileged,

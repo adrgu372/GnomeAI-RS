@@ -727,6 +727,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
+ "cipher 0.5.2",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
 ]
@@ -1877,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "gnomef-rs"
-version = "3.2.0"
+version = "3.2.2"
 dependencies = [
  "anyhow",
  "arti-client",
@@ -1886,8 +1887,14 @@ dependencies = [
  "atspi",
  "axum",
  "base64 0.22.1",
+ "chacha20",
  "chrono",
+ "ed25519-dalek",
  "futures-util",
+ "getrandom 0.3.4",
+ "hex",
+ "hkdf",
+ "hmac",
  "ignore",
  "landlock",
  "libc",
@@ -1903,6 +1910,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tor-cell",
@@ -1912,6 +1920,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x25519-dalek",
  "zeroize",
  "zip",
 ]

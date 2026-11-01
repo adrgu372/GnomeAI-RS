@@ -44,6 +44,8 @@ async fn main() -> Result<()> {
     let config = AppConfig::load(&app_home.join("config.json"))?;
     let value = match args[0].as_str() {
         "list" => node_client(&config)?.list().await?,
+        "status" => node_client(&config)?.status().await?,
+        "remove" => remove(&node_client(&config)?, &args[1..]).await?,
         "exec" => execute(&node_client(&config)?, &args[1..]).await?,
         "learn" => learn(&args[1..])?,
         "run-skill" => run_skill(&config, &launch_dir, &args[1..]).await?,
@@ -61,6 +63,20 @@ fn node_client(config: &AppConfig) -> Result<nodes::NodeClient> {
         config.node_hub_port,
         &config.node_hub_admin_token,
     ))
+}
+
+async fn remove(client: &nodes::NodeClient, args: &[String]) -> Result<serde_json::Value> {
+    let node_id = args
+        .iter()
+        .find(|argument| !argument.starts_with('-'))
+        .context("usage: gnomeai-hubctl remove --yes NODE_ID")?;
+    if !args.iter().any(|argument| argument == "--yes") {
+        bail!(
+            "refusing to remove `{node_id}` without --yes; a node that is still running \
+             re-enrolls itself, so stop it on that machine first"
+        )
+    }
+    client.remove(node_id).await
 }
 
 fn learn(args: &[String]) -> Result<serde_json::Value> {
@@ -192,6 +208,8 @@ fn print_help() {
     println!(
         "GnomeAI local Hub control\n\n\
          gnomeai-hubctl list\n\
+         gnomeai-hubctl status\n\
+         gnomeai-hubctl remove --yes NODE_ID\n\
          gnomeai-hubctl exec [--cwd PATH] [--timeout SECONDS] [--root] NODE_ID -- COMMAND...\n\n\
          gnomeai-hubctl learn SPEC.json\n\
          gnomeai-hubctl run-skill NAME [--node ID] [--cwd PATH] [--root]\n\n\

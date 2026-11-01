@@ -7,8 +7,8 @@
     <SupportedOSPlatformVersion>26</SupportedOSPlatformVersion>
     <ApplicationId>io.github.adrgu372.gnomeai</ApplicationId>
     <ApplicationTitle>GnomeAI</ApplicationTitle>
-    <ApplicationVersion>20</ApplicationVersion>
-    <ApplicationDisplayVersion>3.2.0</ApplicationDisplayVersion>
+    <ApplicationVersion>21</ApplicationVersion>
+    <ApplicationDisplayVersion>3.2.2</ApplicationDisplayVersion>
     <RuntimeIdentifier>android-arm64</RuntimeIdentifier>
     <AndroidPackageFormats>apk</AndroidPackageFormats>
     <AndroidEnableProfiledAot>false</AndroidEnableProfiledAot>

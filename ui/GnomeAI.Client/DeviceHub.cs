@@ -160,7 +160,13 @@ public sealed class DeviceHub : IAsyncDisposable
             }
             if (eventKind is "turn_completed" or "interrupted" or "error") { _live.TryRemove(id,out _);_approvals.Remove(id); }
         }
-        else if (kind is not ("session_list" or "session_reset")) return Task.CompletedTask;
+        // Messenger events are account-scoped, not session-scoped. They were
+        // being dropped here — the core emitted "X wants to chat" and the UI
+        // never saw it, so no accept/reject card and no system note appeared.
+        // `notice` is included for the same reason: it is how the core reports
+        // a delivery or a pairing that failed.
+        else if (kind is not ("session_list" or "session_reset" or "notice")
+                 && !kind.StartsWith("messenger_",StringComparison.Ordinal)) return Task.CompletedTask;
         var routed=JsonSerializer.SerializeToElement(new { epoch=_epoch,revision=Interlocked.Increment(ref _revision),payload=message });
         SessionEvent?.Invoke(null,routed);
         foreach (var link in Links.ToArray().Where(l=>l.Online)) _=NotifySafelyAsync(link,routed);

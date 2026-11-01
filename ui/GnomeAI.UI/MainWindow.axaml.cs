@@ -55,6 +55,7 @@ public sealed partial class MainWindow : Window
         new() { Command = "/skills", Description = "List installed skills" },
         new() { Command = "/skill", Description = "Use, inspect, install, update, verify, or remove a skill" },
         new() { Command = "/memory", Description = "Show or manage shared memory" },
+        new() { Command = "/harness2", Description = "Adapt the agent's own harness for a task" },
         new() { Command = "/copy", Description = "Copy the last assistant reply" },
         new() { Command = "/theme", Description = "Use the system, light, or dark theme" },
         new() { Command = "/contrast", Description = "Legacy alias for toggling light and dark" },
@@ -151,6 +152,7 @@ public sealed partial class MainWindow : Window
         _streamFlushTimer.Tick += StreamFlushTimer_Tick;
         _scrollSettleTimer.Tick += ScrollSettleTimer_Tick;
         _draftSaveTimer.Tick += (_, _) => SaveComposerDrafts();
+        InitializeChat();
 
         if (Environment.GetCommandLineArgs().Contains("--ipc"))
         {
@@ -215,6 +217,9 @@ public sealed partial class MainWindow : Window
     private Task OnBridgeEvent(JsonElement node) => RunUiAsync(async()=> {
         var kind=String(node,"event");
         if(kind=="ready"){_physicalConnected=true;_lastLocalSession=String(node,"session_id");}
+        // Messenger events are account-scoped, not session-scoped: they belong to
+        // the Chat tab even while a remote device is the active agent source.
+        if(kind.StartsWith("messenger_",StringComparison.Ordinal)){HandleMessengerEvent(node,kind);return;}
         if(_selectedPeer is not null && kind!="ui_config"){if(kind=="session_event")CacheLocalEvent(node);return;}
         await HandleEventAsync(node);
 
@@ -1063,7 +1068,13 @@ public sealed partial class MainWindow : Window
     private async Task SendAsync(Dictionary<string, object?> operation)
     {
         if(operation.GetValueOrDefault("op") is "new_session" or "resume_session")ShowConversationPage();
-        if(_selectedPeer is not null){await SendRemoteAsync(operation);return;}
+        // The Chat tab is this PC's messenger, never the paired device's. A
+        // paired peer is an *agent source*: it runs turns and owns its own
+        // sessions. Routing `messenger_*` there would hit SendRemoteAsync's
+        // "available on This PC" rejection, so every send, accept and account
+        // switch would fail the moment a phone was picked as the source.
+        if(_selectedPeer is not null && operation.GetValueOrDefault("op") is string remoteOp
+            && !remoteOp.StartsWith("messenger_",StringComparison.Ordinal)){await SendRemoteAsync(operation);return;}
         if (!_coreConnected) throw new InvalidOperationException("The Rust core is disconnected. Reopen GnomeAI to reconnect.");
         operation.TryGetValue("op", out var op);
         // Forks wait in the core until all turns are idle. Keep Stop and the
@@ -1114,8 +1125,9 @@ public sealed partial class MainWindow : Window
         var originGeneration=_sourceGeneration;
         var originalText = Composer.Text ?? "";
         var text = originalText.Trim();
-        var attachment = _attachments.FirstOrDefault();
-        if (text.Length == 0 && attachment is null) return;
+        // Every staged file travels in one message; the core builds one prompt.
+        var attachments = _attachments.ToArray();
+        if (text.Length == 0 && attachments.Length == 0) return;
         var sessionId = _currentSessionId;
         CaptureComposerDraft();
         _dispatching = true;
@@ -1126,8 +1138,8 @@ public sealed partial class MainWindow : Window
         {
             // Keep the editor intact until the action succeeds. Navigation
             // commands remain available while a different turn is running.
-            var handled = attachment is null && text.StartsWith('/') && await HandleSlashCommandAsync(text);
-            if (!handled && _selectedPeer is null && attachment is null && WorkspacePathFromMessage(text) is { Length: > 0 } workspacePath)
+            var handled = attachments.Length == 0 && text.StartsWith('/') && await HandleSlashCommandAsync(text);
+            if (!handled && _selectedPeer is null && attachments.Length == 0 && WorkspacePathFromMessage(text) is { Length: > 0 } workspacePath)
             {
                 await SendAsync(new() { ["op"] = "set_workspace", ["path"] = workspacePath });
                 handled = true;
@@ -1137,13 +1149,13 @@ public sealed partial class MainWindow : Window
                 if (!_coreConnected) throw new InvalidOperationException("The Rust core is disconnected. Your message has been kept in the editor.");
                 if (_busy || CurrentQueue.Count > 0)
                 {
-                    CurrentQueue.Enqueue(new QueuedSubmission(text, attachment));
+                    CurrentQueue.Enqueue(new QueuedSubmission(text, attachments.ToList()));
                     MarkDraftChanged(sessionId);
                 }
-                else await SubmitMessageAsync(text, attachment);
+                else await SubmitMessageAsync(text, attachments);
             }
             if(originGeneration!=_sourceGeneration)return;
-            CompleteComposerSubmission(sessionId, originalText, attachment);
+            CompleteComposerSubmission(sessionId, originalText, attachments);
             if (text.Length > 0)
             {
                 _commandHistory.Add(text);
@@ -1157,21 +1169,36 @@ public sealed partial class MainWindow : Window
         await SendNextQueuedAsync();
     }
 
-    private async Task SubmitMessageAsync(string text, AttachedFile? attachment)
+    private async Task SubmitMessageAsync(string text, IReadOnlyList<AttachedFile> attachments)
     {
         var originGeneration=_sourceGeneration;
-        if (attachment is not null && !File.Exists(attachment.Path))
-            throw new FileNotFoundException("The attachment is no longer available. Remove it or select the file again.", attachment.Path);
+        foreach (var attachment in attachments)
+            if (!File.Exists(attachment.Path))
+                throw new FileNotFoundException("An attachment is no longer available. Remove it or select the file again.", attachment.Path);
         var sessionId = _currentSessionId;
         var runtime = RuntimeFor(sessionId);
         _busy = runtime.Busy = true;
         RefreshComposer();
         try
         {
-            if (attachment is null)
-                await SendAsync(new() { ["op"] = "submit", ["text"] = text });
-            else
-                await SendAsync(new() { ["op"] = "submit_attachment", ["text"] = text, ["path"] = attachment.Path });
+            switch (attachments.Count)
+            {
+                case 0:
+                    await SendAsync(new() { ["op"] = "submit", ["text"] = text });
+                    break;
+                case 1:
+                    // The single-file op keeps older cores working unchanged.
+                    await SendAsync(new() { ["op"] = "submit_attachment", ["text"] = text, ["path"] = attachments[0].Path });
+                    break;
+                default:
+                    await SendAsync(new()
+                    {
+                        ["op"] = "submit_attachments",
+                        ["text"] = text,
+                        ["paths"] = attachments.Select(file => file.Path).ToArray(),
+                    });
+                    break;
+            }
         }
         catch
         {
@@ -1181,16 +1208,21 @@ public sealed partial class MainWindow : Window
             throw;
         }
         var display = text;
-        if (attachment is not null) {
+        if (attachments.Count > 0) {
             try {
-                var extension=Path.GetExtension(attachment.Path).ToLowerInvariant();
-                var mime=extension switch {".png"=>"image/png",".jpg" or ".jpeg"=>"image/jpeg",".webp"=>"image/webp",".gif"=>"image/gif",_=>""};
-                if(mime.Length>0 && new FileInfo(attachment.Path).Length<=16*1024*1024)
-                    display=JsonSerializer.Serialize(new object[]{new {type="text",text},new {type="image_url",image_url=new {url="data:"+mime+";base64,"+Convert.ToBase64String(await File.ReadAllBytesAsync(attachment.Path))}}});
-                else display += (display.Length == 0 ? "" : "\n") + $"📎 {attachment.Name}";
+                // One inline photo still renders as a photo bubble; anything else
+                // becomes a labelled list so ten files do not become ten images.
+                var photo = attachments.Count == 1 ? attachments[0] : null;
+                var extension = photo is null ? "" : Path.GetExtension(photo.Path).ToLowerInvariant();
+                var mime = extension switch {".png"=>"image/png",".jpg" or ".jpeg"=>"image/jpeg",".webp"=>"image/webp",".gif"=>"image/gif",_=>""};
+                if (photo is not null && mime.Length>0 && new FileInfo(photo.Path).Length<=16*1024*1024)
+                    display=JsonSerializer.Serialize(new object[]{new {type="text",text},new {type="image_url",image_url=new {url="data:"+mime+";base64,"+Convert.ToBase64String(await File.ReadAllBytesAsync(photo.Path))}}});
+                else
+                    display += (display.Length == 0 ? "" : "\n")
+                        + string.Join("\n", attachments.Select(file => "📎 " + file.Name));
             } catch(Exception error) when(error is IOException or UnauthorizedAccessException) {
                 // Core already accepted the message: preview failure must not imply failed submission.
-                display=text+"\n📎 "+attachment.Name;
+                display=text+"\n"+string.Join("\n",attachments.Select(file=>"📎 "+file.Name));
             }
         }
         if (originGeneration==_sourceGeneration && _currentSessionId == sessionId)
@@ -1212,7 +1244,7 @@ public sealed partial class MainWindow : Window
         RefreshComposer();
         try
         {
-            await SubmitMessageAsync(next.Text, next.Attachment);
+            await SubmitMessageAsync(next.Text, next.Attachments);
             queue.Dequeue();
             if(originGeneration!=_sourceGeneration)return;
             MarkDraftChanged(sessionId);
@@ -1326,6 +1358,9 @@ public sealed partial class MainWindow : Window
             case "/skills": await SendAsync(new() { ["op"] = "skills_list" }); break;
             case "/skill": ShowError("Usage: /skill use|inspect|install|update|verify|remove ARG"); break;
             case "/memory": await SendAsync(new() { ["op"] = "memory_show" }); break;
+            case "/harness2":
+                ShowNotice("Use /harness2 [parallel|sequential|both] [k] -- TASK to adapt the agent's harness for one task.");
+                break;
             case "/copy": await CopyLastAssistantReplyAsync(); break;
             case "/theme": ToggleTheme(); break;
             case "/contrast": ToggleContrast(); break;
@@ -1360,6 +1395,8 @@ public sealed partial class MainWindow : Window
                     await HandleMemoryCommandAsync(text[8..].Trim());
                 else if (text.StartsWith("/skill ", StringComparison.Ordinal))
                     await HandleSkillCommandAsync(text[7..].Trim());
+                else if (text.StartsWith("/harness2 ", StringComparison.Ordinal))
+                    await HandleHarness2CommandAsync(text[10..].Trim());
                 else return false;
                 break;
         }
@@ -1390,6 +1427,69 @@ public sealed partial class MainWindow : Window
         };
         if (operation is null) ShowError("Usage: /memory status|show|dream [--dry-run]|reindex|forget ID|clear|on|off");
         else await SendAsync(operation);
+    }
+
+    /// `/harness2 [parallel|sequential|both] [k] [--run] -- TASK`.
+    ///
+    /// Without `--run` this is the safe plan the core returns without calling
+    /// a model; `--run` starts the real sweep in the core and its progress
+    /// arrives as ordinary notices.
+    private async Task HandleHarness2CommandAsync(string value)
+    {
+        var run = value.Contains("--run", StringComparison.Ordinal);
+        var cleaned = value.Replace("--run", string.Empty, StringComparison.Ordinal).Trim();
+        var mode = "both";
+        var k = 2;
+        var task = cleaned;
+        var separator = cleaned.IndexOf("--", StringComparison.Ordinal);
+        if (separator >= 0)
+        {
+            var flags = cleaned[..separator].Trim();
+            task = cleaned[(separator + 2)..].Trim();
+            foreach (var token in flags.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+            {
+                switch (token.ToLowerInvariant())
+                {
+                    case "parallel" or "agg": mode = "parallel"; break;
+                    case "sequential" or "seq": mode = "sequential"; break;
+                    case "both": mode = "both"; break;
+                    default:
+                        if (int.TryParse(token, out var parsed) && parsed > 0 && parsed <= 8) k = parsed;
+                        else
+                        {
+                            ShowError($"Unknown /harness2 option {token}. Usage: /harness2 [parallel|sequential|both] [k] [--run] -- TASK");
+                            return;
+                        }
+                        break;
+                }
+            }
+        }
+        if (task.Length == 0)
+        {
+            ShowError("Usage: /harness2 [parallel|sequential|both] [k] [--run] -- TASK");
+            return;
+        }
+        await SendAsync(new()
+        {
+            ["op"] = run ? "harness2_start" : "harness2_plan",
+            ["task"] = task,
+            ["mode"] = mode,
+            ["k"] = k,
+        });
+        // The core answers both requests with its own notice: the plan lists
+        // the editable surface and the runs root, and the sweep announces the
+        // improver it chose. Printing "started" here before the core had
+        // accepted the request is what made a silently-dropped operation look
+        // like a running sweep, so only the accepted case says anything, and
+        // it says what the budget is rather than that work has begun.
+        if (run)
+        {
+            ShowNotice(
+                $"harness2 requested: {k} candidate(s) per dimension, {mode}. Progress arrives here; " +
+                "the core confirms the improver and the runs root before the first rollout.");
+        }
+        // A plan needs no local line at all: the core replies with the budget
+        // it actually computed.
     }
 
     private async Task HandleSkillCommandAsync(string value)
@@ -1612,25 +1712,22 @@ public sealed partial class MainWindow : Window
         var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
         {
             Title = "Attach a file",
-            AllowMultiple = false,
+            // Any number of files, of any type, in one message.
+            AllowMultiple = true,
             FileTypeFilter =
             [
-                new FilePickerFileType("Supported files")
-                {
-                    Patterns = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif", "*.pdf", "*.docx", "*.xlsx", "*.pptx", "*.txt", "*.md", "*.csv", "*.json", "*.rs", "*.cs", "*.py", "*.js", "*.ts", "*.html", "*.css"]
-                },
                 FilePickerFileTypes.All,
             ],
         });
         if (files.Count == 0) return;
-        SetAttachment(files[0]);
+        AddAttachments(files);
     });
 
     private void Files_Drop(object? sender, DragEventArgs e)
     {
-        var file = e.DataTransfer.TryGetFiles()?.FirstOrDefault();
-        if (file is null) return;
-        SetAttachment(file);
+        var dropped = e.DataTransfer.TryGetFiles()?.ToArray() ?? [];
+        if (dropped.Length == 0) return;
+        AddAttachments(dropped);
         e.Handled = true;
     }
 
@@ -1652,8 +1749,9 @@ public sealed partial class MainWindow : Window
             var path = Path.Combine(cacheDir, $"paste-{DateTime.Now:yyyyMMdd-HHmmss-fff}.png");
             using (var stream = File.Create(path))
                 bitmap.Save(stream);
-            _attachments.Clear();
-            _attachments.Add(new AttachedFile(path, Path.GetFileName(path)));
+            // Pasted images add to what is staged, like picked files do.
+            if (_attachments.All(file => !string.Equals(file.Path, path, StringComparison.Ordinal)))
+                _attachments.Add(new AttachedFile(path, Path.GetFileName(path)));
             RefreshAttachmentBar();
             Composer.Focus();
             return true;
@@ -1665,16 +1763,26 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private void SetAttachment(IStorageItem item)
+    /// <summary>
+    /// Add files to the composer without replacing what is already staged.
+    /// </summary>
+    /// <remarks>
+    /// Any type and any number: the core decides what it can read, and the chat
+    /// path streams every file separately, so nothing here needs a whitelist.
+    /// A file picked twice is kept once.
+    /// </remarks>
+    private void AddAttachments(IEnumerable<IStorageItem> items)
     {
-        var path = item.TryGetLocalPath();
-        if (string.IsNullOrWhiteSpace(path))
+        var skipped = 0;
+        foreach (var item in items)
         {
-            ShowError("The selected file does not provide a local path.");
-            return;
+            var path = item.TryGetLocalPath();
+            if (string.IsNullOrWhiteSpace(path)) { skipped++; continue; }
+            if (_attachments.Any(file => string.Equals(file.Path, path, StringComparison.Ordinal))) continue;
+            _attachments.Add(new AttachedFile(path, item.Name));
         }
-        _attachments.Clear();
-        _attachments.Add(new AttachedFile(path, item.Name));
+        if (skipped > 0)
+            ShowNotice($"{skipped} item(s) were skipped because they are not local files.");
         RefreshAttachmentBar();
         Composer.Focus();
     }
@@ -1682,7 +1790,14 @@ public sealed partial class MainWindow : Window
     private void RefreshAttachmentBar()
     {
         AttachmentBar.IsVisible = _attachments.Count > 0;
-        AttachmentText.Text = _attachments.Count == 0 ? "" : $"File · {_attachments[0].Name}";
+        AttachmentText.Text = _attachments.Count switch
+        {
+            0 => "",
+            1 => $"File · {_attachments[0].Name}",
+            _ => $"{_attachments.Count} files · {string.Join(", ", _attachments.Take(3).Select(file => file.Name))}"
+                 + (_attachments.Count > 3 ? "…" : ""),
+        };
+        ToolTip.SetTip(AttachmentText, string.Join('\n', _attachments.Select(file => file.Name)));
         CaptureComposerDraft();
     }
 
@@ -2197,7 +2312,7 @@ public sealed partial class MainWindow : Window
         }));
 
         content.Children.Add(Section("MCP SERVERS"));
-        content.Children.Add(MutedText("Generic Streamable HTTP and stdio servers. MCP calls remain approval-gated, including for delegated providers."));
+        content.Children.Add(MutedText("Generic Streamable HTTP and stdio servers. MCP calls follow the execution mode: normal asks first, full-access runs them without a second confirmation, and root stays a separate approval."));
         var workingServers = _mcpServers.Select(server => server.Clone()).ToList();
         var mcpHost = new StackPanel { Spacing = 7 };
         void RebuildMcp()
@@ -2767,7 +2882,7 @@ public sealed partial class MainWindow : Window
         title.Children.Add(new TextBlock { Text = $"{(node.Online ? "●" : "○")} {node.Name}", FontWeight = FontWeight.SemiBold });
         var platform = MutedText(node.Platform); Grid.SetColumn(platform, 1); title.Children.Add(platform);
         var policyRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7, Children = { policy, apply } };
-        return Surface(new StackPanel
+        var card = new StackPanel
         {
             Spacing = 6,
             Children =
@@ -2777,7 +2892,32 @@ public sealed partial class MainWindow : Window
                 feedback,
                 policyRow,
             },
+        };
+        // An offline node used to say only "Offline", which left the operator to
+        // guess between a powered-down device, a stopped service, a wrong token
+        // and a firewall. The Hub now states what it last observed.
+        if (!node.Online)
+        {
+            var reason = MutedText(node.OfflineReason.Length > 0
+                ? node.OfflineReason
+                : "The Hub has not heard from this node. It is either powered off or cannot reach this machine.");
+            card.Children.Add(reason);
+        }
+        var remove = new Button { Content = "Remove node" };
+        remove.Classes.Add("danger");
+        remove.Click += async (_, _) => await RunUiAsync(async () =>
+        {
+            if (!await ConfirmAsync("Remove node",
+                    $"Stop tracking {node.Name}? Commands can no longer be sent to it. If the node is still running it re-registers itself, so stop it on that machine too."))
+                return;
+            var result = await NodeRequestAsync(HttpMethod.Delete, $"/v1/nodes/{Uri.EscapeDataString(node.Id)}");
+            ShowNotice(result is { } reply && Bool(reply, "reenrolls_while_running")
+                ? $"{node.Name} was removed, but it is still running and will enroll again. Stop gnomeai-node on that machine."
+                : $"{node.Name} was removed.");
+            ShowDevicesPage();
         });
+        card.Children.Add(ButtonRow(remove));
+        return Surface(card);
     }
 
     private async Task<JsonElement?> GetWhatsAppJsonAsync(string path)
@@ -2846,9 +2986,52 @@ public sealed partial class MainWindow : Window
         using var generator = new QRCodeGenerator();
         using var data = generator.CreateQrCode(payload, QRCodeGenerator.ECCLevel.Q);
         using var qr = new PngByteQRCode(data);
-        var bytes = qr.GetGraphic(8);
+        // 10 px per module keeps a dense invite readable through a phone camera
+        // at arm's length; the caller scales the result into a full dialog.
+        var bytes = qr.GetGraphic(10);
         using var stream = new MemoryStream(bytes);
         return new Bitmap(stream);
+    }
+
+    /// <summary>
+    /// A QR in its own maximised dialog, with the payload beside it.
+    /// </summary>
+    /// <remarks>
+    /// Both the Agent (device pairing) and the Chat (chat invite) surfaces use
+    /// this: a code you can read from another phone should not depend on which
+    /// tab you are standing in.
+    /// </remarks>
+    private async Task ShowEnlargedQrAsync(string payload, string title)
+    {
+        if (string.IsNullOrWhiteSpace(payload))
+        {
+            ShowNotice("Generate the code first.");
+            return;
+        }
+        using var bitmap = CreateQrBitmap(payload);
+        var dialog = CreateDialog(title, 760, 860);
+        var body = new StackPanel { Spacing = 12, Margin = new Thickness(20) };
+        body.Children.Add(new Image
+        {
+            Source = bitmap,
+            Stretch = Stretch.Uniform,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            MaxHeight = 660,
+        });
+        var text = new TextBox
+        {
+            Text = payload,
+            IsReadOnly = true,
+            TextWrapping = TextWrapping.Wrap,
+            MaxHeight = 90,
+            FontSize = 10,
+        };
+        body.Children.Add(text);
+        body.Children.Add(ButtonRow(
+            ActionButton("Copy code", () => CopyTextAsync(payload)),
+            ActionButton("Close", () => { dialog.Close(); return Task.CompletedTask; })));
+        dialog.Content = new ScrollViewer { Content = body };
+        await dialog.ShowDialog(this);
     }
 
     private static string ReadLogTail(string path, int limit)

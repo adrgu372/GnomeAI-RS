@@ -118,10 +118,7 @@ fn bundle_from_brave(mode: &str, value: Value) -> FirecrawlBundle {
                         let url = result["url"].as_str()?.to_string();
                         Some(crate::firecrawl::FirecrawlEntry {
                             title: result["title"].as_str().unwrap_or("").to_string(),
-                            description: result["description"]
-                                .as_str()
-                                .unwrap_or("")
-                                .to_string(),
+                            description: result["description"].as_str().unwrap_or("").to_string(),
                             content: result["description"].as_str().unwrap_or("").to_string(),
                             url,
                         })

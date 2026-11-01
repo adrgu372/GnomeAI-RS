@@ -171,8 +171,13 @@ nu se mută. Destinația folosește propriul director `workspace`.
   imagini pot depăși limita de mutare după codarea lor în JSON/base64.
 - Atașamentele se adaugă din file picker la conversații locale. Încărcarea unui
   fișier direct într-o sesiune remote nu este implementată.
-- PDF-ul este extras local pe Android, fără `pdftotext`. PDF-urile scanate nu au
-  OCR în această implementare. Răspunsul la imagini depinde de modelul ales.
+- PDF-ul este extras local pe Android, fără `pdftotext`: atât atașamentele, cât
+  și unealta de citire a agentului folosesc extractorul in-proces
+  (`pdf-extract`). PDF-urile scanate nu au OCR în această implementare.
+  Răspunsul la imagini depinde de modelul ales.
+- Se pot atașa oricâte fișiere, de orice tip, într-un singur mesaj: selectorul
+  acceptă selecție multiplă, fișierele se adaugă peste cele deja pregătite, iar
+  nucleul le citește în ordine și trimite un singur mesaj către model.
 - Vizualizarea mobilă folosește text simplu pentru istoric și reasoning;
   formatarea Markdown avansată a desktopului nu a fost portată aici.
 - Directorul de lucru este în spațiul privat al aplicației, inaccesibil pentru

@@ -18,7 +18,7 @@ public sealed partial class MainWindow
     {
         if (_restoringComposer || _sessionTransitioning || _currentSessionId.Length == 0) return;
         var runtime = RuntimeFor(_currentSessionId);
-        var draft = new ComposerDraft(Composer.Text ?? "", _attachments.FirstOrDefault(), Composer.CaretIndex);
+        var draft = new ComposerDraft(Composer.Text ?? "", _attachments.ToList(), Composer.CaretIndex);
         if (runtime.Draft == draft) return;
         runtime.Draft = draft;
         MarkDraftChanged(_currentSessionId);
@@ -85,22 +85,24 @@ public sealed partial class MainWindow
             Composer.Text = runtime.Draft.Text;
             Composer.CaretIndex = Math.Clamp(runtime.Draft.CaretIndex, 0, runtime.Draft.Text.Length);
             _attachments.Clear();
-            if (runtime.Draft.Attachment is { } attachment) _attachments.Add(attachment);
+            _attachments.AddRange(runtime.Draft.Attachments);
             RefreshAttachmentBar();
             _historyPosition = null;
         }
         finally { _restoringComposer = false; }
     }
 
-    private void CompleteComposerSubmission(string sessionId, string originalText, AttachedFile? attachment)
+    private void CompleteComposerSubmission(string sessionId, string originalText, IReadOnlyList<AttachedFile> attachments)
     {
         var runtime = RuntimeFor(sessionId);
-        if (runtime.Draft.Text != originalText || runtime.Draft.Attachment != attachment) return;
+        // The user may have staged more files after pressing Send; only clear the
+        // draft when what is staged is still exactly what was submitted.
+        if (runtime.Draft.Text != originalText || !runtime.Draft.Attachments.SequenceEqual(attachments)) return;
         runtime.Draft = ComposerDraft.Empty;
         MarkDraftChanged(sessionId);
         // The user may have navigated or edited while an asynchronous action ran.
         if (_currentSessionId == sessionId && Composer.Text == originalText
-            && _attachments.FirstOrDefault() == attachment)
+            && _attachments.SequenceEqual(attachments))
         {
             _restoringComposer = true;
             try

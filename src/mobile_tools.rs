@@ -312,9 +312,8 @@ impl Tool for MobileFirecrawlSearch {
         if bundle.text.starts_with("[Firecrawl") {
             // Deployment down/unreachable: degrade instead of failing.
             let fallback = crate::brave::brave_search_bundle(&config, &query, "web").await;
-            let mut content = String::from(
-                "Local Firecrawl is unavailable; Brave snippets follow.\n\n",
-            );
+            let mut content =
+                String::from("Local Firecrawl is unavailable; Brave snippets follow.\n\n");
             content.push_str(&match fallback {
                 Ok(bundle) => bundle.text,
                 Err(error) => {

@@ -632,7 +632,11 @@ pub async fn read_file(path: &Path) -> anyhow::Result<ReadFileResult> {
             })
         }
         "pdf" => {
-            let content = pdftotext(path)
+            // Android has no poppler binaries, so the same in-process extractor
+            // the attachment path uses is the correct one there. Falling back to
+            // "unavailable" on a phone would make every PDF unreadable to the
+            // agent even though the library is linked in.
+            let content = pdf_text(path)
                 .await
                 .unwrap_or_else(|_| "PDF text extraction unavailable.".into());
             Ok(ReadFileResult {
@@ -799,6 +803,27 @@ async fn pdftotext(path: &Path) -> anyhow::Result<String> {
         Vec::new(),
     )
     .await
+}
+
+/// PDF text without a helper process.
+///
+/// Desktop keeps `pdftotext` (it handles far more documents), while Android has
+/// no poppler binaries at all, so the in-process extractor is the only option
+/// there. Both paths return the same bounded text.
+async fn pdf_text(path: &Path) -> anyhow::Result<String> {
+    #[cfg(target_os = "android")]
+    {
+        let owned = path.to_path_buf();
+        let text = tokio::task::spawn_blocking(move || pdf_extract::extract_text(&owned))
+            .await
+            .context("the PDF worker failed")?
+            .map_err(|error| anyhow::anyhow!("cannot extract PDF text: {error}"))?;
+        return Ok(text.chars().take(MAX_EXTRACTED_CHARS).collect());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        pdftotext(path).await
+    }
 }
 
 pub fn encode_image_as_base64(path: &Path) -> anyhow::Result<String> {

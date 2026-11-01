@@ -129,8 +129,22 @@ impl Agent {
 pub enum ApprovalPolicy {
     /// Ask for every tool that writes or executes.
     Ask,
-    /// Run tools without asking. Used only by explicit `full-access`.
+    /// Run tools without asking. Used only by explicit `full-access`, and it
+    /// covers external MCP calls too; root stays a separate approval.
     Never,
+}
+
+/// `full-access` is the user's standing answer for everything that runs with
+/// ordinary user privileges. `External` (MCP) follows the same policy, while
+/// `Privileged` never does: root always needs its own confirmation.
+fn auto_approved(requirement: ApprovalRequirement, policy: ApprovalPolicy) -> bool {
+    match requirement {
+        ApprovalRequirement::None => true,
+        ApprovalRequirement::Standard | ApprovalRequirement::External => {
+            policy == ApprovalPolicy::Never
+        }
+        ApprovalRequirement::Privileged => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -267,10 +281,10 @@ impl Agent {
             .send(Event::TurnStarted { turn_id: turn.id })
             .await;
 
-        let delegated_mcp = self.provider.executes_configured_mcp()
-            && self.mcp_servers.iter().any(|server| server.enabled);
+        // Full-access already answered the "may this turn touch the host?"
+        // question, MCP included, so delegating must not ask again.
         if self.provider.delegates_execution()
-            && (self.approval != ApprovalPolicy::Never || delegated_mcp)
+            && self.approval != ApprovalPolicy::Never
             && !self.approve_delegated_turn().await?
         {
             let text = "Delegated account-provider execution was denied by the user.";
@@ -668,10 +682,7 @@ impl Agent {
 
     async fn approved(&self, call: &ToolCall, tool: &Arc<dyn Tool>, summary: &str) -> Result<bool> {
         let definition = tool.definition();
-        if definition.approval == ApprovalRequirement::None
-            || (definition.approval == ApprovalRequirement::Standard
-                && self.approval == ApprovalPolicy::Never)
-        {
+        if auto_approved(definition.approval, self.approval) {
             return Ok(true);
         }
         if matches!(
@@ -1123,6 +1134,39 @@ pub(crate) fn automatic_session_title(text: &str) -> String {
 #[cfg(test)]
 mod title_tests {
     use super::automatic_session_title;
+
+    use super::{ApprovalPolicy, auto_approved};
+    use crate::tooling::ApprovalRequirement;
+
+    #[test]
+    fn full_access_skips_mcp_approvals_but_never_root() {
+        for requirement in [
+            ApprovalRequirement::None,
+            ApprovalRequirement::Standard,
+            ApprovalRequirement::External,
+        ] {
+            assert!(auto_approved(requirement, ApprovalPolicy::Never));
+        }
+        assert!(!auto_approved(
+            ApprovalRequirement::Privileged,
+            ApprovalPolicy::Never
+        ));
+    }
+
+    #[test]
+    fn normal_mode_still_asks_for_writes_and_mcp() {
+        assert!(auto_approved(
+            ApprovalRequirement::None,
+            ApprovalPolicy::Ask
+        ));
+        for requirement in [
+            ApprovalRequirement::Standard,
+            ApprovalRequirement::External,
+            ApprovalRequirement::Privileged,
+        ] {
+            assert!(!auto_approved(requirement, ApprovalPolicy::Ask));
+        }
+    }
 
     #[test]
     fn first_user_line_becomes_a_compact_title() {

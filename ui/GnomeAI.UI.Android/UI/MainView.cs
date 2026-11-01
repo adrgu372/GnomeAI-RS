@@ -113,6 +113,14 @@ public sealed partial class MainView : UserControl, IDisposable
     {
         // Transcript/transport traffic is handled by the batched session path.
         var coreKind=message.GetProperty("event").GetString();
+        // Messenger events belong to the Messages tab, not to any session. They
+        // arrive here because they are core events, and they are consumed before
+        // the session filter below can treat them as agent traffic.
+        if(coreKind is not null && coreKind.StartsWith("messenger_",StringComparison.Ordinal)) {
+            if(!Dispatcher.UIThread.CheckAccess()){Dispatcher.UIThread.Post(()=>{if(!_disposed)HandleMessengerEvent(message,coreKind);});return Task.CompletedTask;}
+            HandleMessengerEvent(message,coreKind);
+            return Task.CompletedTask;
+        }
         if(coreKind is not ("ui_config" or "ready" or "provider_changed" or "error" or "notice"))return Task.CompletedTask;
         if(!Dispatcher.UIThread.CheckAccess()){Dispatcher.UIThread.Post(()=>{if(!_disposed)_=OnCore(message);});return Task.CompletedTask;}
         var kind=message.GetProperty("event").GetString();
@@ -217,8 +225,10 @@ public sealed partial class MainView : UserControl, IDisposable
         card.Children.Add(Button("Deny",()=>Decide("deny")));
         _approvalPanel.Children.Add(card);
     }
-    private void ShowPanel() { _settingsGeneration++; if(_composeSurface is not null)_composeSurface.IsVisible=false; _devicesVisible=false;_chatsVisible=false;_panel.Children.Clear();_panelScroll.IsVisible=true;_scroll.IsVisible=false;if(_copyBar is not null)_copyBar.IsVisible=false; }
-    private void ShowTranscript() { _settingsGeneration++; if(_composeSurface is not null)_composeSurface.IsVisible=true;SelectTab("Chat"); _devicesVisible=false;_chatsVisible=false;_panelScroll.IsVisible=false;_scroll.IsVisible=true;RefreshCopyBar(); }
+    // Leaving the Messages screen (for any tab or surface) clears its flags, so
+    // a late messenger event can never yank the user back to it.
+    private void ShowPanel() { _settingsGeneration++; if(_composeSurface is not null)_composeSurface.IsVisible=false; _devicesVisible=false;_chatsVisible=false;_chatsScreen=false;_chatsHome=false;_panel.Children.Clear();_panelScroll.IsVisible=true;_scroll.IsVisible=false;if(_copyBar is not null)_copyBar.IsVisible=false; }
+    private void ShowTranscript() { _settingsGeneration++; if(_composeSurface is not null)_composeSurface.IsVisible=true;SelectTab("Chat"); _devicesVisible=false;_chatsVisible=false;_chatsScreen=false;_chatsHome=false;_panelScroll.IsVisible=false;_scroll.IsVisible=true;RefreshCopyBar(); }
     private async Task ShowChatsAsync()
     {
         var link=Selected;var generation=_viewGeneration;
@@ -314,12 +324,18 @@ public sealed partial class MainView : UserControl, IDisposable
     private async Task SendAsync()
     {
         if(_running){await Request("interrupt",new {session_id=_session});return;}
-        var text=_composer.Text??"";if(string.IsNullOrWhiteSpace(text) && _attachmentPath is null) return;
+        var text=_composer.Text??"";if(string.IsNullOrWhiteSpace(text) && _attachmentPaths.Count==0) return;
+        // The composer is shared, and so are its attachments. When a messenger
+        // conversation is open, Send routes there first with every staged file;
+        // the agent path below stays unchanged for the Chat tab.
+        if(_account.Length>0 && _conversation.Length>0) {
+            if(await SendChatAsync()) return;
+        }
         _send.IsEnabled=false;
         try
         {
             if(_session.Length==0) await NewAsync();
-            if(_attachmentPath is not null) {await SubmitAttachmentAsync(_session,text);}
+            if(_attachmentPaths.Count>0) {await SubmitAttachmentAsync(_session,text);}
             else await _hub.RequestAsync(Selected,"submit",new { session_id=_session,text });
             if(_composer.Text==text) _composer.Text="";
             ShowTranscript();QueueTranscriptScroll(true);await RefreshCurrentAsync();
@@ -377,6 +393,41 @@ public sealed partial class MainView : UserControl, IDisposable
         }catch(JsonException){}
         return text;
     }
+
+    /// <summary>
+    /// A QR in its own full-screen view, readable from another phone.
+    /// </summary>
+    /// <remarks>
+    /// Both the Devices tab (pairing) and the Messages tab (chat invite) open
+    /// this, so a big code never depends on which tab is active.
+    /// </remarks>
+    private void ShowEnlargedQr(string payload,string title)
+    {
+        if(string.IsNullOrWhiteSpace(payload)){_status.Text="Generate the code first.";return;}
+        _viewGeneration++;
+        ShowPanel();
+        _devicesVisible=false;
+        _panel.Children.Add(new TextBlock {Text=title,FontSize=24,FontWeight=FontWeight.SemiBold,TextWrapping=TextWrapping.Wrap});
+        try {
+            var image=new Image {
+                // Fill the panel: on a phone the limiting dimension is the width.
+                Stretch=Stretch.Uniform,
+                MaxHeight=640,
+                HorizontalAlignment=HorizontalAlignment.Center,
+            };
+            using var generator=new QRCoder.QRCodeGenerator();
+            using var data=generator.CreateQrCode(payload,QRCoder.QRCodeGenerator.ECCLevel.M);
+            using var png=new QRCoder.PngByteQRCode(data);
+            image.Source=new Avalonia.Media.Imaging.Bitmap(new MemoryStream(png.GetGraphic(12)));
+            _panel.Children.Add(Card(image));
+        } catch(Exception error) { _panel.Children.Add(Card(new TextBlock {Text="The QR could not be rendered: "+error.Message,TextWrapping=TextWrapping.Wrap})); }
+        _panel.Children.Add(Card(ReadOnlyBlock("Code",payload)));
+        _panel.Children.Add(Button("Copy code",async()=>{
+            if(TopLevel.GetTopLevel(this)?.Clipboard is {} clipboard) await clipboard.SetTextAsync(payload);
+            _status.Text="Code copied";
+        }));
+        _panel.Children.Add(Button("Back",()=>{ShowDevices();return Task.CompletedTask;}));
+    }
     private void ShowDevices()
     {
         _viewGeneration++;ShowPanel();_devicesVisible=true;SelectTab("Devices");
@@ -385,7 +436,9 @@ public sealed partial class MainView : UserControl, IDisposable
         var relay=new TextBox {Watermark="wss://optional-relay.example"};
         _panel.Children.Add(new Expander {Header="Advanced: use an existing WSS relay",Content=relay});
         var code=new TextBox { AcceptsReturn=true,TextWrapping=TextWrapping.Wrap,Watermark="Paste pairing code",MinHeight=80,MaxHeight=160 };
-        var qr=new Image { MaxWidth=280,MaxHeight=280,HorizontalAlignment=HorizontalAlignment.Center };
+        // Big from the start: another phone has to read this through a camera,
+        // and a dense invite is unreadable at thumbnail size.
+        var qr=new Image { MaxWidth=520,MaxHeight=520,Stretch=Stretch.Uniform,HorizontalAlignment=HorizontalAlignment.Center };
         _panel.Children.Add(new TextBlock {Text="Pair new device",FontSize=20});
         if(_scanQr is not null)_panel.Children.Add(Button("Scan QR",async()=> {
             var scanned=await _scanQr();if(scanned is null)return;
@@ -399,10 +452,11 @@ public sealed partial class MainView : UserControl, IDisposable
             using var data=generator.CreateQrCode(code.Text,QRCoder.QRCodeGenerator.ECCLevel.M);
             using var png=new QRCoder.PngByteQRCode(data);
             if(qr.Source is IDisposable previous)previous.Dispose();
-            qr.Source=new Avalonia.Media.Imaging.Bitmap(new MemoryStream(png.GetGraphic(4)));
+            qr.Source=new Avalonia.Media.Imaging.Bitmap(new MemoryStream(png.GetGraphic(8)));
             _status.Text="Invitation expires in 10 minutes. Confirm matching digits on both devices.";
         });
         _panel.Children.Add(create);
+        _panel.Children.Add(Button("Enlarge QR",()=>{ShowEnlargedQr(code.Text??"","Scan pairing invitation");return Task.CompletedTask;}));
         _panel.Children.Add(Button("Copy invitation",async()=>{if(TopLevel.GetTopLevel(this)?.Clipboard is {} clipboard) await clipboard.SetTextAsync(code.Text); }));
         _panel.Children.Add(Button("Connect using invitation",()=>{_hub.Pair(code.Text??"");_status.Text="Connecting… Keep both devices open for confirmation.";return Task.CompletedTask;}));
         if(_hub.HasPendingTransfer) _panel.Children.Add(Button("Pending session transfer · Resume or discard",()=>{ShowTransferRecovery();return Task.CompletedTask;}));

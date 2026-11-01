@@ -2,8 +2,9 @@
 //!
 //! Every discovered MCP tool is adapted to GnomeAI's native `Tool` trait, so
 //! providers see one registry and the agent keeps one approval path. MCP
-//! annotations are treated as hints only; external calls always remain
-//! approval-gated, even when full-access is selected.
+//! annotations are treated as hints only. External calls follow the selected
+//! execution mode: `normal` asks, `full-access` lets them run, and root stays a
+//! separate, always-confirmed escalation.
 
 use anyhow::{Context, Result, bail};
 use rmcp::{

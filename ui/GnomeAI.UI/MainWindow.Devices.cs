@@ -86,7 +86,12 @@ public sealed partial class MainWindow
             SendButton.IsEnabled=SendButton.IsEnabled && _remoteSessionActive && _currentSessionId.Length>0;
         }
     }
-    private void ShowConversationPage() {DevicesPage.IsVisible=false;ChatWorkspace.IsVisible=true;}
+    private void ShowConversationPage() {
+        DevicesPage.IsVisible=false;ChatWorkspace.IsVisible=true;
+        // Leaving the Devices page returns to the Agent tab, not to Chat: the
+        // tab bar already shows which surface is active.
+        if(_messengerTabActive){_messengerTabActive=false;RefreshChatTabs();}
+    }
     private async Task SelectSourceAsync(PeerLink? peer,string? session=null) {
         if(_changingSource || (_selectedPeer is null && (_dispatching || _sessionTransitioning))){RefreshDevicePicker();return;}
         ShowConversationPage();
@@ -196,6 +201,22 @@ public sealed partial class MainWindow
                 if (!Current()) throw new IOException("Device selection changed; photo was not sent.");
                 await source.RequestAsync("submit", new { session_id=photoSession, text=photo });
                 break;
+            case "submit_attachments":
+            {
+                // A remote device's chat core takes one text payload, so several
+                // files are folded into it in order instead of being dropped.
+                var remoteSession = _currentSessionId;
+                var parts = new List<string>();
+                if (Value("text") is { Length: > 0 } caption) parts.Add(caption);
+                foreach (var path in (op.GetValueOrDefault("paths") as IEnumerable<string>) ?? [])
+                {
+                    var attached = await GnomeAI.Client.PhotoMessage.FromFileAsync(path, "");
+                    if (!Current()) throw new IOException("Device selection changed; files were not sent.");
+                    parts.Add(attached);
+                }
+                await source.RequestAsync("submit", new { session_id=remoteSession, text=string.Join("\n", parts) });
+                break;
+            }
             case "interrupt": await source.RequestAsync("interrupt",new {session_id=_currentSessionId});break;
             case "approve": await source.RequestAsync("approve",new {session_id=_currentSessionId,call_id=Value("call_id"),decision=Value("decision")});break;
             case "rename_session": await source.RequestAsync("rename",new {session_id=Value("id"),title=Value("title")});await source.RefreshListAsync();break;
@@ -213,11 +234,15 @@ public sealed partial class MainWindow
     private void ShowDevicesPage() {
         if(_devices is null){ShowNotice("Start the Rust core to manage devices.");return;}
         ChatWorkspace.IsVisible=false;ActivityPane.IsVisible=false;DevicesPage.IsVisible=true;
+        ChatPage.IsVisible=false;
         _invitationBitmap?.Dispose();_invitationBitmap=null;
         var body=new StackPanel {Spacing=14,Margin=new Thickness(24),MaxWidth=900};
         body.Children.Add(DialogHeading("Devices","Pair a phone or desktop, or manage an execution node. Compare the six digits on both screens before confirming."));
         var code=new TextBox {Watermark="Paste pairing code",AcceptsReturn=true,TextWrapping=Avalonia.Media.TextWrapping.Wrap,MaxHeight=130};
-        var qr=new Image {MaxWidth=440,MaxHeight=440};
+        // The code is shown big from the start: a dense invitation on a phone
+        // camera is unreadable at thumbnail size, and "Enlarge" was the first
+        // thing anyone had to press.
+        var qr=new Image {MaxWidth=560,MaxHeight=560,Stretch=Avalonia.Media.Stretch.Uniform};
         var feedback=MutedText("Invitations expire after ten minutes.");
         var create=ActionButton("Create invitation",async()=>{
             feedback.Text="Connecting to Tor…";
@@ -228,13 +253,7 @@ public sealed partial class MainWindow
         body.Children.Add(ButtonRow(create,ActionButton("Pair new device",()=>{_devices.Pair((code.Text??"").Trim());feedback.Text="Connecting… Keep both devices open.";return Task.CompletedTask;}),
             ActionButton("Copy invitation",()=>CopyTextAsync(code.Text??""))));
         body.Children.Add(code);body.Children.Add(qr);
-        body.Children.Add(ActionButton("Enlarge QR",async()=>{
-            if(string.IsNullOrEmpty(code.Text))return;
-            using var bitmap=CreateQrBitmap(code.Text);
-            var dialog=CreateDialog("Scan pairing invitation",740,800);
-            dialog.Content=new Image {Source=bitmap,Margin=new Thickness(24),Stretch=Avalonia.Media.Stretch.Uniform};
-            await dialog.ShowDialog(this);
-        }));
+        body.Children.Add(ActionButton("Enlarge QR",async()=>await ShowEnlargedQrAsync(code.Text??"","Scan pairing invitation")));
         body.Children.Add(feedback);
         if(_devices.HasPendingTransfer)body.Children.Add(ActionButton("Pending session transfer · Resume or discard",()=>ShowTransferRecoveryAsync()));
         _deviceCards=new StackPanel {Spacing=10};body.Children.Add(_deviceCards);RefreshDeviceCards();
@@ -249,9 +268,59 @@ public sealed partial class MainWindow
         }
         body.Children.Add(Section("EXECUTION NODES"));
         body.Children.Add(MutedText("These devices execute tools; phone and desktop peers also store conversations and support Move / Sync."));
+        // When a node is not connecting, the useful facts are the address it has
+        // to reach and whether that address answers at all; both are checked
+        // here so the operator does not have to open a terminal to find out.
         body.Children.Add(ActionButton("Refresh devices",RefreshNodes));body.Children.Add(nodes);
-        if(_whatsapp is {} cfg)body.Children.Add(new Expander {Header="Enroll an execution node",Content=ActionButton("Copy enrollment command",()=>CopyTextAsync($"gnomeai-node enroll --server http://PC-IP:{cfg.NodePort} --token {cfg.NodeEnrollmentToken} --name NAME"))});
+        if(_whatsapp is {} cfg) {
+            var enroll=new StackPanel {Spacing=8};
+            enroll.Children.Add(MutedText($"A node connects outbound to this machine on port {cfg.NodePort}. The firewall here must allow that port, and the node's server URL must use the same address."));
+            // Interfaces are enumerated once, off the UI thread; the label is
+            // filled in when that finishes so opening the page never blocks.
+            var addresses=MutedText("Reading this machine's addresses…");
+            enroll.Children.Add(addresses);
+            _=RunUiAsync(async()=>addresses.Text=$"This machine's addresses: {string.Join(", ", await LocalAddressesAsync())}");
+            var portCheck=MutedText("Checking the node listener…");
+            enroll.Children.Add(portCheck);
+            enroll.Children.Add(ActionButton("Check node listener",async()=>portCheck.Text=await CheckNodeListenerAsync(cfg.NodePort)));
+            enroll.Children.Add(ActionButton("Copy enrollment command",()=>CopyTextAsync($"gnomeai-node enroll --server http://PC-IP:{cfg.NodePort} --token {cfg.NodeEnrollmentToken} --name NAME")));
+            body.Children.Add(new Expander {Header="Enroll or diagnose an execution node",Content=enroll});
+            _=RunUiAsync(async()=>portCheck.Text=await CheckNodeListenerAsync(cfg.NodePort));
+        }
         DevicesPage.Content=new ScrollViewer {Content=body};_ = RunUiAsync(RefreshNodes);
+    }
+
+    /// The addresses a node can be pointed at, in the order worth trying.
+    private static Task<string[]> LocalAddressesAsync() => Task.Run(() => {
+        var addresses=new List<string>();
+        try {
+            foreach(var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()) {
+                if(nic.OperationalStatus!=System.Net.NetworkInformation.OperationalStatus.Up)continue;
+                if(nic.NetworkInterfaceType==System.Net.NetworkInformation.NetworkInterfaceType.Loopback)continue;
+                foreach(var unicast in nic.GetIPProperties().UnicastAddresses) {
+                    var address=unicast.Address;
+                    if(address.AddressFamily!=System.Net.Sockets.AddressFamily.InterNetwork)continue;
+                    addresses.Add(nic.Name+": "+address);
+                }
+            }
+        }catch(Exception){ /* Interfaces are advisory; an empty list is still usable. */ }
+        return addresses.Count>0?addresses.ToArray():["none detected"];
+    });
+
+    /// Ask the Hub whether it is listening, and say why not when it is not.
+    private async Task<string> CheckNodeListenerAsync(int port) {
+        var hub=_whatsapp;
+        if(hub is null)return "No local service configuration is loaded.";
+        try {
+            var status=await NodeRequestAsync(HttpMethod.Get,"/v1/status");
+            if(status is not {} value)return $"Port {port} answered, but it returned no status.";
+            var online=Long(value,"online_nodes");var enrolled=Long(value,"enrolled_nodes");
+            return $"Listening on port {port}: {online} of {enrolled} enrolled node(s) online. "
+                +"A node still connects outbound to this port, so allow it in the local firewall.";
+        }catch(Exception error) {
+            return $"The Hub is not answering on 127.0.0.1:{port} ({error.Message}). "
+                +"Restart GnomeAI after enabling the node listener in Settings.";
+        }
     }
     private async Task ShowTransferRecoveryAsync(PeerLink? peer=null) {
         if(_devices is null)return;

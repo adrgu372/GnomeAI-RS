@@ -1,0 +1,15 @@
+{
+  "name": "oc-gw-audit",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Proof-of-concept tooling for OpenClaw Gateway security findings",
+  "license": "Unlicense",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node web-poc-test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^5.0.0"
+  }
+}

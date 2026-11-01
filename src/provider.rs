@@ -254,12 +254,6 @@ pub trait Provider: Send + Sync {
     fn delegates_execution(&self) -> bool {
         false
     }
-    /// The provider CLI consumes MCP configuration and executes those calls
-    /// internally, so the outer agent can approve the delegated turn but
-    /// cannot interpose on each tools/call.
-    fn executes_configured_mcp(&self) -> bool {
-        false
-    }
     async fn stream(&self, req: Request) -> Result<BoxStream<'static, Result<Delta>>>;
 }
 
@@ -930,10 +924,6 @@ impl Provider for CliProvider {
     }
 
     fn delegates_execution(&self) -> bool {
-        true
-    }
-
-    fn executes_configured_mcp(&self) -> bool {
         true
     }
 

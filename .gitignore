@@ -30,3 +30,10 @@ descriere
 !/promo/icon.png
 /PROMOTION.md
 /gnomeai_export_*.md
+
+# Local viewing library and personal playlists. The IPTV converter reads `tv`
+# when it is present and skips that check otherwise, so neither is required to
+# build or test the repository.
+/tv
+/*.m3u
+/TV-Lite-*.AppImage

@@ -4,12 +4,12 @@ using System.Text.Json;
 
 namespace GnomeAI.UI;
 
-internal sealed record ComposerDraft(string Text, AttachedFile? Attachment, int CaretIndex)
+internal sealed record ComposerDraft(string Text, List<AttachedFile> Attachments, int CaretIndex)
 {
-    public static ComposerDraft Empty { get; } = new("", null, 0);
+    public static ComposerDraft Empty { get; } = new("", [], 0);
 }
 
-internal sealed record QueuedSubmission(string Text, AttachedFile? Attachment);
+internal sealed record QueuedSubmission(string Text, List<AttachedFile> Attachments);
 internal sealed record SavedComposer(ComposerDraft Draft, List<QueuedSubmission> Queue);
 
 /// <summary>Private, atomic snapshots of work that has not been sent yet.</summary>
@@ -27,7 +27,8 @@ internal sealed class ComposerDraftStore
         if (!File.Exists(path)) return new(ComposerDraft.Empty, []);
         var saved = JsonSerializer.Deserialize<SavedComposer>(File.ReadAllText(path));
         if (saved?.Draft?.Text is null || saved.Queue is null
-            || saved.Queue.Any(item => item is null || item.Text is null))
+            || saved.Draft.Attachments is null
+            || saved.Queue.Any(item => item is null || item.Text is null || item.Attachments is null))
             throw new InvalidDataException("The saved draft has an invalid format.");
         return saved;
     }
@@ -35,7 +36,7 @@ internal sealed class ComposerDraftStore
     public void Save(string sessionId, SavedComposer saved)
     {
         var path = PathFor(sessionId);
-        if (saved.Draft.Text.Length == 0 && saved.Draft.Attachment is null && saved.Queue.Count == 0)
+        if (saved.Draft.Text.Length == 0 && saved.Draft.Attachments.Count == 0 && saved.Queue.Count == 0)
         {
             File.Delete(path);
             return;

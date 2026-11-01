@@ -1,6 +1,91 @@
-# GnomeAI-RS unreleased
+# GnomeAI-RS 3.2.2
+
+### Execution nodes
+
+- **A node that is not connecting now says why.** `Offline` on its own could mean
+  a powered-down Pi, a stopped service, a stale enrollment token or a firewall
+  dropping the traffic. Every offline node on the Devices page now carries the
+  reason the Hub actually observed: it never completed a poll, no request has
+  reached the Hub since it was last seen (so the traffic is being dropped before
+  it arrives), or its request arrived and was rejected (so it holds a different
+  token). The same payload gains `offline_reason` in `/v1/nodes`.
+- **Remove node.** There was no way to forget a node from the UI: a re-enrolled
+  device left a permanent dead entry behind. `DELETE /v1/nodes/{id}` and a
+  `Remove node` button clear it, and the reply warns when the node is still
+  running and will enroll itself again. `gnomeai-hubctl remove --yes NODE_ID`
+  does the same from a terminal.
+- **The Devices page diagnoses the listener.** It shows the addresses a node can
+  be pointed at and checks whether the Hub answers, so `gnomeai-node` failing to
+  connect no longer sends the operator to a terminal to find the port.
+- **A healthy node re-registers every 15 seconds.** The Hub gains
+  `GET /v1/status`, and a node now re-registers inside the online window instead
+  of waiting for a poll to fail, so a brief network outage recovers without the
+  node looking dead.
+
+### Chat and attachments
+
+- **Scanning a chat QR now asks the other phone.** A scan is a request, not
+  consent: the receiving device shows "‹name› wants to chat" above its
+  conversation list, and only Accept writes the contact. Decline answers the
+  sender too, so neither side is left guessing — which is also why a scanned
+  peer no longer leaves every message `Pending` with no explanation.
+- **The QR is shown large from the start, in both tabs.** The pairing code grew
+  from 440 to 560 px on desktop and from 280 to 520 px on Android, the module
+  size went up, and `Enlarge QR` now opens the same full-size view from the
+  Agent/Devices tab *and* from the chat invite dialogs. Android finally has the
+  button the scanner has been telling people to press.
+- **Any file, any number, in one message.** The picker accepts several files of
+  any type at once, drops add to what is staged instead of replacing it, and the
+  composer shows a count with the names on hover. The core gains
+  `submit_attachments` / `submit_attachments_to` for the agent path and
+  `messenger_send_media.paths` for chat: every file is read or sealed in order
+  and delivered as **one** message with one prompt and one bubble.
+
+### Messenger (Chat tab)
+
+- **A new Chat tab: end-to-end encrypted chat over Tor, with no server, no
+  relay and no store-and-forward.** Text, photos, video, audio and large files
+  go from one onion service directly to another. A message that cannot be
+  delivered stays `Pending` locally and is flushed when the peer answers.
+- **Messenger identity is separate from device pairing.** Each account
+  generates its own Ed25519 + X25519 identity, seals it under its own keystore
+  master key (`store/messenger/keystore.key`) in its own database
+  (`store/messenger/messenger.db`), and asks Arti for its **own onion**. No
+  messenger key is derived from a device key and no messenger row is written
+  into the agent session database.
+- **Multi-account, switched instantly.** The account picker swaps identity,
+  contacts, conversations and onion without a logout or a Tor restart. The
+  free tier allows two accounts; the local Pro tier removes the limit.
+- **X3DH + Double Ratchet for 1:1.** Invites are signed JSON (QR or pasted
+  text), and importing one verifies that the user id really is the identity
+  and that the signed prekey carries its signature. One-time prekeys live only
+  on the owner's devices and each is consumed exactly once.
+- **Groups up to 300 members with sender keys.** Each member's chain is
+  distributed only inside a 1:1 envelope; delivery is sender fan-out and the
+  transcript shows `delivered X/Y`. Removing a member rotates every chain for
+  the group.
+- **Large files without a relay.** A control message carries the metadata,
+  SHA-256 and a per-attachment key; sealed chunks follow, each acknowledged, so
+  a lost circuit resumes and a finished file is published only after its digest
+  matches. Standard allows 100 MiB, the local Pro tier 2 GiB.
+- **Markdown text and editable messages.** Text is stored as Markdown source
+  and rendered with the transcript viewer; edits are signed control messages
+  that keep the previous version in the local row.
+- **Also on Android.** The mobile shell gains a **Messages** tab with its own
+  account picker, conversation list, transcript, composer, attachment picker,
+  QR invite and group member management. It drives the same core operations as
+  the desktop, so both share one identity and one history per account.
 
 ## 3.2.0
+
+### Execution modes
+
+- **Full-access no longer asks for MCP tools.** External MCP calls now follow
+  the selected execution mode like every other tool: `normal` asks first,
+  `full-access` runs them without a second confirmation, and read-only still
+  blocks writes. Delegated provider turns stop asking as well, since the mode
+  already answered that question. Root stays separate — `sudo` and any other
+  privilege escalation still require their own approval, in full-access too.
 
 ### Desktop
 

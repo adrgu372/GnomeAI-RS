@@ -119,6 +119,11 @@ def main() -> None:
         "gnomeai-whatsapp.service", "systemctl --global enable",
         "systemctl --user daemon-reload",
         "SignalKind::terminate", "wait_for_shutdown_signal",
+        # Messenger: its own tab, its own account picker, and its own core ops.
+        "ChatPage", "MessengerAccountPicker", "MessengerConversations",
+        "messenger_send_text", "messenger_send_media", "messenger_edit_message",
+        "messenger_media_progress", "messenger_peer_offline",
+        "MessengerTransferProgress", "InitializeChat",
     }
     for surface in sorted(required_surfaces):
         if surface not in combined:
@@ -168,6 +173,45 @@ def main() -> None:
         fail("background service must not borrow app_dir after AppPaths takes ownership")
     if "native_service::load_or_create_token(paths.app_dir.as_path())?" not in background_core:
         fail("background service token must use the path retained by AppPaths")
+
+    # Messenger separation is a security property, not a style choice: no
+    # messenger code may derive from a device key, reuse the mesh onion, or
+    # write into the agent database.
+    messenger_dir = ROOT / "src" / "messenger"
+    messenger_sources = "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted(messenger_dir.glob("*.rs"))
+    )
+    for forbidden in ("device_store", "DeviceIdentity", "agent.db", "pairing"):
+        if forbidden in messenger_sources:
+            fail(f"messenger code must not touch the device mesh: {forbidden}")
+    for required in ("messenger.db", "keystore.key", "x3dh", "ratchet", "SenderChain"):
+        if required.lower() not in messenger_sources.lower():
+            fail(f"messenger separation surface is missing: {required}")
+    if "MAX_GROUP_MEMBERS: usize = 300" not in messenger_sources:
+        fail("the 300-member group cap is missing")
+    if "PRO_LIMIT" not in messenger_sources or "STANDARD_LIMIT" not in messenger_sources:
+        fail("the local file-size tiers are missing")
+
+    # The Android shell has its own view tree, so the desktop tab alone would
+    # ship an APK with no messenger at all. Assert the mobile surface exists and
+    # is wired to the same core operations.
+    android_chat = UI.parent / "GnomeAI.UI.Android" / "UI" / "MainView.Chat.cs"
+    if not android_chat.is_file():
+        fail("the Android messenger surface is missing (MainView.Chat.cs)")
+    android_chat_source = android_chat.read_text(encoding="utf-8")
+    android_mobile = (UI.parent / "GnomeAI.UI.Android" / "UI" / "MainView.Mobile.cs").read_text(encoding="utf-8")
+    android_shell = (UI.parent / "GnomeAI.UI.Android" / "UI" / "MainView.cs").read_text(encoding="utf-8")
+    for operation in (
+        "messenger_create_account", "messenger_send_text", "messenger_send_media",
+        "messenger_edit_message", "messenger_list_conversations", "messenger_add_contact",
+        "messenger_create_group", "messenger_remove_group_member",
+    ):
+        if operation not in android_chat_source:
+            fail(f"the Android messenger cannot reach {operation}")
+    if '"Messages"' not in android_mobile:
+        fail("the Android bottom navigation has no Messages tab")
+    if "HandleMessengerEvent" not in android_shell:
+        fail("messenger events are not routed in the Android shell")
 
     print(
         f"Avalonia UI contract OK: {len(handlers)} handlers, "

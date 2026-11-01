@@ -388,10 +388,16 @@ lightweight node or to the phone.
 ## Attachments, documents and vision
 
 Drop files anywhere on the conversation window or use the attachment picker.
+**Any type and any number of files can be staged and sent in one message**: the
+picker accepts multiple files, a drop adds to what is already staged, and the
+core folds them into a single prompt (one `<attached_file>` block per document,
+all images in one multimodal message). On Android the same holds for the file
+picker and for chat attachments.
+
 GnomeAI stores uploads privately and can process:
 
 - PNG, JPEG, WebP, GIF and BMP images;
-- PDF through `pdftotext`;
+- PDF through `pdftotext` on desktop and in-process (`pdf-extract`) on Android;
 - DOCX, XLSX and PPTX, including DOCM/XLSM/PPTM and ODT/ODS/ODP containers;
 - TXT, Markdown, CSV/TSV, JSON, YAML, TOML, XML, HTML and other text/data files;
 - common Rust, Python, JavaScript/TypeScript, C/C++, Go, Java, Kotlin, Swift,
@@ -412,7 +418,8 @@ travel through the mesh transport in frames capped at 8 MiB
 
 - `read-only` blocks workspace mutations;
 - `normal` allows normal user-level access after explicit approval;
-- `full-access` skips ordinary user-level approval prompts;
+- `full-access` skips ordinary user-level approval prompts, including tools
+  that call external MCP servers;
 - root commands always use the separate native sudo path and never receive
   implicit root permission from `full-access`.
 
@@ -627,6 +634,7 @@ Type `/` to show graphical suggestions. Main commands:
 /skills
 /skill
 /memory
+/harness2
 /tokens
 /doctor
 /diff
@@ -652,6 +660,147 @@ from the state directory. Provider settings, session storage, tool output and
 memory remain private user data and must not be committed. Desktop device
 identities and peers live in `store/devices/devices.json` under the same root;
 pairing material on the phone is protected by the Android Keystore.
+
+## Messenger
+
+The **Chat** tab is an end-to-end encrypted messenger that talks only over
+Tor/Arti. There is no server, no relay and no store-and-forward anywhere on the
+network: a message goes from one onion service to another, or it waits.
+
+### Separation from the device mesh
+
+The messenger is a separate security domain, not a feature bolted onto pairing:
+
+| Layer | Role | Keys | Onion |
+|-------|------|------|-------|
+| Device mesh | your PC ↔ your devices | device identity + pairing | internal mesh onion |
+| Messenger account | you ↔ other people | `UserIdentity` per account | one onion **per account** |
+
+Concretely: messenger keys are generated fresh and stored sealed under
+`store/messenger/keystore.key` (a distinct 32-byte master key, mode `0600`), no
+messenger key is derived from a device key, and every account asks Arti for its
+own onion under a channel derived from the account id — never the mesh channel.
+`scripts/check-avalonia-ui.py` fails the build if messenger code starts
+referencing the device store or the agent session database.
+
+### Accounts
+
+Create as many as you like; the free tier allows two and the local Pro tier
+removes that limit. Switching accounts in the picker is instant — no logout, no
+Tor restart — because each account keeps its own contacts, conversations,
+ratchet state and onion. Nothing about the device pairing changes.
+
+The messenger is available on both shells: the **Chat** tab on the desktop and
+the **Messages** tab in the Android bottom navigation. They are separate views
+(the phone has its own layout and insets) over the *same* core, so one account,
+one onion and one history are shared — a message sent on the phone arrives on the
+PC and the reverse. `scripts/check-avalonia-ui.py` fails the build if the Android
+surface disappears or stops reaching the core's operations.
+
+### Handshake and 1:1 encryption
+
+An invite is a small signed JSON payload (the QR code, or paste it as text):
+
+```json
+{
+  "v": 1,
+  "user_id": "<hex Ed25519 identity key>",
+  "identity_pk": "<hex X25519 identity key>",
+  "identity_public": "<hex Ed25519 public key>",
+  "signed_prekey": "<hex X25519 signed prekey>",
+  "spk_sig": "<hex signature over the signed prekey>",
+  "onion": "<this account's onion>",
+  "name": "optional"
+}
+```
+
+Importing an invite verifies that `user_id` really is the identity key and that
+the signed prekey carries that identity's signature, so a peer cannot hand you a
+name it does not own. The first message then runs X3DH (`DH1 = DH(IK_A, SPK_B)`,
+`DH2 = DH(EK_A, IK_B)`, `DH3 = DH(EK_A, SPK_B)` and `DH4` when a one-time prekey
+is available) into a Double Ratchet. The header is authenticated as associated
+data, so a modified header makes the message fail to open rather than open the
+wrong thing.
+
+### Scanning asks the other device
+
+A QR scan is a **request**, not consent. The scanner sends its own signed invite
+as a `ContactRequest` over the other account's onion; that device stores it as a
+pending request and shows *"‹name› wants to chat"* above its conversation list.
+Only **Accept** writes the contact — and it answers the sender with the same
+decision, so the scanner knows immediately whether the chat is mutual. Declining
+removes the request on both sides.
+
+This is why a scanned peer can start typing right away (its own messages queue
+as `Pending`) while the other device still has to agree before anything becomes
+a contact.
+
+One-time prekeys live only on the owner's devices. They are topped up lazily and
+each is handed out exactly once, so a captured bundle cannot be replayed.
+
+### Groups up to 300
+
+Groups use sender keys: each member seals with their own chain, and every other
+member keeps that chain. The chain itself is delivered **only inside a 1:1
+envelope** to each member over their own onion, so a group never needs a server
+to distribute keys. A group is capped at 300 members in the app, on both create
+and join.
+
+Delivery is **sender fan-out**. The sender opens one connection per member and
+the same ciphertext goes to all of them; the transcript shows `delivered X/Y`.
+Removing a member drops every sender chain for that group and re-distributes, so
+the removed person cannot read anything after the removal. Offline members are
+simply `Pending`.
+
+### Files, including large ones
+
+There is no Session Router and no swarm. A control message carries the metadata,
+the SHA-256 and a per-attachment key inside the ratchet envelope; the bytes then
+follow as sealed chunks (64 KiB–1 MiB, 256 KiB by default) over the same Tor
+path. Each chunk is acknowledged, so progress reflects what the peer stored, and
+a lost circuit resumes instead of restarting. The assembled file is published
+only after its digest matches.
+
+One message may carry **any number of files of any type**. Each part has its own
+transfer id, key and digest, and they stream one after another in the order they
+were picked; the peer renders one bubble with a card per file.
+
+| Tier | Limit per file |
+|------|----------------|
+| Standard | 100 MiB |
+| Pro (local) | 2 GiB, configurable |
+
+Both are app policy: no server exists to enforce them. Received files go under
+`store/messenger/media/<message-id>/`, and a peer-supplied file name is reduced
+to a bare name so it can never escape that directory.
+
+### Markdown and edits
+
+Text is stored as Markdown source and rendered in the client with the same
+viewer the agent transcript uses: bold, italic, strike, inline code, fenced
+blocks, lists and links. Editing sends a signed `Edit { target_id, new_body }`
+control message; the original version stays in the local row for audit and the
+bubble shows "edited" with its timestamp. Only text is editable in v1: media is
+delete-and-resend.
+
+### Offline is a normal state
+
+Online means the account's onion accepts connections and answered the heartbeat.
+A message that cannot be delivered is written `Pending`, sealed into
+`store/messenger/outbox` and flushed, in order, when the peer returns. Receipts
+(`Delivered`/`Read`) are only shown when a direct channel actually existed to
+carry them.
+
+### Limits worth knowing
+
+- No calls, no disappearing messages, no open communities: out of scope for v1.
+- Multi-device sync for one messenger account is not implemented. Each device is
+  its own identity; a second device joins as a contact. The Double Ratchet is per
+  (account, peer) and is not shared across devices — the documented edge case
+  this version does not solve.
+- A 300-member group means 300 connections for one sender. That is the honest
+  cost of having no relay; the per-account delivery worker serialises the queue
+  instead of a server budget doing it.
 
 ## WhatsApp bridge
 
@@ -688,6 +837,34 @@ cargo test --locked
 dotnet run --project tests/DeviceLifecycle
 dotnet run --project tests/MobileThinking
 ```
+
+## Recursive harness adaptation (`/harness2`)
+
+`/harness2` ports [`google-research/harness2`](https://github.com/google-research/harness2)
+to Rust and points it at this agent's own harness: the always-on text, the
+skills, the delegated workers and the helper scripts. For one task it proposes
+invariant (`INV`) and domain (`DOM`) edits, rolls every candidate out as a real
+GnomeAI session in a scratch copy of the workspace, composes the harness the
+behavioural contrasts support, and adopts it into a per-domain library that
+later tasks read first. Weights never change; at `k` candidates per dimension a
+mode costs exactly `R = 4k` rollouts and `P = 3k` improvement stages.
+
+```text
+/harness2 -- fix the failing totals in reports/quarterly.xlsx
+/harness2 sequential 3 --run -- migrate the auth module to the new client
+/harness2 parallel 2 -- widen the test suite
+```
+
+Without `--run` the command only reports the plan (modes, the `4k`/`3k`
+budget, the editable surface, the runs root) and calls nothing: a real sweep
+costs one autonomous session per rollout, so it is never started implicitly.
+
+Every context tree is refused if it carries an answer-key path or a
+grader-verdict marker, and the same tripwire runs on each proposed harness
+before it can be rolled or stored. Runs, selections, adopted harnesses and
+lessons live under `harness2/` in the state directory. See
+[docs/HARNESS2.md](docs/HARNESS2.md) for the module map, the on-disk layout and
+the deliberately different details.
 
 ## Third-party notices
 

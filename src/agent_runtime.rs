@@ -301,7 +301,10 @@ enum IdleOutcome {
 /// Everything the op handlers need. One struct so the busy branch can defer
 /// an op and the drain loop can replay it against identical state.
 struct Core {
-    mesh: crate::mesh_transport::Mesh,
+    /// Shared with the messenger: one Arti client per process, because two
+    /// clients cannot share the same Tor storage directory.
+    mesh: std::sync::Arc<crate::mesh_transport::Mesh>,
+    messenger: Option<messenger::MessengerService>,
     agent: Agent,
     mcp_runtime: mcp_client::McpRuntime,
     /// Old MCP transports stay alive while a turn that captured their registry
@@ -346,8 +349,44 @@ async fn core_loop(
     native_api_token: String,
 ) -> Result<()> {
     let events = agent.event_sender();
+    // The messenger owns its own database, its own keystore and its own onion
+    // per account. It shares the Tor client with the mesh, nothing else.
+    // One embedded Arti client for everything. The messenger's docs promise it
+    // shares the mesh's Tor client, and it must: two clients on the same
+    // storage directory fight over its lock, the loser never bootstraps, and
+    // every messenger message then sits Pending forever behind a Tor client
+    // that can never come up.
+    let mesh = Arc::new(crate::mesh_transport::Mesh::new(app_paths.app_dir.clone()));
+    let messenger = match messenger::MessengerStore::open(
+        &app_paths.store_dir.join("messenger/messenger.db"),
+        &app_paths.app_dir,
+    ) {
+        Ok(store) => Some(messenger::MessengerService::new(
+            store,
+            mesh.clone(),
+            events.clone(),
+        )),
+        Err(error) => {
+            let _ = events
+                .send(Event::Notice {
+                    message: format!("Messenger is unavailable: {error}"),
+                })
+                .await;
+            None
+        }
+    };
+    if let Some(messenger) = &messenger
+        && let Err(error) = messenger.start().await
+    {
+        let _ = events
+            .send(Event::Notice {
+                message: format!("Messenger could not start: {error}"),
+            })
+            .await;
+    }
     let mut core = Core {
-        mesh: crate::mesh_transport::Mesh::new(app_paths.app_dir.clone()),
+        mesh,
+        messenger,
         agent,
         mcp_runtime,
         retired_mcp_runtimes: Vec::new(),
@@ -428,6 +467,26 @@ async fn core_loop(
                         };
                         if let Err(error)=result { session_recoverable_error(&events,&session_id,error).await; }
                     }
+                    Op::SubmitAttachmentsTo { session_id, paths, text } => {
+                        let home=core.app_paths.app_dir.clone();
+                        // Every path is checked against app storage on Android
+                        // before anything is read, then folded into one message.
+                        let prepared=tokio::task::spawn_blocking(move || {
+                            if cfg!(target_os = "android") {
+                                for path in &paths {
+                                    if !path.canonicalize()?.starts_with(home.canonicalize()?) {
+                                        anyhow::bail!("Attachment is outside app storage");
+                                    }
+                                }
+                            }
+                            prepare_attachments(&paths,&text)
+                        }).await.context("attachment worker failed")?;
+                        let result=match prepared {
+                            Ok(text) => device_request(&mut core,&uuid::Uuid::new_v4().to_string(),&uuid::Uuid::nil().to_string(),"submit",serde_json::json!({"session_id":session_id,"text":text}),&mut active,&mut turns,&events).await.map(|_|()),
+                            Err(error) => Err(error)
+                        };
+                        if let Err(error)=result { session_recoverable_error(&events,&session_id,error).await; }
+                    }
                     Op::DeviceRequest { request_id, peer_id, action, payload } => {
                         let result = device_request(&mut core, &request_id, &peer_id, &action, payload, &mut active, &mut turns, &events).await;
                         let result = match result { Ok(value) => serde_json::json!({"ok":true,"data":value}), Err(error) => serde_json::json!({"ok":false,"error":error.to_string()}) };
@@ -444,6 +503,25 @@ async fn core_loop(
                         match prepared {
                             Ok(text) => submit_or_queue(&core.agent, text, &mut active, &mut turns, &events).await,
                             Err(error) => session_recoverable_error(&events, &session_id, error).await,
+                        }
+                    }
+                    Op::SubmitAttachments { text, paths } => {
+                        let session_id = core.agent.session_id.clone();
+                        // One message, every file: the model sees one prompt and
+                        // the transcript one bubble, however many were attached.
+                        let prepared = tokio::task::spawn_blocking(move || {
+                            prepare_attachments(&paths, &text)
+                        })
+                        .await
+                        .context("attachment preparation task failed")?;
+                        match prepared {
+                            Ok(text) => {
+                                submit_or_queue(&core.agent, text, &mut active, &mut turns, &events)
+                                    .await
+                            }
+                            Err(error) => {
+                                session_recoverable_error(&events, &session_id, error).await
+                            }
                         }
                     }
                     Op::Interrupt => {
@@ -516,8 +594,41 @@ async fn handle_idle_op(
     events: &mpsc::Sender<Event>,
 ) -> Result<IdleOutcome> {
     match op {
-        Op::SubmitAttachmentTo { .. } | Op::DeviceRequest { .. } => {
+        Op::SubmitAttachmentTo { .. }
+        | Op::SubmitAttachmentsTo { .. }
+        | Op::DeviceRequest { .. } => {
             anyhow::bail!("Device requests must be dispatched through the live loop");
+        }
+        Op::SubmitAttachments { .. } => {
+            anyhow::bail!("Multi-file submissions must be dispatched through the live loop");
+        }
+        // Chat is independent of the coding agent: a messenger op never starts
+        // a turn and never waits for one.
+        Op::MessengerCreateAccount { .. }
+        | Op::MessengerListAccounts
+        | Op::MessengerSwitchAccount { .. }
+        | Op::MessengerDeleteAccount { .. }
+        | Op::MessengerGetInvitePayload { .. }
+        | Op::MessengerSetProfile { .. }
+        | Op::MessengerSetTier { .. }
+        | Op::MessengerAddContact { .. }
+        | Op::MessengerListContactRequests { .. }
+        | Op::MessengerRespondContactRequest { .. }
+        | Op::MessengerListConversations { .. }
+        | Op::MessengerGetMessages { .. }
+        | Op::MessengerSendText { .. }
+        | Op::MessengerSendMedia { .. }
+        | Op::MessengerEditMessage { .. }
+        | Op::MessengerMarkRead { .. }
+        | Op::MessengerCreateGroup { .. }
+        | Op::MessengerAddGroupMembers { .. }
+        | Op::MessengerRemoveGroupMember { .. }
+        | Op::MessengerListGroups { .. }
+        | Op::MessengerGetGroupMessages { .. }
+        | Op::MessengerFlushQueue { .. } => {
+            if let Err(error) = run_messenger_op(core, op).await {
+                notice(events, &format!("messenger: {error:#}")).await;
+            }
         }
         Op::SetBrave { api_key, mode } => {
             if !matches!(mode.as_str(), "web" | "context") {
@@ -979,6 +1090,23 @@ async fn handle_idle_op(
             let report = run_doctor(core).await;
             notice(events, &report).await;
         }
+        Op::Harness2 {
+            task,
+            k,
+            mode,
+            dry_run,
+        } => {
+            run_harness2(core, events, task, k, mode, dry_run).await;
+        }
+        // The desktop client tags its requests `harness2_plan` and
+        // `harness2_start`; both land here, and the tag alone decides whether
+        // a sweep may start.
+        Op::Harness2Plan { task, k, mode } => {
+            run_harness2(core, events, task, k, mode, true).await;
+        }
+        Op::Harness2Start { task, k, mode } => {
+            run_harness2(core, events, task, k, mode, false).await;
+        }
         Op::Shutdown => return Ok(IdleOutcome::Shutdown),
     }
     Ok(IdleOutcome::Continue)
@@ -1045,6 +1173,75 @@ fn prepare_attachment(path: &Path, prompt: &str) -> Result<String> {
     Ok(format!(
         "{prompt}\n\n<attached_file name=\"{name}\">\n{extracted}\n</attached_file>"
     ))
+}
+
+/// Combine any number of attachments into one user message.
+///
+/// Each file is prepared exactly as a single attachment would be, then joined:
+/// images become multimodal parts on one `image_url` list (all of them in the
+/// same message), and documents contribute one `<attached_file>` block each. A
+/// single turn, a single transcript bubble, any number of files.
+fn prepare_attachments(paths: &[PathBuf], prompt: &str) -> Result<String> {
+    if paths.is_empty() {
+        bail!("no attachment was selected");
+    }
+    let mut images: Vec<serde_json::Value> = Vec::new();
+    let mut documents = String::new();
+    let mut names: Vec<String> = Vec::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let prepared = prepare_attachment(path, "")?;
+        match serde_json::from_str::<serde_json::Value>(&prepared) {
+            Ok(serde_json::Value::Array(parts)) => {
+                // An image came back as [text, image_url]; keep only the picture
+                // and let the shared prompt speak once for the whole message.
+                for part in parts {
+                    if part.get("type").and_then(|kind| kind.as_str()) == Some("image_url") {
+                        images.push(part);
+                    }
+                }
+            }
+            _ => {
+                documents.push_str(&prepared);
+                documents.push_str("\n\n");
+            }
+        }
+        names.push(name);
+    }
+    let prompt = if prompt.trim().is_empty() {
+        match (images.len(), names.len()) {
+            (0, _) => format!(
+                "Analyze the attached file{}: {}.",
+                if names.len() == 1 { "" } else { "s" },
+                names.join(", ")
+            ),
+            (_, 0) => "Analyze the attached image.".to_string(),
+            (_, _) => format!(
+                "Analyze the attached image{} and file{}: {}.",
+                if images.len() == 1 { "" } else { "s" },
+                if names.len() == images.len() { "" } else { "s" },
+                names.join(", ")
+            ),
+        }
+    } else {
+        prompt.trim().to_string()
+    };
+    if images.is_empty() {
+        return Ok(format!("{prompt}\n\n{}", documents.trim_end()));
+    }
+    let mut parts = vec![serde_json::json!({"type": "text", "text": prompt})];
+    if !documents.trim().is_empty() {
+        parts.push(serde_json::json!({
+            "type": "text",
+            "text": documents.trim_end(),
+        }));
+    }
+    parts.extend(images);
+    Ok(serde_json::to_string(&parts)?)
 }
 
 fn start_turn(agent: &Agent, text: String) -> (CancellationToken, TurnFuture) {
@@ -1122,7 +1319,56 @@ fn can_run_during_turns(op: &Op) -> bool {
             | Op::ResumeSession { .. }
             | Op::RenameSession { .. }
             | Op::DeleteSession { .. }
+    ) || can_run_messenger_during_turns(op)
+}
+
+/// Messenger ops are safe alongside a running turn: they touch the messenger
+/// store only, never the agent's session, workspace or provider.
+fn can_run_messenger_during_turns(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::MessengerCreateAccount { .. }
+            | Op::MessengerListAccounts
+            | Op::MessengerSwitchAccount { .. }
+            | Op::MessengerDeleteAccount { .. }
+            | Op::MessengerGetInvitePayload { .. }
+            | Op::MessengerSetProfile { .. }
+            | Op::MessengerSetTier { .. }
+            | Op::MessengerAddContact { .. }
+            // These two were missing from the allow-list, so while any turn was
+            // running the core deferred them. The Chat tab asks for the request
+            // list on entry and answers with respond: both were silently held
+            // until the agent went idle. That is why an incoming invitation
+            // showed nothing and could not be accepted — the "accept/reject"
+            // message never had a control to reach.
+            | Op::MessengerListContactRequests { .. }
+            | Op::MessengerRespondContactRequest { .. }
+            | Op::MessengerListConversations { .. }
+            | Op::MessengerGetMessages { .. }
+            | Op::MessengerSendText { .. }
+            | Op::MessengerSendMedia { .. }
+            | Op::MessengerEditMessage { .. }
+            | Op::MessengerMarkRead { .. }
+            | Op::MessengerCreateGroup { .. }
+            | Op::MessengerAddGroupMembers { .. }
+            | Op::MessengerRemoveGroupMember { .. }
+            | Op::MessengerListGroups { .. }
+            | Op::MessengerGetGroupMessages { .. }
+            | Op::MessengerFlushQueue { .. }
     )
+}
+
+/// Run one messenger op against the shared service.
+///
+/// The messenger is optional: a session that could not open its store still
+/// runs the coding agent, and chat simply reports that it is unavailable
+/// instead of failing the turn.
+async fn run_messenger_op(core: &Core, op: Op) -> Result<()> {
+    let messenger = core
+        .messenger
+        .as_ref()
+        .context("the messenger is unavailable in this session")?;
+    messenger.handle_op(op).await
 }
 
 async fn session_event(events: &mpsc::Sender<Event>, session_id: &str, payload: Event) {
@@ -1513,10 +1759,7 @@ async fn set_firecrawl(
 fn firecrawl_launcher_setting(config: &config::AppConfig) -> String {
     #[cfg(target_os = "android")]
     {
-        config
-            .firecrawl_launcher_path
-            .clone()
-            .unwrap_or_default()
+        config.firecrawl_launcher_path.clone().unwrap_or_default()
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -2389,6 +2632,39 @@ async fn recoverable_error(events: &mpsc::Sender<Event>, error: impl std::fmt::D
         .await;
 }
 
+/// One `/harness2` request, from any transport.
+///
+/// `dry_run` is decided by the *tag* the client sent, never by a payload
+/// field, so a client that asks for the plan can never receive a sweep of
+/// sixteen autonomous sessions. A dry run reports the budget, the editable
+/// surface and the runs root and calls nothing.
+async fn run_harness2(
+    core: &Core,
+    events: &mpsc::Sender<Event>,
+    task: String,
+    k: u32,
+    mode: String,
+    dry_run: bool,
+) {
+    let workspace = core.agent.workspace.clone();
+    let config_state = core.config_state.clone();
+    if dry_run {
+        // The plan calls no model and writes nothing, so it can answer in
+        // order and the caller sees the result of its own request.
+        harness2::run_desktop_command(workspace, config_state, events.clone(), task, k, mode, true)
+            .await;
+        return;
+    }
+    // A real sweep is one autonomous session per rollout -- hours, not
+    // seconds. Awaiting it here would freeze the core loop (and every other
+    // conversation on it) until the last rollout finished, so it runs on its
+    // own task and reports through the ordinary notice channel.
+    let events = events.clone();
+    tokio::spawn(async move {
+        harness2::run_desktop_command(workspace, config_state, events, task, k, mode, false).await;
+    });
+}
+
 fn parse_cli() -> Result<Cli> {
     let mut cli = Cli {
         workspace: None,
@@ -2559,6 +2835,65 @@ async fn device_request(
             return Ok(
                 json!({"protocol":2,"platform":std::env::consts::OS,"web":true,"vision":true,"files":true,"subagents":true,"shell":!cfg!(target_os="android"),"desktop_control":cfg!(target_os="linux"),"tor":true}),
             );
+        }
+        // Recursive harness adaptation. `plan` is the always-safe dry run the
+        // composer offers (it never calls a model); `start` runs the sweep on
+        // a background task and reports through the ordinary notice channel.
+        "harness2_plan" | "harness2_start" => {
+            let task = payload
+                .get("task")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if task.is_empty() {
+                bail!("Describe the task to adapt for");
+            }
+            let k = payload.get("k").and_then(|k| k.as_u64()).unwrap_or(2) as u32;
+            if k == 0 || k > 8 {
+                bail!("k must be between 1 and 8");
+            }
+            let mode = payload
+                .get("mode")
+                .and_then(|m| m.as_str())
+                .unwrap_or("both")
+                .to_string();
+            let workspace = if id.is_empty() {
+                core.agent.workspace.clone()
+            } else {
+                store
+                    .get_session(id)?
+                    .context("Session not found")?
+                    .workspace
+            };
+            let surface = harness2::substrate::gnomeai_surface();
+            let runs = harness2::runs_root();
+            if action == "harness2_plan" {
+                return Ok(json!({
+                    "task": task,
+                    "k": k,
+                    "mode": mode,
+                    "rollouts_per_mode": 4 * k,
+                    "stages_per_mode": 3 * k,
+                    "editable_surface": surface.always_on,
+                    "runs_root": runs.display().to_string(),
+                }));
+            }
+            let config_state = core.config_state.clone();
+            let events = events.clone();
+            tokio::spawn(async move {
+                harness2::run_desktop_command(
+                    workspace,
+                    config_state,
+                    events,
+                    task,
+                    k,
+                    mode,
+                    false,
+                )
+                .await;
+            });
+            return Ok(json!({"started": true}));
         }
         "workspace_location" => {
             let session = store.get_session(id)?.context(
@@ -2858,6 +3193,54 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Several files become one message: a shared prompt, one document block
+    /// per file, so the model sees one turn instead of one turn per file.
+    #[test]
+    fn many_attachments_become_one_prompt() {
+        let root = std::env::temp_dir().join(format!(
+            "gnomef-attachments-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("notes.md");
+        let second = root.join("more.md");
+        std::fs::write(&first, "# Notes\n\nfirst file").unwrap();
+        std::fs::write(&second, "# More\n\nsecond file").unwrap();
+
+        let prepared = prepare_attachments(&[first, second], "Summarize both").unwrap();
+        assert!(prepared.starts_with("Summarize both"));
+        assert_eq!(prepared.matches("<attached_file name=").count(), 2);
+        assert!(prepared.contains("first file"));
+        assert!(prepared.contains("second file"));
+        // The prompt is stated once, not once per file.
+        assert_eq!(prepared.matches("Summarize both").count(), 1);
+
+        // An empty selection is an error, not an empty prompt.
+        assert!(prepare_attachments(&[], "").is_err());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// With no user text, the prompt names every file so the model knows what
+    /// arrived instead of receiving an empty request.
+    #[test]
+    fn an_unprompted_selection_describes_its_files() {
+        let root = std::env::temp_dir().join(format!(
+            "gnomef-attachments-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("budget.md");
+        let second = root.join("plan.md");
+        std::fs::write(&first, "money").unwrap();
+        std::fs::write(&second, "dates").unwrap();
+
+        let prepared = prepare_attachments(&[first, second], "").unwrap();
+        assert!(prepared.starts_with("Analyze the attached files:"));
+        assert!(prepared.contains("budget.md"));
+        assert!(prepared.contains("plan.md"));
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn workspace_request_resolves_relative_directory_from_current_workspace() {

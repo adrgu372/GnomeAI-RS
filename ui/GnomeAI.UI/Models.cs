@@ -227,6 +227,10 @@ public sealed class NodeInfo
     public string InitSystem { get; init; } = "manual";
     public bool RootAvailable { get; init; }
     public string RootPolicy { get; init; } = "ask";
+    /// Why the Hub is not hearing from this node. Empty while it is online.
+    public string OfflineReason { get; init; } = "";
+    /// When the node last contacted the Hub, in Unix seconds; zero if unknown.
+    public long LastSeenUnix { get; init; }
     public string Status => Online ? "Online" : "Offline";
     public string Platform => $"{Os} · {Architecture} · {InitSystem}";
 
@@ -240,6 +244,10 @@ public sealed class NodeInfo
         InitSystem = GetString(node, "init_system", "manual"),
         RootAvailable = GetBool(node, "root_available"),
         RootPolicy = GetString(node, "root_policy", "ask"),
+        OfflineReason = GetString(node, "offline_reason", ""),
+        LastSeenUnix = node.TryGetProperty("last_seen_unix", out var seen) && seen.TryGetInt64(out var seconds)
+            ? seconds
+            : 0,
     };
 
     private static string GetString(JsonElement node, string name, string fallback) =>
@@ -249,4 +257,96 @@ public sealed class NodeInfo
 
     private static bool GetBool(JsonElement node, string name) =>
         node.TryGetProperty(name, out var value) && value.ValueKind is JsonValueKind.True;
+}
+
+/// One messenger account as the chat tab lists it. Each account owns a separate
+/// identity, its own onion address and its own conversation history.
+public sealed class MessengerAccountItem
+{
+    public string AccountId { get; init; } = "";
+    public string UserId { get; init; } = "";
+    public string IdentityPk { get; init; } = "";
+    public string IdentityPublic { get; init; } = "";
+    public string SignedPrekey { get; init; } = "";
+    public string PrekeySignature { get; init; } = "";
+    public string DisplayName { get; init; } = "";
+    public string Onion { get; init; } = "";
+    public bool Active { get; init; }
+    public bool Online { get; init; }
+    public bool Pro { get; init; }
+    public long ChunkSize { get; init; }
+
+    /// "Work · online" — short enough for the account picker.
+    public override string ToString() =>
+        DisplayName + (Onion.Length > 0 ? (Online ? " · online" : " · offline") : " · starting Tor…");
+
+    public static MessengerAccountItem FromJson(JsonElement node) => new()
+    {
+        AccountId = GetString(node, "account_id"),
+        UserId = GetString(node, "user_id"),
+        IdentityPk = GetString(node, "identity_pk"),
+        IdentityPublic = GetString(node, "identity_public"),
+        SignedPrekey = GetString(node, "signed_prekey"),
+        PrekeySignature = GetString(node, "prekey_signature"),
+        DisplayName = GetString(node, "display_name", "Account"),
+        Onion = GetString(node, "onion_address"),
+        Active = GetBool(node, "active"),
+        Online = GetBool(node, "online"),
+        Pro = GetBool(node, "pro"),
+        ChunkSize = node.TryGetProperty("chunk_size", out var chunk) && chunk.TryGetInt64(out var size)
+            ? size
+            : 262144,
+    };
+
+    private static string GetString(JsonElement node, string name, string fallback = "") =>
+        node.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString() ?? fallback
+            : fallback;
+
+    private static bool GetBool(JsonElement node, string name) =>
+        node.TryGetProperty(name, out var value) && value.ValueKind is JsonValueKind.True;
+}
+
+/// One row in the chat conversation list. The badge is the attachment kind, so
+/// "📎 file" and "🎥 video" are visible without opening the conversation.
+public sealed class MessengerConversationItem
+{
+    public string Id { get; init; } = "";
+    public string Kind { get; init; } = "direct";
+    public string Target { get; init; } = "";
+    public string Title { get; init; } = "";
+    public string Preview { get; init; } = "";
+    public long Unread { get; init; }
+    public bool HasUnread => Unread > 0;
+    public string UnreadLabel => Unread > 99 ? "99+" : Unread.ToString();
+    public string Badge => Kind == "group" ? "⋯" : "@";
+
+    public static MessengerConversationItem FromJson(JsonElement node) => new()
+    {
+        Id = Json.String(node, "conversation_id"),
+        Kind = Json.String(node, "kind", "direct"),
+        Target = Json.String(node, "target"),
+        Title = Json.String(node, "title", "Conversation"),
+        Preview = Json.String(node, "preview"),
+        Unread = Json.Long(node, "unread"),
+    };
+}
+
+/// The small JSON helpers the chat tab needs. Kept here so messenger models do
+/// not depend on the main window's private helpers.
+internal static class Json
+{
+    public static string String(JsonElement node, string name, string fallback = "") =>
+        node.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString() ?? fallback
+            : fallback;
+
+    public static long Long(JsonElement node, string name) =>
+        node.TryGetProperty(name, out var value) && value.TryGetInt64(out var number) ? number : 0;
+
+    public static bool Bool(JsonElement node, string name) =>
+        node.TryGetProperty(name, out var value) && value.ValueKind is JsonValueKind.True;
+
+    public static string Element(JsonElement node) =>
+        node.ValueKind == JsonValueKind.String ? node.GetString() ?? "" : "";
 }

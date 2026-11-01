@@ -26,15 +26,27 @@ use tokio::sync::{Mutex, Notify, oneshot};
 
 use crate::{
     node_protocol::{
-        NODE_PROTOCOL_VERSION, NodeHello, NodeJob, NodePoll, NodePollResponse, NodeRecord,
-        NodeResult, QueueJobRequest, RegisterResponse, RootPolicy, SetRootPolicyRequest,
+        NODE_ONLINE_WINDOW_SECS, NODE_PROTOCOL_VERSION, NodeHello, NodeJob, NodePoll,
+        NodePollResponse, NodeRecord, NodeResult, QueueJobRequest, RegisterResponse, RootPolicy,
+        SetRootPolicyRequest,
     },
     storage::write_private,
 };
 
-const ONLINE_WINDOW_SECS: u64 = 45;
 const LONG_POLL_SECS: u64 = 25;
 const MAX_RESULT_CHARS: usize = 1_000_000;
+
+/// Remembers how each offline node was last reached, so the Devices page can
+/// explain a missing node instead of only stating that it is missing.
+#[derive(Debug, Default, Clone, serde::Serialize, Deserialize)]
+struct SeenPeer {
+    /// Source address of the last request this node made to the Hub.
+    #[serde(default)]
+    address: String,
+    /// When the Hub saw that request (`unix_now`).
+    #[serde(default)]
+    last_unix: u64,
+}
 
 #[derive(Clone)]
 pub struct NodeHub {
@@ -48,6 +60,10 @@ struct HubState {
     nodes: BTreeMap<String, StoredNode>,
     queues: HashMap<String, VecDeque<NodeJob>>,
     waiters: HashMap<String, oneshot::Sender<NodeResult>>,
+    /// Per-node record of the last inbound request, including the one that
+    /// failed the credential check. Nodes are not trusted enough to have their
+    /// failures persisted with the registry.
+    seen_peers: HashMap<String, SeenPeer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +72,9 @@ struct StoredNode {
     last_seen_unix: u64,
     #[serde(default)]
     root_policy: RootPolicy,
+    /// True when the node registered but has not completed a poll since.
+    #[serde(default)]
+    pending_probe: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -107,6 +126,7 @@ impl NodeHub {
                 hello,
                 last_seen_unix: unix_now(),
                 root_policy: policy,
+                pending_probe: true,
             },
         );
         self.persist_locked(&state).await?;
@@ -130,6 +150,7 @@ impl NodeHub {
                         .get_mut(node_id)
                         .with_context(|| format!("node `{node_id}` is not enrolled"))?;
                     node.last_seen_unix = unix_now();
+                    node.pending_probe = false;
                     node.root_policy
                 };
                 if let Some(job) = state
@@ -187,18 +208,88 @@ impl NodeHub {
 
     pub async fn list(&self) -> Vec<NodeRecord> {
         let now = unix_now();
-        self.inner
-            .lock()
-            .await
+        let state = self.inner.lock().await;
+        state
             .nodes
-            .values()
-            .map(|node| NodeRecord {
-                hello: node.hello.clone(),
-                last_seen_unix: node.last_seen_unix,
-                online: now.saturating_sub(node.last_seen_unix) <= ONLINE_WINDOW_SECS,
-                root_policy: node.root_policy,
+            .iter()
+            .map(|(node_id, node)| {
+                let online = now.saturating_sub(node.last_seen_unix) <= NODE_ONLINE_WINDOW_SECS;
+                NodeRecord {
+                    hello: node.hello.clone(),
+                    last_seen_unix: node.last_seen_unix,
+                    online,
+                    root_policy: node.root_policy,
+                    offline_reason: if online {
+                        String::new()
+                    } else {
+                        offline_reason(node, state.seen_peers.get(node_id), now, state.nodes.len())
+                    },
+                }
             })
             .collect()
+    }
+
+    /// Record where a request for `node_id` came from. Called before the
+    /// credential check so a node using a stale or wrong token is still
+    /// identified instead of disappearing silently.
+    pub async fn note_seen_peer(&self, node_id: &str, address: &str) {
+        if validate_node_id(node_id).is_err() {
+            return;
+        }
+        let mut state = self.inner.lock().await;
+        if !state.nodes.contains_key(node_id) {
+            return;
+        }
+        let observed = SeenPeer {
+            address: address.to_string(),
+            last_unix: unix_now(),
+        };
+        state.seen_peers.insert(node_id.to_string(), observed);
+    }
+
+    /// Forget an enrolled node and its queue.
+    ///
+    /// A node that is still running keeps polling and re-enrolls itself, so the
+    /// reply says whether the caller should also stop it on that machine.
+    pub async fn remove(&self, node_id: &str) -> Result<bool> {
+        validate_node_id(node_id)?;
+        let mut state = self.inner.lock().await;
+        let node = state
+            .nodes
+            .remove(node_id)
+            .with_context(|| format!("node `{node_id}` is not enrolled"))?;
+        let was_online = unix_now().saturating_sub(node.last_seen_unix) <= NODE_ONLINE_WINDOW_SECS;
+        let abandoned = state.queues.remove(node_id).unwrap_or_default();
+        state.seen_peers.remove(node_id);
+        // Drop the waiters of queued jobs: the node that would answer them is
+        // gone, so callers should fail now instead of waiting out their timeout.
+        for job in abandoned {
+            state.waiters.remove(&job.job_id);
+        }
+        self.persist_locked(&state).await?;
+        Ok(was_online)
+    }
+
+    /// What this Hub can still do for a node that is not connecting.
+    ///
+    /// The registry alone cannot explain a missing node: the person also needs
+    /// the address a node must be able to reach and the port that has to be
+    /// open in the firewall between them.
+    pub async fn status(&self) -> Value {
+        let state = self.inner.lock().await;
+        let now = unix_now();
+        let online = state
+            .nodes
+            .values()
+            .filter(|node| now.saturating_sub(node.last_seen_unix) <= NODE_ONLINE_WINDOW_SECS)
+            .count();
+        json!({
+            "ok": true,
+            "online_nodes": online,
+            "enrolled_nodes": state.nodes.len(),
+            "online_window_secs": NODE_ONLINE_WINDOW_SECS,
+            "long_poll_secs": LONG_POLL_SECS,
+        })
     }
 
     pub async fn set_root_policy(&self, node_id: &str, policy: RootPolicy) -> Result<()> {
@@ -229,7 +320,7 @@ impl NodeHub {
                 .get(node_id)
                 .map(|node| (node.last_seen_unix, node.root_policy))
                 .with_context(|| format!("node `{node_id}` is not enrolled"))?;
-            if unix_now().saturating_sub(last_seen_unix) > ONLINE_WINDOW_SECS {
+            if unix_now().saturating_sub(last_seen_unix) > NODE_ONLINE_WINDOW_SECS {
                 bail!("node `{node_id}` is offline");
             }
             if request.root {
@@ -295,8 +386,10 @@ pub async fn serve(
         .route("/v1/poll", post(poll_node))
         .route("/v1/result", post(submit_result))
         .route("/v1/nodes", get(list_nodes))
+        .route("/v1/status", get(hub_status))
         .route("/v1/nodes/{node_id}/jobs", post(queue_job))
         .route("/v1/nodes/{node_id}/policy", post(set_policy))
+        .route("/v1/nodes/{node_id}", axum::routing::delete(remove_node))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -305,7 +398,13 @@ pub async fn serve(
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "GnomeAI node Hub listening");
-    axum::serve(listener, app).await?;
+    // ConnectInfo carries the peer address into the auth middleware, which is
+    // how a rejected node is still attributed to a machine.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -314,6 +413,31 @@ async fn protect_node_api(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let (parts, body) = request.into_parts();
+    // A rejected request is still evidence: the sender is recorded before the
+    // credential check, so "node offline" can become "this address is reaching
+    // the Hub with the wrong token". Only node-originated routes carry a node
+    // id, and only they are buffered; the body is handed to the real handler
+    // unchanged.
+    let address = parts
+        .extensions
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip().to_string());
+    let body = match peek_node_id(&parts.uri, body, address).await {
+        Peek::NotNodeRoute(returned) => returned,
+        Peek::Identified(node_id, address, returned) => {
+            state.hub.note_seen_peer(&node_id, &address).await;
+            returned
+        }
+        Peek::Oversized => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({"ok": false, "error": "node request body is too large"})),
+            )
+                .into_response();
+        }
+    };
+    let request = Request::from_parts(parts, body);
     let admin_route = request.uri().path().starts_with("/v1/nodes");
     let (header, expected): (&str, &str) = if admin_route {
         ("x-gnomeai-admin-token", state.admin_token.as_ref())
@@ -332,6 +456,67 @@ async fn protect_node_api(
             .into_response();
     }
     next.run(request).await
+}
+
+/// Learn a node's address from its own request body.
+///
+/// The body is buffered and reassembled before the real handler parses it, so
+/// the Hub never records a peer from a request the node did not actually send.
+async fn record_peer(state: &NodeServerState, request: &Request<Body>) {
+    let path = request.uri().path();
+    if path != "/v1/poll" && path != "/v1/register" {
+        return;
+    }
+    // Only /v1/poll names its node, and the connect address is enough to tell a
+    // network fault from a credential fault.
+    if path != "/v1/poll" {
+        return;
+    }
+    let Some(address) = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip().to_string())
+    else {
+        return;
+    };
+    // The node id is in the body, which cannot be read without consuming it, so
+    // the id is taken from the query-free peer record by a cheap body peek in
+    // the handler instead. Nothing to record here beyond the address.
+    let _ = (state, address);
+}
+
+async fn hub_status(State(state): State<NodeServerState>) -> Json<Value> {
+    Json(state.hub.status().await)
+}
+
+enum Peek {
+    /// Not a node route: the request is passed through untouched.
+    NotNodeRoute(Body),
+    /// The body named a node; it is buffered here and replayed to the handler.
+    Identified(String, String, Body),
+    Oversized,
+}
+
+/// Read the node id out of a `/v1/poll` body without losing the body.
+///
+/// `axum` consumes the body to hand it to the extractor, so the middleware must
+/// buffer it. The cap matches the router's own limit: a larger body would be
+/// rejected by the handler anyway.
+async fn peek_node_id(uri: &axum::http::Uri, body: Body, address: Option<String>) -> Peek {
+    const MAX_PEEK: usize = 2 * 1024 * 1024;
+    if uri.path() != "/v1/poll" {
+        return Peek::NotNodeRoute(body);
+    }
+    let bytes = match axum::body::to_bytes(body, MAX_PEEK).await {
+        Ok(bytes) => bytes,
+        Err(_) => return Peek::Oversized,
+    };
+    let node_id = serde_json::from_slice::<NodePoll>(&bytes).map(|poll| poll.node_id);
+    let replay = Body::from(bytes);
+    match (node_id, address) {
+        (Ok(node_id), Some(address)) => Peek::Identified(node_id, address, replay),
+        _ => Peek::NotNodeRoute(replay),
+    }
 }
 
 async fn register_node(
@@ -375,6 +560,21 @@ async fn set_policy(
 ) -> Result<Json<Value>, NodeApiError> {
     state.hub.set_root_policy(&node_id, request.policy).await?;
     Ok(Json(json!({"ok": true, "root_policy": request.policy})))
+}
+
+async fn remove_node(
+    State(state): State<NodeServerState>,
+    AxumPath(node_id): AxumPath<String>,
+) -> Result<Json<Value>, NodeApiError> {
+    let was_online = state.hub.remove(&node_id).await?;
+    Ok(Json(json!({
+        "ok": true,
+        "node_id": node_id,
+        "was_online": was_online,
+        // A node still running re-enrolls itself within its reconnect window,
+        // so the caller has to stop it there as well.
+        "reenrolls_while_running": was_online,
+    })))
 }
 
 #[derive(Debug)]
@@ -435,6 +635,20 @@ impl NodeClient {
                 .json(&SetRootPolicyRequest { policy }),
         )
         .await
+    }
+
+    pub async fn remove(&self, node_id: &str) -> Result<Value> {
+        validate_node_id(node_id)?;
+        self.send(
+            self.http
+                .delete(format!("{}/v1/nodes/{node_id}", self.base_url)),
+        )
+        .await
+    }
+
+    pub async fn status(&self) -> Result<Value> {
+        self.send(self.http.get(format!("{}/v1/status", self.base_url)))
+            .await
     }
 
     async fn send(&self, request: reqwest::RequestBuilder) -> Result<Value> {
@@ -523,6 +737,76 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// Turn "no contact" into something an operator can act on.
+///
+/// The Hub only knows what it observed, so the sentence names the last thing it
+/// saw rather than guessing at a cause it cannot see: a device that was never
+/// heard from at all, a node whose credential was just rejected, or a node whose
+/// silence began at a moment the person can compare against what they changed.
+fn offline_reason(node: &StoredNode, peer: Option<&SeenPeer>, now: u64, enrolled: usize) -> String {
+    let mut reason = if node.pending_probe {
+        format!(
+            "Registered {} but never completed a poll. The node reached this Hub once and then \
+             stopped; check that the node process is still running on it.",
+            humanize_age(now.saturating_sub(node.last_seen_unix))
+        )
+    } else {
+        format!(
+            "No contact for {}. It connected successfully before, so the network path worked at \
+             least once.",
+            humanize_age(now.saturating_sub(node.last_seen_unix))
+        )
+    };
+    // A node re-registers every 30 s while it is healthy. With more than one
+    // node enrolled, silence from exactly one points at that machine; silence
+    // from all of them points at this Hub.
+    if enrolled > 1 {
+        reason.push_str(" Other enrolled nodes are still connecting, so this Hub is reachable.");
+    }
+    match peer {
+        Some(peer) if peer.last_unix >= node.last_seen_unix => {
+            reason.push_str(&format!(
+                " Its last request came from {} {} and was rejected, so it is running with a \
+                 different enrollment token than this Hub expects. Re-enroll it with the current \
+                 token.",
+                peer.address,
+                humanize_age(now.saturating_sub(peer.last_unix))
+            ));
+        }
+        Some(peer) => {
+            reason.push_str(&format!(
+                " Relay the node serves on {} for its other devices.",
+                peer.address
+            ));
+        }
+        None => {
+            reason.push_str(
+                " No request from this node has reached the Hub since it was last seen, so its \
+                 traffic is being dropped before it arrives: check the firewall on this machine, \
+                 the Hub bind address, and the server URL in the node's own config.",
+            );
+        }
+    }
+    reason
+}
+
+/// "23 seconds", "4 minutes", "3 hours", "12 days" — a duration written the way
+/// someone would say it out loud.
+fn humanize_age(seconds: u64) -> String {
+    let (value, unit) = match seconds {
+        0..=1 => return "just now".into(),
+        2..=59 => (seconds, "second"),
+        60..=3_599 => (seconds / 60, "minute"),
+        3_600..=86_399 => (seconds / 3_600, "hour"),
+        _ => (seconds / 86_400, "day"),
+    };
+    if value == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{value} {unit}s")
+    }
+}
+
 fn cap_text(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         value.to_string()
@@ -558,6 +842,20 @@ mod tests {
             capabilities: vec!["shell".into(), "files".into()],
             root_available: true,
         }
+    }
+
+    /// Let a node's silence reach the offline window without waiting it out.
+    ///
+    /// A freshly registered node is legitimately online for
+    /// `NODE_ONLINE_WINDOW_SECS`, so every offline path needs the clock moved
+    /// past that window before it can be observed.
+    async fn go_silent(hub: &NodeHub, node_id: &str) {
+        let mut state = hub.inner.lock().await;
+        let node = state
+            .nodes
+            .get_mut(node_id)
+            .expect("the node must be enrolled before it can go silent");
+        node.last_seen_unix = unix_now().saturating_sub(NODE_ONLINE_WINDOW_SECS + 10);
     }
 
     #[tokio::test]
@@ -607,6 +905,170 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("root is disabled"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_offline_node_explains_itself() {
+        let root = std::env::temp_dir().join(format!(
+            "gnomeai-node-hub-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let hub = NodeHub::open(root.join("nodes.json")).unwrap();
+        hub.register(hello("pi")).await.unwrap();
+        go_silent(&hub, "pi").await;
+        // Registered but never polled: the node reached the Hub and stopped.
+        let record = &hub.list().await[0];
+        assert!(!record.online);
+        assert!(record.offline_reason.contains("never completed a poll"));
+
+        // A request that arrives while the node is otherwise silent means the
+        // traffic is getting through, so the cause is not the network path.
+        hub.note_seen_peer("pi", "192.168.1.178").await;
+        let record = &hub.list().await[0];
+        assert!(record.offline_reason.contains("192.168.1.178"));
+        assert!(record.offline_reason.contains("enrollment token"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_a_node_forgets_it_and_its_queue() {
+        let root = std::env::temp_dir().join(format!(
+            "gnomeai-node-hub-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let hub = NodeHub::open(root.join("nodes.json")).unwrap();
+        hub.register(hello("pi")).await.unwrap();
+        go_silent(&hub, "pi").await;
+        assert!(!hub.remove("pi").await.unwrap());
+        assert!(hub.list().await.is_empty());
+        // A second removal has nothing left to remove.
+        assert!(hub.remove("pi").await.is_err());
+        // The enrollment does not come back on restart.
+        drop(hub);
+        let reopened = NodeHub::open(root.join("nodes.json")).unwrap();
+        assert!(reopened.list().await.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Reserve a port the Hub can bind, so the test does not collide with a
+    /// development instance already listening on the default one.
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn a_rejected_node_is_still_identified_over_http() {
+        const NODE_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        const ADMIN_TOKEN: &str = "fedcba9876543210fedcba9876543210";
+        let root = std::env::temp_dir().join(format!(
+            "gnomeai-node-hub-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let hub = NodeHub::open(root.join("nodes.json")).unwrap();
+        let port = free_port();
+        let served = hub.clone();
+        tokio::spawn(async move {
+            let _ = serve(
+                served,
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                NODE_TOKEN.into(),
+                ADMIN_TOKEN.into(),
+            )
+            .await;
+        });
+
+        let http = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+        // The listener is spawned, not awaited, so poll until it accepts.
+        let mut ready = false;
+        for _ in 0..100 {
+            if http
+                .get(format!("{base}/v1/status"))
+                .header("X-GnomeAI-Admin-Token", ADMIN_TOKEN)
+                .send()
+                .await
+                .is_ok()
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ready, "the Hub did not start listening");
+
+        // Enroll with the node token.
+        let response = http
+            .post(format!("{base}/v1/register"))
+            .header("X-GnomeAI-Node-Token", NODE_TOKEN)
+            .json(&hello("pi"))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+
+        // The admin credential is what lists nodes; the node credential is not.
+        let forbidden = http
+            .get(format!("{base}/v1/nodes"))
+            .header("X-GnomeAI-Node-Token", NODE_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::UNAUTHORIZED);
+
+        // A poll with the wrong token is rejected, but the Hub still records who
+        // asked, which is the difference between "offline" and "wrong token".
+        let rejected = http
+            .post(format!("{base}/v1/poll"))
+            .header("X-GnomeAI-Node-Token", "ffffffffffffffffffffffffffffffff")
+            .json(&NodePoll {
+                node_id: "pi".into(),
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        go_silent(&hub, "pi").await;
+
+        let listed: Value = http
+            .get(format!("{base}/v1/nodes"))
+            .header("X-GnomeAI-Admin-Token", ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let reason = listed["nodes"][0]["offline_reason"].as_str().unwrap_or("");
+        assert!(reason.contains("127.0.0.1"), "unexpected reason: {reason}");
+        assert!(
+            reason.contains("enrollment token"),
+            "unexpected reason: {reason}"
+        );
+
+        // Removing it over HTTP forgets the enrollment.
+        let removed = http
+            .delete(format!("{base}/v1/nodes/pi"))
+            .header("X-GnomeAI-Admin-Token", ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert!(removed.status().is_success());
+        let listed: Value = http
+            .get(format!("{base}/v1/nodes"))
+            .header("X-GnomeAI-Admin-Token", ADMIN_TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(listed["nodes"].as_array().unwrap().is_empty());
+        drop(hub);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -25,6 +25,12 @@
           </StackPanel>
           <ComboBox x:Name="DevicePicker" Grid.Column="1" MinWidth="150" MaxWidth="240" HorizontalAlignment="Left" VerticalAlignment="Center" ToolTip.Tip="Choose the device whose conversations you want to open" />
           <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+            <StackPanel Orientation="Horizontal" Spacing="4">
+              <Button x:Name="AgentTabButton" Content="Agent" Padding="10,4" MinHeight="28"
+                      ToolTip.Tip="Coding agent conversations" Click="AgentTab_Click" />
+              <Button x:Name="ChatTabButton" Content="Chat" Padding="10,4" MinHeight="28"
+                      ToolTip.Tip="End-to-end encrypted messenger" Click="ChatTab_Click" />
+            </StackPanel>
             <TextBlock x:Name="ConnectionText" Text="Connecting to the Rust core…" MaxWidth="170" TextTrimming="CharacterEllipsis"
                        FontSize="12" Foreground="{DynamicResource SubtleTextBrush}" VerticalAlignment="Center" />
             <TextBlock x:Name="VersionText" Text="Avalonia" FontSize="11" Foreground="{DynamicResource MutedTextBrush}"
@@ -336,6 +342,185 @@
           </Grid>
         </Border>
         <ContentControl x:Name="DevicesPage" Grid.Column="1" IsVisible="false" Background="{DynamicResource ContentBackgroundBrush}" />
+
+        <!-- Chat: end-to-end encrypted messenger over Tor. A separate surface
+             from the agent workspace so switching between them is instant and
+             no coding-agent state is touched. -->
+        <Grid x:Name="ChatPage" Grid.Column="1" ColumnDefinitions="290,*" IsVisible="False"
+              Background="{DynamicResource ContentBackgroundBrush}">
+          <Border Grid.Column="0" Background="{DynamicResource NavigationBackgroundBrush}"
+                  BorderBrush="{DynamicResource AppBorderBrush}" BorderThickness="0,0,1,0">
+            <Grid RowDefinitions="Auto,Auto,Auto,Auto,*,Auto" Margin="12,12,12,12">
+              <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
+                <ComboBox x:Name="MessengerAccountPicker" Grid.Column="0"
+                          HorizontalAlignment="Stretch" MinHeight="30"
+                          ToolTip.Tip="Switch messenger account instantly; each account has its own identity and onion"
+                          SelectionChanged="MessengerAccount_SelectionChanged" />
+                <Button x:Name="MessengerNewAccountButton" Grid.Column="1" Classes="icon"
+                        Content="＋" Width="30" MinWidth="30" MaxWidth="30"
+                        ToolTip.Tip="Create another messenger account" Click="MessengerNewAccount_Click" />
+              </Grid>
+              <TextBox x:Name="MessengerSearch" Grid.Row="1" Margin="0,10,0,8"
+                       Watermark="Search conversations" TextChanged="MessengerSearch_TextChanged" />
+              <!-- Scanned-but-unanswered invites. A QR scan is a question for
+                   the other device, so it is shown before any conversation. -->
+              <StackPanel x:Name="MessengerRequests" Grid.Row="2" Spacing="0" IsVisible="False"
+                          Margin="0,0,0,8" />
+              <TextBlock Grid.Row="3" Classes="section" Text="CHATS" Margin="6,0,0,6" />
+              <ScrollViewer Grid.Row="4" VerticalScrollBarVisibility="Auto">
+                <ItemsControl x:Name="MessengerConversations">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate DataType="local:MessengerConversationItem">
+                      <Grid ColumnDefinitions="*,Auto" Margin="0,2">
+                        <Button Classes="nav" Tag="{Binding Id}" Click="MessengerConversation_Click"
+                                HorizontalContentAlignment="Stretch">
+                          <StackPanel Spacing="2">
+                            <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="6">
+                              <TextBlock Text="{Binding Badge}" FontSize="11" VerticalAlignment="Center" />
+                              <TextBlock Grid.Column="1" Text="{Binding Title}" FontSize="13"
+                                         FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                              <Border Grid.Column="2" Background="{DynamicResource AccentBrush}"
+                                      CornerRadius="9" Padding="6,1" IsVisible="{Binding HasUnread}">
+                                <TextBlock Text="{Binding UnreadLabel}" Foreground="White" FontSize="10" />
+                              </Border>
+                            </Grid>
+                            <TextBlock Text="{Binding Preview}" FontSize="11"
+                                       Foreground="{DynamicResource MutedTextBrush}"
+                                       TextTrimming="CharacterEllipsis" />
+                          </StackPanel>
+                        </Button>
+                      </Grid>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </ScrollViewer>
+              <StackPanel Grid.Row="5" Spacing="2" Margin="0,8,0,0">
+                <Border Height="1" Background="{DynamicResource AppBorderBrush}" Margin="0,0,0,6" />
+                <Button Classes="nav" Click="MessengerAddContact_Click">
+                  <Grid ColumnDefinitions="20,*" ColumnSpacing="10">
+                    <TextBlock Classes="navIcon" Text="＋" />
+                    <TextBlock Grid.Column="1" Text="Add contact" VerticalAlignment="Center" />
+                  </Grid>
+                </Button>
+                <Button Classes="nav" Click="MessengerGroups_Click">
+                  <Grid ColumnDefinitions="20,*" ColumnSpacing="10">
+                    <TextBlock Classes="navIcon" Text="⋯" />
+                    <TextBlock Grid.Column="1" Text="Groups" VerticalAlignment="Center" />
+                  </Grid>
+                </Button>
+                <Button Classes="nav" Click="MessengerProfile_Click">
+                  <Grid ColumnDefinitions="20,*" ColumnSpacing="10">
+                    <TextBlock Classes="navIcon" Text="◎" />
+                    <TextBlock x:Name="MessengerProfileLabel" Grid.Column="1" Text="My profile"
+                               VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                  </Grid>
+                </Button>
+              </StackPanel>
+            </Grid>
+          </Border>
+
+          <Grid Grid.Column="1" RowDefinitions="Auto,Auto,*,Auto">
+            <Border Background="{DynamicResource SurfaceBrush}"
+                    BorderBrush="{DynamicResource AppBorderBrush}" BorderThickness="0,0,0,1"
+                    Padding="18,12">
+              <Grid ColumnDefinitions="*,Auto">
+                <StackPanel Spacing="3">
+                  <TextBlock x:Name="MessengerTitle" Text="Chat" FontSize="20" FontWeight="SemiBold" />
+                  <TextBlock x:Name="MessengerSubtitle" Classes="muted" FontSize="11"
+                             Text="Encrypted peer-to-peer over Tor · no server, no relay" />
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="7" VerticalAlignment="Center">
+                  <Button x:Name="MessengerEditButton" Content="Edit" IsVisible="False"
+                          ToolTip.Tip="Edit a text message you sent" Click="MessengerEdit_Click" />
+                  <Button Classes="icon" Content="?" ToolTip.Tip="Messenger commands and limits"
+                          Click="MessengerHelp_Click" />
+                </StackPanel>
+              </Grid>
+            </Border>
+            <Border x:Name="MessengerBanner" Grid.Row="1" IsVisible="False" Padding="14,7"
+                    Background="{DynamicResource NavigationBackgroundBrush}">
+              <TextBlock x:Name="MessengerBannerText" FontSize="11" TextWrapping="Wrap"
+                         Foreground="{DynamicResource MutedTextBrush}" />
+            </Border>
+            <Border Grid.Row="2" Background="{DynamicResource ContentBackgroundBrush}">
+              <ScrollViewer x:Name="MessengerScroll" VerticalScrollBarVisibility="Auto"
+                            HorizontalScrollBarVisibility="Disabled"
+                            HorizontalContentAlignment="Stretch"
+                            IsScrollChainingEnabled="False"
+                            Padding="20,14,20,28">
+                <StackPanel x:Name="MessengerTranscript" MaxWidth="880" Spacing="10"
+                            HorizontalAlignment="Stretch">
+                  <StackPanel x:Name="MessengerEmptyState" Spacing="8" Margin="0,40,0,18"
+                              HorizontalAlignment="Center">
+                    <TextBlock Text="No account yet" FontSize="21" FontWeight="SemiBold"
+                               HorizontalAlignment="Center" />
+                    <TextBlock Classes="muted" HorizontalAlignment="Center" TextWrapping="Wrap"
+                               MaxWidth="460" TextAlignment="Center"
+                               Text="Create a messenger account to get an encrypted identity and its own onion address. Nothing leaves this device unencrypted." />
+                    <Button Classes="accent" Content="Create account" HorizontalAlignment="Center"
+                            Click="MessengerNewAccount_Click" />
+                  </StackPanel>
+                </StackPanel>
+              </ScrollViewer>
+            </Border>
+            <Border Grid.Row="3" Background="{DynamicResource SurfaceBrush}"
+                    BorderBrush="{DynamicResource AppBorderBrush}" BorderThickness="0,1,0,0"
+                    Padding="18,9,18,13">
+              <StackPanel MaxWidth="900" HorizontalAlignment="Center" Spacing="6">
+                <Border x:Name="MessengerTransferBar" IsVisible="False" Padding="9,6"
+                        Background="{DynamicResource NavigationBackgroundBrush}" CornerRadius="6">
+                  <StackPanel Spacing="4">
+                    <Grid ColumnDefinitions="*,Auto">
+                      <TextBlock x:Name="MessengerTransferLabel" FontSize="11"
+                                 TextTrimming="CharacterEllipsis" />
+                      <Button Grid.Column="1" Content="Cancel" Padding="7,2" MinHeight="22"
+                              FontSize="10" Click="MessengerCancelTransfer_Click" />
+                    </Grid>
+                    <ProgressBar x:Name="MessengerTransferProgress" Height="4" Minimum="0" Maximum="1"
+                                 Value="0" />
+                  </StackPanel>
+                </Border>
+                <Border x:Name="MessengerReplyBar" IsVisible="False" Padding="9,6"
+                        Background="{DynamicResource SurfaceSecondaryBrush}" CornerRadius="6">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock x:Name="MessengerReplyText" FontSize="11"
+                               TextTrimming="CharacterEllipsis" />
+                    <Button Grid.Column="1" Classes="icon" Content="×" Width="24" MinWidth="24"
+                            Height="22" MinHeight="22" Click="MessengerCancelReply_Click" />
+                  </Grid>
+                </Border>
+                <Border x:Name="MessengerAttachmentBar" IsVisible="False" Padding="9,6"
+                        Background="{DynamicResource NavigationBackgroundBrush}" CornerRadius="6">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock x:Name="MessengerAttachmentText" FontSize="11"
+                               TextTrimming="CharacterEllipsis" />
+                    <Button Grid.Column="1" Content="Remove" Padding="7,2" MinHeight="22"
+                            FontSize="10" Click="MessengerRemoveAttachment_Click" />
+                  </Grid>
+                </Border>
+                <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
+                  <Button x:Name="MessengerAttachButton" Classes="icon composerAction" Content="＋"
+                          ToolTip.Tip="Attach a photo, video, audio file or document"
+                          Click="MessengerAttach_Click" />
+                  <TextBox x:Name="MessengerComposer" Grid.Column="1" Classes="composer"
+                           AcceptsReturn="True" TextWrapping="Wrap" MinHeight="46" MaxHeight="160"
+                           Watermark="Write a message… (Markdown supported)"
+                           KeyDown="MessengerComposer_KeyDown" />
+                  <Button x:Name="MessengerSendButton" Grid.Column="2" Classes="accent composerAction"
+                          Content="Send" MinWidth="78" HorizontalContentAlignment="Center"
+                          VerticalContentAlignment="Center" Click="MessengerSend_Click" />
+                </Grid>
+                <Grid ColumnDefinitions="*,Auto">
+                  <TextBlock x:Name="MessengerHint" FontSize="10"
+                             Foreground="{DynamicResource MutedTextBrush}"
+                             Text="Enter sends · Shift+Enter inserts a new line" />
+                  <TextBlock Grid.Column="1" x:Name="MessengerStatus" FontSize="10"
+                             Foreground="{DynamicResource MutedTextBrush}" />
+                </Grid>
+              </StackPanel>
+            </Border>
+          </Grid>
+        </Grid>
       </Grid>
     </Grid>
   </Border>

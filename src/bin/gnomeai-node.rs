@@ -6,7 +6,8 @@ mod node_protocol;
 
 use anyhow::{Context, Result, bail};
 use node_protocol::{
-    NODE_PROTOCOL_VERSION, NodeHello, NodeJob, NodePoll, NodePollResponse, NodeResult,
+    NODE_ONLINE_WINDOW_SECS, NODE_PROTOCOL_VERSION, NodeHello, NodeJob, NodePoll, NodePollResponse,
+    NodeResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -115,16 +116,30 @@ async fn run_connected(client: &reqwest::Client, config: &NodeConfig) -> Result<
         "GnomeAI node `{}` connected to {}",
         config.name, config.server
     );
+    // The Hub calls a node offline after NODE_ONLINE_WINDOW_SECS of silence, and
+    // it only learns a node is healthy by hearing from it. Re-registering well
+    // inside that window means a single dropped connection or a laptop that
+    // slept shows up as a reconnect instead of a node that looks dead while it is
+    // actually fine.
+    let mut healthy_interval =
+        tokio::time::interval(Duration::from_secs((NODE_ONLINE_WINDOW_SECS / 3).max(5)));
+    healthy_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    healthy_interval.tick().await;
     loop {
-        let response = send_json(
-            client
-                .post(format!("{}/v1/poll", config.server))
-                .json(&NodePoll {
-                    node_id: config.node_id.clone(),
-                }),
-            &config.token,
-        )
-        .await?;
+        let response = tokio::select! {
+            polled = send_json(
+                client
+                    .post(format!("{}/v1/poll", config.server))
+                    .json(&NodePoll {
+                        node_id: config.node_id.clone(),
+                    }),
+                &config.token,
+            ) => polled?,
+            _ = healthy_interval.tick() => {
+                register(client, config).await?;
+                continue;
+            }
+        };
         let poll: NodePollResponse = serde_json::from_value(response)?;
         let Some(job) = poll.job else {
             continue;

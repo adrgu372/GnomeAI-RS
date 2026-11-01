@@ -1,6 +1,6 @@
 [package]
 name = "gnomef-rs"
-version = "3.2.0"
+version = "3.2.2"
 edition = "2024"
 rust-version = "1.91"
 autobins = false
@@ -48,8 +48,15 @@ async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart"] }
 base64 = "0.22"
+chacha20 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+ed25519-dalek = "2"
 futures-util = "0.3"
+getrandom = "0.3"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
 ignore = "0.4"
 libc = "0.2"
 mime_guess = "2"
@@ -72,6 +79,7 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 zeroize = "1"
 
